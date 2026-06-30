@@ -1,0 +1,227 @@
+import cv2
+import numpy as np
+import threading
+from src.primary.tracking import TrackStatus, SingleObjectTracker
+from src.primary.detection import detectSingleObject
+import src.primary.config as config
+from src.primary.geometry import estimateTargetImagePosition
+from datetime import datetime
+import time
+from src.primary.comm_buffer import CommBuffer, cmd_thread_main
+from src.primary.platform import Platform
+
+from src.comm.link import UdpLink
+from src.comm.network_config import(
+    PRIMARY_IP, 
+    ENDPOINT_IP,
+    UDP_PORT,
+    PRIMARY_NODE_ID,
+    ENDPOINT_NODE_ID,
+    DEFAULT_MAX_PACKET_BYTES
+)
+
+
+if __name__ == "__main__": 
+
+    cap = cv2.VideoCapture(0)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_H)
+    cap.set(cv2.CAP_PROP_FPS, config.FPS)
+
+    tracker = SingleObjectTracker(
+    # params...
+    )
+
+    comm_buffer = CommBuffer()
+    
+    platform = Platform(comm_buffer=comm_buffer)
+
+    link = UdpLink(
+        local_ip=PRIMARY_IP,
+        remote_ip=ENDPOINT_IP,
+        port=UDP_PORT,
+        local_node_id=PRIMARY_NODE_ID,
+        remote_node_id=ENDPOINT_NODE_ID,
+        max_packet_bytes=DEFAULT_MAX_PACKET_BYTES,
+        check_remote_ip=True
+    )
+
+    # link = None # FOR DEBUG ONLY
+
+    stop_event = threading.Event()
+
+    cmd_thread = threading.Thread(
+        target=cmd_thread_main,
+        args=(comm_buffer, stop_event, link),
+        daemon=True # this is a background thread
+    )
+
+    cmd_thread.start()
+
+    last_detection_px_w = 0
+    last_detection_px_h = 0
+
+    tracker_paused = False      # OpenCV/tracker runs by default
+    platform_paused = True      # Platform OFF by default
+    
+    try:
+        while cap.isOpened():    
+
+            if not tracker_paused:
+                
+                frame_time = time.perf_counter()
+                ret, frame = cap.read() # doesn't always give latest frame but that's a future optimization.
+                if not ret:
+                    print("Possible camera failure")
+                    break
+
+                # Detect the object and produce a measurement
+                object_detected, detection, measurement = detectSingleObject(frame)
+                detection_label = "No detections"
+
+                if object_detected:
+                    last_detection_px_w = detection.px_w
+                    last_detection_px_h = detection.px_h
+                    cv2.rectangle(
+                        frame, 
+                        (int(detection.u -detection.px_w/2), int(detection.v - detection.px_h/2)),
+                        (int(detection.u + detection.px_w/2), int(detection.v + detection.px_h/2)),
+                        color=(0,255,0), 
+                        thickness=2
+                    )
+                    
+                    cv2.circle(frame, (int(detection.u), int(detection.v)), radius=5, color=(0,255,0), thickness=-1)
+
+                    detection_label = "Measurement: (x: " + f"{measurement.x:.4f}" + ", y: " + f"{measurement.y:.4f}"  + ", z: " + f"{measurement.z:.4f}" + ")"
+                
+
+
+                # Track the object state & update the platform planner
+                track_status = tracker.update(object_detected, measurement, frame_time)
+                platform.update(tracker=tracker)
+                
+                track_label = "Dead track"
+                if track_status == TrackStatus.CONFIRMED or track_status == TrackStatus.TENTATIVE:
+                    track_u, track_v = estimateTargetImagePosition(tracker.track.x, tracker.track.y, tracker.track.z)
+
+                    # rectangle is drawn based on last detected px_w, px_h. might change this...
+                    cv2.rectangle(
+                        frame,
+                        (int(track_u - last_detection_px_w/2), int(track_v - last_detection_px_h/2)),
+                        (int(track_u + last_detection_px_w/2), int(track_v + last_detection_px_h/2)),
+                        color=(0,0,255), 
+                        thickness=2    
+                    )
+
+                    cv2.circle(frame, (int(track_u), int(track_v)), radius=5, color=(0,0,255), thickness=-1)
+
+                    velocity_2d = np.array([tracker.track.dx, tracker.track.dy], dtype=float)
+                    velocity_norm = np.linalg.norm(velocity_2d)
+                    if velocity_norm > 1e-6:
+                        arrow_length_px = 40
+                        direction = velocity_2d / velocity_norm
+                        arrow_end = (
+                            int(round(int(track_u) + arrow_length_px * direction[0])),
+                            int(round(int(track_v) + arrow_length_px * direction[1])),
+                        )
+                        cv2.arrowedLine(frame, (int(track_u), int(track_v)), arrow_end, (0, 0, 255), thickness=2, tipLength=0.25)
+
+                    track_label = ("Confirmed" if track_status == TrackStatus.CONFIRMED else "Tentative") 
+                    track_label = (
+                        track_label + " track: (x: " + f"{tracker.track.x:.4f}" + ", y: " + f"{tracker.track.y:.4f}"  + ", z: " + f"{tracker.track.z:.4f}" 
+                        + ", dx: " + f"{tracker.track.dx:.4f}" + ", dy: " + f"{tracker.track.dy:.4f}"  + ", dz: " + f"{tracker.track.dz:.4f}" + ")"
+                    )
+
+                
+                # flip (optional) as a last step before then labelling, for viewing only 
+                frame = cv2.flip(frame, 1) 
+                cv2.putText(frame, detection_label, (10,20), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color=(0,255,0), thickness=1)
+                cv2.putText(frame, track_label, (10,50), cv2.FONT_HERSHEY_SIMPLEX, 0.4, color=(0,0,255), thickness=1)
+
+                last_frame = frame.copy()
+            else:
+                if last_frame is None: # incase of missing frame?
+                    continue
+
+                frame = last_frame.copy()
+
+
+            cv2.imshow("Webcam Feed", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+
+            if key != 255: # FOR DEBUG ONLY
+                print(f"key pressed: {key}, char: {chr(key) if key < 128 else '?'}")
+
+            # q = quit
+            if key == ord("q"):
+                print("Quitting...")
+                platform.halt_triggering()
+                platform.turn_off()
+                stop_event.set()
+                break
+
+            # p = pause BOTH OpenCV/tracker and platform
+            elif key == ord("p"):
+                tracker_paused = True
+                platform_paused = True
+                platform.turn_off()
+                print("Paused tracker/OpenCV + platform OFF")
+
+            # r = resume OpenCV/tracker only
+            elif key == ord("r"):
+                tracker_paused = False
+                print("Tracker/OpenCV resumed")
+
+            # l = pause platform only
+            elif key == ord("l"):
+                platform_paused = True
+                platform.turn_off()
+                print("Platform OFF")
+
+            # o = resume platform only if OpenCV/tracker is running
+            elif key == ord("o"):
+                if tracker_paused:
+                    print("Cannot turn platform ON while tracker/OpenCV is paused")
+                else:
+                    platform_paused = False
+                    platform.turn_on()
+                    print("Platform ON")
+
+            # h = halt triggering
+            elif key == ord("h"):
+                platform.halt_triggering()
+                print("Triggering HALTED")
+
+            # f = allow triggering
+            elif key == ord("f"):
+                platform.allow_triggering()
+                print("Triggering allowed")
+
+            # s = screenshot
+            elif key == ord("s"):
+                filename = datetime.now().strftime("screenshot_%Y%m%d_%H%M%S.png")
+                cv2.imwrite("screenshots/" + filename, frame)
+                print(f"Saved {filename}")
+
+    finally:
+        print("Cleaning up...")
+        
+        stop_event.set()
+
+        if cmd_thread.is_alive():
+            cmd_thread.join(timeout=1.0)
+        
+        if cmd_thread.is_alive():
+            print("Warning: command thread did not stop before link close")
+
+        try:
+            link.close()
+        except Exception as e:
+            print(f"Failed to close UDP link: {e}")
+        
+        cap.release()
+        cv2.destroyAllWindows()
+
+        print("Done.")
+    

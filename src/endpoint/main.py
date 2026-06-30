@@ -1,0 +1,96 @@
+import board
+
+import src.endpoint.config as config
+from src.endpoint.drivers.servo_driver import ServoDriver
+from src.endpoint.mechanisms.foam_mechanism import FoamMechanism
+from src.endpoint.mechanisms.orient_mechanism import OrientMechanism
+from src.endpoint.controller import EndpointController, CmdResult
+from src.endpoint.server import EndpointServer
+
+from src.comm.link import UdpLink
+from src.comm.network_config import(
+    PRIMARY_IP, 
+    ENDPOINT_IP,
+    UDP_PORT,
+    PRIMARY_NODE_ID,
+    ENDPOINT_NODE_ID,
+    DEFAULT_MAX_PACKET_BYTES
+)
+
+
+if __name__ == "__main__": 
+
+    i2c = board.I2C()
+
+    servo_driver = ServoDriver(
+        i2c=i2c,
+        frequency_hz=config.PCA9685_FREQUENCY_HZ, 
+        num_channels=config.PCA9685_NUM_CHANNELS,
+        default_calibration=config.DEFAULT_SERVO_CALIBRATION
+    )
+
+    for channel, calibration in config.SERVO_CALIBRATIONS.items():
+        servo_driver.set_channel_calibration(channel, calibration)
+
+
+    orient_mechanism = OrientMechanism(
+        servo_driver=servo_driver,
+        pan_channel=config.PAN_CHANNEL,
+        tilt_channel=config.TILT_CHANNEL,
+        default_pan_deg=config.DEFAULT_PAN_ANGLE,
+        default_tilt_deg=config.DEFAULT_TILT_ANGLE
+    )
+    
+    foam_mechanism = FoamMechanism(
+        servo_driver=servo_driver,
+        foam_channel=config.FOAM_CHANNEL,
+        #...
+        #
+        #
+    )
+    
+    controller = EndpointController(orient_mechanism, foam_mechanism)
+
+    link = UdpLink(
+        local_ip=ENDPOINT_IP,
+        remote_ip=PRIMARY_IP,
+        port=UDP_PORT,
+        local_node_id=ENDPOINT_NODE_ID,
+        remote_node_id=PRIMARY_NODE_ID,
+        max_packet_bytes=DEFAULT_MAX_PACKET_BYTES,
+        check_remote_ip=True
+    )
+
+    server = EndpointServer(
+        controller, 
+        link, 
+        refresh_frequency_hz=120,
+        telemetry_frequency_hz=15
+    )
+
+    try:
+        go_safe_result = controller.go_safe()
+        if go_safe_result.is_error:
+            raise RuntimeError(go_safe_result.error_text)
+        
+        server.run()
+    
+    finally:
+    
+        try:
+            go_safe_result = controller.go_safe()
+            if go_safe_result.is_error:
+                print(f"Failed to enter safe mode during shutdown: {go_safe_result.error_text}")
+
+        except Exception as e:
+            print(f"Unexpected failure while entering safe mode during shutdown: {e}")
+
+        try:
+            link.close()
+        except Exception as e:
+            print(f"Failed to close UDP link: {e}")
+
+        try:
+            servo_driver.close(release=False)
+        except Exception as e:
+            print(f"Failed to close servo driver: {e}")

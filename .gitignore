@@ -1,0 +1,8 @@
+screenshots/*
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Local network settings
+src/comm/network_config_local.py
