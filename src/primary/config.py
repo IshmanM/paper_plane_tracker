@@ -46,5 +46,5 @@ SERVO_BIASES[SERVO_IDX["tilt"]] = 0.0 # degrees
 
 # Sign depends on your physical servo mounting.
 SERVO_SIGNS = np.zeros(NUM_SERVOS, dtype=float)
-SERVO_SIGNS[SERVO_IDX["pan"]] = 1.0 # If aiming right makes the servo move left, flip to -1.0.
+SERVO_SIGNS[SERVO_IDX["pan"]] = -1.0 # If aiming right makes the servo move left, flip to -1.0.
 SERVO_SIGNS[SERVO_IDX["tilt"]] = 1.0 # If aiming up makes the servo move down, flip to -1.0.
