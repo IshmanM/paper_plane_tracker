@@ -92,6 +92,8 @@ class ServoDriver:
         calibration = self.get_calibration(channel)
 
         used_angle_deg = calibration.cmd_to_adjusted_angle_deg(float(angle_deg))
+        
+        print("trim calibration used: ", calibration.angle_trim_deg, True) # FOR DEBUG ONLY
         print("used_angle_deg:", used_angle_deg ,flush=True) # FOR DEBUG ONLY
 
 
@@ -117,7 +119,6 @@ class ServoDriver:
 
         self.last_angle_deg[channel] = used_angle_deg
 
-        print("used_angle_deg: ", used_angle_deg, flush=True) # FOR DEBUG ONLY
         return used_angle_deg
 
 
