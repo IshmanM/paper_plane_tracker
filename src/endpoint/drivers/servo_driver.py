@@ -115,6 +115,7 @@ class ServoDriver:
 
         self.last_angle_deg[channel] = used_angle_deg
 
+        print("used_angle_deg",flush=True) # FOR DEBUG ONLY
         return used_angle_deg
 
 

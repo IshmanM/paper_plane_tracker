@@ -31,7 +31,7 @@ class ServoCalibration:
         max_angle_deg: float = 180.0,
         min_pulse_us: float = 500.0,
         max_pulse_us: float = 2500.0,
-        angle_trim_deg: float = 0
+        angle_trim_deg: float = 0.0
     ):
         self.min_angle_deg = float(min_angle_deg)
         self.max_angle_deg = float(max_angle_deg)
