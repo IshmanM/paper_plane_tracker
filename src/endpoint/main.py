@@ -30,7 +30,9 @@ if __name__ == "__main__":
     )
 
     for channel, calibration in config.SERVO_CALIBRATIONS.items():
+        
         servo_driver.set_channel_calibration(channel, calibration)
+        print("set servo calibrations: ", servo_driver.channel_calibrations) #FOR DEBUG ONLY
 
 
     orient_mechanism = OrientMechanism(
