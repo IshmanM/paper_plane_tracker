@@ -18,6 +18,7 @@ DEFAULT_CAL_MIN_ANGLE_DEG = 0.0
 DEFAULT_CAL_MAX_ANGLE_DEG = 180.0
 DEFAULT_MIN_PULSE_US = 500.0
 DEFAULT_MAX_PULSE_US = 2500.0
+DEFAULT_ANGLE_TRIM_DEG = 0.0
 
 
 def move_and_pause(
@@ -120,6 +121,13 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--angle-trim-deg",
+        type=float,
+        default=DEFAULT_ANGLE_TRIM_DEG,
+        help="Angle trim added to commanded angle before PWM conversion.",
+    )
+
+    parser.add_argument(
         "--move-home-on-start",
         action="store_true",
         help="Move to home angle before entering interactive mode.",
@@ -163,6 +171,7 @@ def main() -> None:
         f"Calibration: {args.cal_min_angle}-{args.cal_max_angle} deg "
         f"-> {args.min_pulse_us}-{args.max_pulse_us} us"
     )
+    print(f"Angle trim: {args.angle_trim_deg} deg")
     print(f"Home angle: {args.home_angle} deg")
     print()
     print("Before continuing:")
@@ -187,6 +196,7 @@ def main() -> None:
         max_angle_deg=args.cal_max_angle,
         min_pulse_us=args.min_pulse_us,
         max_pulse_us=args.max_pulse_us,
+        angle_trim_deg=args.angle_trim_deg,
     )
 
     i2c = board.I2C()
