@@ -91,7 +91,7 @@ class ServoDriver:
 
         calibration = self.get_calibration(channel)
 
-        used_angle_deg = float(angle_deg)
+        used_angle_deg = calibration.cmd_to_adjusted_angle_deg(float(angle_deg))
 
         if clamp_to_calibration:
             used_angle_deg = self._clip(

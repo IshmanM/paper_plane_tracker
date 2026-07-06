@@ -31,13 +31,17 @@ class ServoCalibration:
         max_angle_deg: float = 180.0,
         min_pulse_us: float = 500.0,
         max_pulse_us: float = 2500.0,
+        angle_trim_deg: float = 0
     ):
         self.min_angle_deg = float(min_angle_deg)
         self.max_angle_deg = float(max_angle_deg)
         self.min_pulse_us = float(min_pulse_us)
         self.max_pulse_us = float(max_pulse_us)
+         # raw_servo_angle = commanded_angle + angle_trim_deg
+        self.angle_trim_deg = float(angle_trim_deg)
 
         self.validate()
+
 
     def validate(self) -> None:
         values = [
@@ -45,6 +49,7 @@ class ServoCalibration:
             self.max_angle_deg,
             self.min_pulse_us,
             self.max_pulse_us,
+            self.angle_trim_deg
         ]
 
         if not all(math.isfinite(x) for x in values):
@@ -55,3 +60,12 @@ class ServoCalibration:
 
         if self.max_pulse_us <= self.min_pulse_us:
             raise ValueError("max_pulse_us must be greater than min_pulse_us")
+        
+    
+    def cmd_to_adjusted_angle_deg(self, cmd_angle_deg: float) -> float:
+        cmd_angle_deg = float(cmd_angle_deg)
+
+        if not math.isfinite(cmd_angle_deg):
+            raise ValueError("cmd_angle_deg must be finite")
+
+        return cmd_angle_deg + self.angle_trim_deg
