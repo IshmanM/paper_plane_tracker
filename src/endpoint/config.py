@@ -33,7 +33,7 @@ SERVO_CALIBRATIONS = {
         max_angle_deg=180.0,
         min_pulse_us=500.0,
         max_pulse_us=2500.0,
-        angle_trim_deg=0
+        angle_trim_deg=5
     ),
 
     TILT_CHANNEL: ServoCalibration(
