@@ -149,7 +149,12 @@ class EndpointController:
             )
 
         try:
-            if (not triggering_halted) and trigger:
+            if triggering_halted:
+                # Apply the halt only when transitioning into the halted state.
+                if not self.foam_mechanism.trigger_is_halted():
+                    self.foam_mechanism.halt_trigger()
+            elif trigger:
+                # trigger() automatically clears the temporary halt.
                 self.foam_mechanism.trigger()
 
         except FoamMechanismError as e:

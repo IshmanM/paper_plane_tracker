@@ -52,3 +52,8 @@ SERVO_CALIBRATIONS = {
         angle_trim_deg=0
     ),
 }
+
+FOAM_RESET_ANGLE_DEG = 
+FOAM_RESET_HOLD_DELAY = 0.05 # seconds
+FOAM_TRIGGER_ANGLE_DEG = 
+FOAM_TRIGGER_HOLD_DELAY = 0.05 # seconds

@@ -6,7 +6,7 @@ FPS = 60
 PX_FOCAL_LENGTH = 500  # depends on frame width/height and = to the average of a few (reference_pixel_width * reference_distance / reference_width).
 W =  0.0635 # real marker width (assuming W is appx H)
 
-UDP_TX_DELAY = 0.001
+UDP_TX_DELAY = 0.001 # seconds
 
 
 SERVO_NAMES = ("pan", "tilt")
