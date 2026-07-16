@@ -34,10 +34,10 @@ class DCMotorDriver:
             name="motor_2_gpio_pins",
         )
 
-        if isinstance(pwm_frequency_hz, bool):
-            raise ValueError("pwm_frequency_hz must be an integer")
-
-        if not isinstance(pwm_frequency_hz, int):
+        if isinstance(pwm_frequency_hz, bool) or not isinstance(
+            pwm_frequency_hz,
+            int,
+        ):
             raise ValueError("pwm_frequency_hz must be an integer")
 
         if pwm_frequency_hz <= 0:
@@ -45,7 +45,7 @@ class DCMotorDriver:
 
         all_pins = motor_1_gpio_pins + motor_2_gpio_pins
 
-        if len(set(all_pins)) != len(all_pins):
+        if self._contains_duplicate_pins(all_pins):
             raise ValueError(
                 "Each motor-driver input must use a different GPIO pin"
             )
@@ -82,10 +82,9 @@ class DCMotorDriver:
                 frequency=pwm_frequency_hz,
                 duty_cycle=0,
             )
-
         except Exception:
-            # Release any outputs that were created before the failure.
-            self._deinit_outputs()
+            # Do not let cleanup failures hide the original setup error.
+            self._deinit_outputs(suppress_errors=True)
             raise
 
     def set_speeds(
@@ -108,17 +107,24 @@ class DCMotorDriver:
         with self._lock:
             self._ensure_open()
 
-            # Briefly stop each motor before applying a new direction.
-            self._set_motor_speed(
-                in1=self._motor_1_in1,
-                in2=self._motor_1_in2,
-                speed=motor_1_speed,
-            )
-            self._set_motor_speed(
-                in1=self._motor_2_in1,
-                in2=self._motor_2_in2,
-                speed=motor_2_speed,
-            )
+            try:
+                self._set_motor_speed(
+                    in1=self._motor_1_in1,
+                    in2=self._motor_1_in2,
+                    speed=motor_1_speed,
+                )
+                self._set_motor_speed(
+                    in1=self._motor_2_in1,
+                    in2=self._motor_2_in2,
+                    speed=motor_2_speed,
+                )
+            except Exception:
+                # Do not leave one motor running if the other update fails.
+                try:
+                    self._stop_all_unlocked()
+                except Exception:
+                    pass
+                raise
 
     def stop_all(self) -> None:
         """
@@ -136,17 +142,39 @@ class DCMotorDriver:
             if self._closed:
                 return
 
+            first_error = None
+
             try:
                 self._stop_all_unlocked()
-            finally:
+            except Exception as exc:
+                first_error = exc
+
+            try:
                 self._deinit_outputs()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+            finally:
                 self._closed = True
 
+            if first_error is not None:
+                raise first_error
+
     def _stop_all_unlocked(self) -> None:
-        self._motor_1_in1.duty_cycle = 0
-        self._motor_1_in2.duty_cycle = 0
-        self._motor_2_in1.duty_cycle = 0
-        self._motor_2_in2.duty_cycle = 0
+        first_error = None
+
+        for output in self._outputs():
+            if output is None:
+                continue
+
+            try:
+                output.duty_cycle = 0
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+
+        if first_error is not None:
+            raise first_error
 
     @classmethod
     def _set_motor_speed(
@@ -166,23 +194,52 @@ class DCMotorDriver:
         elif speed < 0.0:
             in2.duty_cycle = duty_cycle
 
-    def _deinit_outputs(self) -> None:
-        outputs = (
+    def _deinit_outputs(self, suppress_errors: bool = False) -> None:
+        first_error = None
+
+        output_attributes = (
+            "_motor_1_in1",
+            "_motor_1_in2",
+            "_motor_2_in1",
+            "_motor_2_in2",
+        )
+
+        for attribute_name in output_attributes:
+            output = getattr(self, attribute_name)
+
+            try:
+                if output is not None:
+                    output.deinit()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+            finally:
+                setattr(self, attribute_name, None)
+
+        if first_error is not None and not suppress_errors:
+            raise first_error
+
+    def _outputs(self) -> tuple[object, object, object, object]:
+        return (
             self._motor_1_in1,
             self._motor_1_in2,
             self._motor_2_in1,
             self._motor_2_in2,
         )
 
-        for output in outputs:
-            if output is not None:
-                output.deinit()
-
     def _ensure_open(self) -> None:
         if self._closed:
             raise RuntimeError(
                 "Cannot use DC motor driver after it has been closed"
             )
+
+    @staticmethod
+    def _contains_duplicate_pins(pins: tuple[object, ...]) -> bool:
+        return any(
+            pin == other_pin
+            for index, pin in enumerate(pins)
+            for other_pin in pins[index + 1:]
+        )
 
     @staticmethod
     def _validate_gpio_pair(
