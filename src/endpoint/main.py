@@ -36,6 +36,7 @@ if __name__ == "__main__":
     dc_motor_driver = DCMotorDriver(
         motor_1_gpio_pins=(board.D5, board.D6,),
         motor_2_gpio_pins=(board.D16,board.D20,),
+        pwm_frequency_hz=20000
     )
 
     orient_mechanism = OrientMechanism(
@@ -50,8 +51,8 @@ if __name__ == "__main__":
         servo_driver=servo_driver,
         dc_motor_driver=dc_motor_driver,
         foam_channel=config.FOAM_CHANNEL,
-        motor_1_speed=0.5,
-        motor_2_speed=0.5
+        motor_1_speed=0.8,
+        motor_2_speed=0.8
     )
     
     controller = EndpointController(orient_mechanism, foam_mechanism)
