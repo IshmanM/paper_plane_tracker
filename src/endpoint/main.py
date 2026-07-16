@@ -6,6 +6,7 @@ from src.endpoint.mechanisms.foam_mechanism import FoamMechanism
 from src.endpoint.mechanisms.orient_mechanism import OrientMechanism
 from src.endpoint.controller import EndpointController, CmdResult
 from src.endpoint.server import EndpointServer
+from src.endpoint.drivers.dc_motor_driver import DCMotorDriver
 
 from src.comm.link import UdpLink
 from src.comm.network_config import(
@@ -32,6 +33,10 @@ if __name__ == "__main__":
     for channel, calibration in config.SERVO_CALIBRATIONS.items():
         servo_driver.set_channel_calibration(channel, calibration)
 
+    dc_motor_driver = DCMotorDriver(
+        motor_1_gpio_pins=(board.D5, board.D6,),
+        motor_2_gpio_pins=(board.D16,board.D20,),
+    )
 
     orient_mechanism = OrientMechanism(
         servo_driver=servo_driver,
@@ -43,10 +48,10 @@ if __name__ == "__main__":
     
     foam_mechanism = FoamMechanism(
         servo_driver=servo_driver,
+        dc_motor_driver=dc_motor_driver,
         foam_channel=config.FOAM_CHANNEL,
-        #...
-        #
-        #
+        motor_1_speed=0.5,
+        motor_2_speed=0.5
     )
     
     controller = EndpointController(orient_mechanism, foam_mechanism)
@@ -86,9 +91,21 @@ if __name__ == "__main__":
             print(f"Unexpected failure while entering safe mode during shutdown: {e}")
 
         try:
+            # Stop the worker thread and ensure the trigger servo is reset.
+            foam_mechanism.stop()
+        except Exception as e:
+            print(f"Failed to stop foam mechanism: {e}")
+    
+        try:
             link.close()
         except Exception as e:
             print(f"Failed to close UDP link: {e}")
+
+        try:
+            # Release the PWM GPIO resources after FoamMechanism has stopped.
+            dc_motor_driver.close()
+        except Exception as e:
+            print(f"Failed to close DC motor driver: {e}")
 
         try:
             servo_driver.close(release=False)

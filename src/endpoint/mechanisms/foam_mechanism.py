@@ -24,15 +24,15 @@ class FoamMechanism:
         servo_driver: ServoDriver,
         dc_motor_driver: DCMotorDriver,
         foam_channel: int,
-        motor_a_speed: float,
-        motor_b_speed: float,
+        motor_1_speed: float,
+        motor_2_speed: float,
     ):
         self.servo_driver = servo_driver
         self.dc_motor_driver = dc_motor_driver
 
         self.foam_channel = foam_channel
-        self.motor_a_speed = motor_a_speed
-        self.motor_b_speed = motor_b_speed
+        self.motor_1_speed = motor_1_speed
+        self.motor_2_speed = motor_2_speed
 
         # Serializes trigger, halt, and stop commands.
         self._command_lock = threading.RLock()
@@ -259,8 +259,8 @@ class FoamMechanism:
     def _start_dc_motors(self) -> None:
         # Motor signs may differ because the flywheels face opposite ways.
         self.dc_motor_driver.set_speeds(
-            motor_a_speed=self.motor_a_speed,
-            motor_b_speed=self.motor_b_speed,
+            motor_1_speed=self.motor_1_speed,
+            motor_2_speed=self.motor_2_speed,
         )
 
 
