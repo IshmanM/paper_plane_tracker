@@ -10,7 +10,7 @@ CAMERA_TO_PLATFORM_R = np.array([
 ])
 
 # meters camera x, y, z relative to platform origin
-CAMERA_ORIGIN_IN_PLATFORM = np.array([-0.2, 0.15, 0.0], dtype=float) 
+CAMERA_ORIGIN_IN_PLATFORM = np.array([-0.5, 0.15, 0.0], dtype=float) 
 
 
 
