@@ -12,7 +12,7 @@ FOAM_CHANNEL = 2
 
 
 DEFAULT_PAN_ANGLE = 90.0
-DEFAULT_TILT_ANGLE = 45.0
+DEFAULT_TILT_ANGLE = 30.0 # using different relative theta
 
 
 DEFAULT_SERVO_CALIBRATION = ServoCalibration(
