@@ -15,9 +15,6 @@ DEFAULT_PAN_ANGLE = 90.0
 DEFAULT_TILT_ANGLE = 45.0
 
 
-TILT_SERVO_OFFSET_DEG = 10.0
-
-
 DEFAULT_SERVO_CALIBRATION = ServoCalibration(
     min_angle_deg=0.0,
     max_angle_deg=180.0,

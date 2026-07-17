@@ -28,7 +28,7 @@ MIN_SERVO_ANGLES[SERVO_IDX["pan"]] = 0.0 # degrees
 MIN_SERVO_ANGLES[SERVO_IDX["tilt"]] = 0.0 # degrees
 
 MAX_SERVO_ANGLES = np.zeros(NUM_SERVOS, dtype=float)
-MAX_SERVO_ANGLES[SERVO_IDX["pan"]] = 180.0 # degrees
+MAX_SERVO_ANGLES[SERVO_IDX["pan"]] = 175.0 # degrees
 MAX_SERVO_ANGLES[SERVO_IDX["tilt"]] = 85.0 # degrees
 
 SERVO_DEADBAND = np.zeros(NUM_SERVOS, dtype=float)
@@ -46,5 +46,5 @@ SERVO_BIASES[SERVO_IDX["tilt"]] = 0.0 # degrees
 
 # Sign depends on your physical servo mounting.
 SERVO_SIGNS = np.zeros(NUM_SERVOS, dtype=float)
-SERVO_SIGNS[SERVO_IDX["pan"]] = -1.0 # If aiming right makes the servo move left, flip to -1.0.
+SERVO_SIGNS[SERVO_IDX["pan"]] = 1.0 # If aiming right makes the servo move left, flip to -1.0.
 SERVO_SIGNS[SERVO_IDX["tilt"]] = 1.0 # If aiming up makes the servo move down, flip to -1.0.
