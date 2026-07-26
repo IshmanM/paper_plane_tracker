@@ -51,8 +51,8 @@ if __name__ == "__main__":
         servo_driver=servo_driver,
         dc_motor_driver=dc_motor_driver,
         foam_channel=config.FOAM_CHANNEL,
-        motor_1_speed=0.95,
-        motor_2_speed=0.95
+        motor_1_speed=0.98,
+        motor_2_speed=0.98
     )
     
     controller = EndpointController(orient_mechanism, foam_mechanism)
