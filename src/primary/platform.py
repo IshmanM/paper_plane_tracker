@@ -233,6 +233,7 @@ class Platform:
 
         self.active_plan = self._make_off_plan(now)
         self.mode = PlatformMode.OFF
+        self.triggering_halted = True
 
         self.comm_buffer.set_platform_snapshot(
             active_plan=self.active_plan,
