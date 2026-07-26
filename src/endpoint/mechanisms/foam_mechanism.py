@@ -6,6 +6,7 @@ from src.endpoint.config import (
     FOAM_RESET_HOLD_DELAY,
     FOAM_TRIGGER_ANGLE_DEG,
     FOAM_TRIGGER_HOLD_DELAY,
+    FOAM_MOTOR_SPINUP_DELAY,
 )
 from src.endpoint.drivers.servo_driver import ServoDriver
 from src.endpoint.drivers.dc_motor_driver import DCMotorDriver
@@ -43,7 +44,7 @@ class FoamMechanism:
         # Wakes the worker for a new trigger sequence.
         self._trigger_event = threading.Event()
 
-        # Interrupts the firing hold and begins servo reset.
+        # Interrupts the triggering hold and begins servo reset.
         self._interrupt_event = threading.Event()
 
         # Permanently shuts down the worker.
@@ -55,6 +56,8 @@ class FoamMechanism:
 
         self._trigger_in_progress = False
         self._trigger_halted = True
+
+        self._dc_motors_started_time: float | None = None # None if motors are stopped
 
         # Initialize both motors and the trigger servo safely.
         try:
@@ -73,24 +76,21 @@ class FoamMechanism:
         self._worker_thread.start()
 
 
-    def trigger(self) -> None:
+    def arm(self) -> None:
         """
-        Start one asynchronous trigger sequence.
+        Enable triggering and start the flywheel motors.
 
-        A trigger command automatically clears a temporary halt and
-        starts both flywheel motors.
+        Calling arm repeatedly while already armed has no effect.
         """
         with self._command_lock:
             with self._state_lock:
                 if self._stop_event.is_set():
                     raise FoamMechanismError(
-                        "Cannot trigger foam mechanism after it has stopped."
+                        "Cannot arm foam mechanism after it has stopped."
                     )
 
-                if self._trigger_in_progress:
-                    raise FoamMechanismError(
-                        "Foam trigger sequence is already in progress."
-                    )
+                if not self._trigger_halted:
+                    return
 
             try:
                 self._start_dc_motors()
@@ -101,12 +101,37 @@ class FoamMechanism:
 
             with self._state_lock:
                 self._trigger_halted = False
+
+
+    def trigger(self) -> None:
+        """
+        Start one asynchronous trigger sequence.
+
+        The mechanism must already be armed. The worker waits for any
+        remaining flywheel spin-up time before moving the trigger servo.
+        """
+        with self._command_lock:
+            with self._state_lock:
+                if self._stop_event.is_set():
+                    raise FoamMechanismError(
+                        "Cannot trigger foam mechanism after it has stopped."
+                    )
+
+                if self._trigger_halted:
+                    raise FoamMechanismError(
+                        "Cannot trigger foam mechanism while triggering is halted."
+                    )
+
+                if self._trigger_in_progress:
+                    raise FoamMechanismError(
+                        "Foam trigger sequence is already in progress."
+                    )
+
                 self._trigger_in_progress = True
 
                 self._interrupt_event.clear()
                 self._sequence_done_event.clear()
 
-            # Wake the worker after reserving the mechanism.
             self._trigger_event.set()
 
 
@@ -114,11 +139,15 @@ class FoamMechanism:
         """
         Halt triggering and return the servo to its reset position.
 
-        An active firing hold is interrupted. Both DC motors are stopped
+        An active triggering hold is interrupted. Both DC motors are stopped
         only after the trigger servo has completed its reset.
         """
         with self._command_lock:
             with self._state_lock:
+                if (self._trigger_halted and not self._trigger_in_progress and self._dc_motors_started_time is None):
+                    # return early if already halted to avoid extra delay
+                    return
+     
                 self._trigger_halted = True
                 trigger_in_progress = self._trigger_in_progress
 
@@ -205,10 +234,23 @@ class FoamMechanism:
 
             try:
                 if trigger_cancelled:
-                    # Halt or stop arrived before firing began.
                     self._return_to_reset()
                 else:
-                    self._perform_trigger_sequence()
+                    with self._state_lock:
+                        motors_started_time = self._dc_motors_started_time
+
+                    if motors_started_time is None:
+                        raise FoamMechanismError("Cannot trigger because the DC motors are not running.")
+
+                    motor_run_time = time.perf_counter() - motors_started_time
+                    remaining_spinup_time = max(0.0, FOAM_MOTOR_SPINUP_DELAY - motor_run_time)
+
+                    interrupted = self._interrupt_event.wait(remaining_spinup_time)
+
+                    if interrupted:
+                        self._return_to_reset()
+                    else:
+                        self._perform_trigger_sequence()
 
             except Exception as exc:
                 # The original trigger() call has already returned.
@@ -232,7 +274,13 @@ class FoamMechanism:
 
     def _perform_trigger_sequence(self) -> None:
         try:
-            # Move the trigger servo into the firing position.
+            with self._state_lock:
+                trigger_cancelled = (self._trigger_halted or self._stop_event.is_set())
+
+            if trigger_cancelled or self._interrupt_event.is_set():
+                return
+            
+            # Move the trigger servo into the triggering position.
             self.servo_driver.set_angle_deg(
                 channel=self.foam_channel,
                 angle_deg=FOAM_TRIGGER_ANGLE_DEG,
@@ -263,7 +311,13 @@ class FoamMechanism:
             motor_2_speed=self.motor_2_speed,
         )
 
+        with self._state_lock:
+            self._dc_motors_started_time = time.perf_counter()
+
 
     def _stop_dc_motors(self) -> None:
         # Stop both DC motor outputs.
         self.dc_motor_driver.stop_all()
+
+        with self._state_lock:
+            self._dc_motors_started_time = None

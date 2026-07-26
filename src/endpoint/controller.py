@@ -100,8 +100,6 @@ class EndpointController:
         
 
     def _handle_cmd_platform_control(self, cmd: dict, now: float) -> CmdResult:
-        # Receiving a platform-control command means the endpoint is no longer safe.
-        self.safe = False
 
         payload = cmd.get("cmd_payload")
 
@@ -135,6 +133,9 @@ class EndpointController:
                 error_text=f"Invalid platform control payload: {e}",
             )
 
+        # Receiving a valid platform-control command means the endpoint is no longer in safe mode.
+        self.safe = False
+
         try:
             self.orient_mechanism.set_angles_deg(
                 pan_deg=pan_deg,
@@ -150,12 +151,17 @@ class EndpointController:
 
         try:
             if triggering_halted:
-                # Apply the halt only when transitioning into the halted state.
                 if not self.foam_mechanism.trigger_is_halted():
                     self.foam_mechanism.halt_trigger()
-            elif trigger:
-                # trigger() automatically clears the temporary halt.
-                self.foam_mechanism.trigger()
+
+            else:
+                if self.foam_mechanism.trigger_is_halted():
+                    # Starts the motors as soon as triggering is enabled.
+                    self.foam_mechanism.arm()
+
+                if trigger and not self.foam_mechanism.trigger_in_progress():
+                    # The worker waits for any remaining motor spin-up time.
+                    self.foam_mechanism.trigger()
 
         except FoamMechanismError as e:
             return CmdResult(
