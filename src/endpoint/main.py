@@ -33,10 +33,16 @@ if __name__ == "__main__":
     for channel, calibration in config.SERVO_CALIBRATIONS.items():
         servo_driver.set_channel_calibration(channel, calibration)
 
+    # dc_motor_driver = DCMotorDriver(
+    #     motor_1_gpio_pins=(board.D5, board.D6,),
+    #     motor_2_gpio_pins=(board.D16,board.D20,),
+    #     pwm_frequency_hz=20000
+    # )
     dc_motor_driver = DCMotorDriver(
-        motor_1_gpio_pins=(board.D5, board.D6,),
-        motor_2_gpio_pins=(board.D16,board.D20,),
-        pwm_frequency_hz=20000
+        motor_1_gpio_pins=(12, 18),
+        motor_2_gpio_pins=(13, 19),
+        pwm_frequency_hz=20_000,
+        sleep_gpio=None
     )
 
     orient_mechanism = OrientMechanism(
