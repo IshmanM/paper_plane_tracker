@@ -1,2 +1,4 @@
 numpy==2.4.6
 adafruit-circuitpython-pca9685
+gpiozero
+rpi-hardware-pwm
