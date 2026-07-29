@@ -1,10 +1,11 @@
 import cv2
 import numpy as np
+import os
 import threading
-from src.primary.tracking import TrackStatus, SingleObjectTracker
-from src.primary.detection import detectSingleObject
+from src.primary.tracking import TrackStatus, SingleObjectTracker, drawTrack
+from src.primary.detection import detectSingleObject, drawDetection
+from src.primary.object_vision_spec import ObjectType
 import src.primary.config as config
-from src.primary.geometry import estimateTargetImagePosition
 from datetime import datetime
 import time
 from src.primary.comm_buffer import CommBuffer, cmd_thread_main
@@ -22,18 +23,22 @@ from src.comm.network_config import(
 
 
 if __name__ == "__main__": 
+    object_type = ObjectType.TENNIS_BALL
+    # object_type = ObjectType.PAPER_PLANE_TRIANGLES
 
     cap = cv2.VideoCapture(0)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_H)
     cap.set(cv2.CAP_PROP_FPS, config.FPS)
 
+    if not cap.isOpened():
+        raise RuntimeError("Could not open camera.")
+
     tracker = SingleObjectTracker(
-    # params...
+        # params...
     )
 
     comm_buffer = CommBuffer()
-    
     platform = Platform(comm_buffer=comm_buffer)
 
     link = UdpLink(
@@ -49,51 +54,45 @@ if __name__ == "__main__":
     # link = None # FOR DEBUG ONLY
 
     stop_event = threading.Event()
-
     cmd_thread = threading.Thread(
         target=cmd_thread_main,
         args=(comm_buffer, stop_event, link),
         daemon=True # this is a background thread
     )
-
     cmd_thread.start()
+
+    os.makedirs("screenshots", exist_ok=True)
 
     last_detection_px_w = 0
     last_detection_px_h = 0
+    last_frame = None
 
     tracker_paused = False      # OpenCV/tracker runs by default
     platform_paused = True      # Platform OFF by default
     
     try:
         while cap.isOpened():    
-
             if not tracker_paused:
-                
                 frame_time = time.perf_counter()
                 ret, frame = cap.read() # doesn't always give latest frame but that's a future optimization.
+
                 if not ret:
                     print("Possible camera failure")
                     break
 
                 # Detect the object and produce a measurement
-                object_detected, detection, measurement = detectSingleObject(frame)
-                detection_label = "No detections"
-
+                object_detected, detection, measurement = detectSingleObject(frame, object_type)
+    
                 if object_detected:
                     last_detection_px_w = detection.px_w
                     last_detection_px_h = detection.px_h
-                    cv2.rectangle(
-                        frame, 
-                        (int(detection.u -detection.px_w/2), int(detection.v - detection.px_h/2)),
-                        (int(detection.u + detection.px_w/2), int(detection.v + detection.px_h/2)),
-                        color=(0,255,0), 
-                        thickness=2
-                    )
-                    
-                    cv2.circle(frame, (int(detection.u), int(detection.v)), radius=5, color=(0,255,0), thickness=-1)
+                    drawDetection(frame, detection)
 
-                    detection_label = "Measurement: (x: " + f"{measurement.x:.4f}" + ", y: " + f"{measurement.y:.4f}"  + ", z: " + f"{measurement.z:.4f}" + ")"
-                
+                detection_label = "No detections"
+                if not object_detected:
+                    detection_label = "No detection"
+                else:
+                    detection_label = (f"Measurement: x={measurement.x:.4f}, y={measurement.y:.4f}, z={measurement.z:.4f}")
 
 
                 # Track the object state & update the platform planner
@@ -102,33 +101,12 @@ if __name__ == "__main__":
                 
                 track_label = "Dead track"
                 if track_status == TrackStatus.CONFIRMED or track_status == TrackStatus.TENTATIVE:
-                    track_u, track_v = estimateTargetImagePosition(tracker.track.x, tracker.track.y, tracker.track.z)
-
                     # rectangle is drawn based on last detected px_w, px_h. might change this...
-                    cv2.rectangle(
-                        frame,
-                        (int(track_u - last_detection_px_w/2), int(track_v - last_detection_px_h/2)),
-                        (int(track_u + last_detection_px_w/2), int(track_v + last_detection_px_h/2)),
-                        color=(0,0,255), 
-                        thickness=2    
-                    )
-
-                    cv2.circle(frame, (int(track_u), int(track_v)), radius=5, color=(0,0,255), thickness=-1)
-
-                    velocity_2d = np.array([tracker.track.dx, tracker.track.dy], dtype=float)
-                    velocity_norm = np.linalg.norm(velocity_2d)
-                    if velocity_norm > 1e-6:
-                        arrow_length_px = 40
-                        direction = velocity_2d / velocity_norm
-                        arrow_end = (
-                            int(round(int(track_u) + arrow_length_px * direction[0])),
-                            int(round(int(track_v) + arrow_length_px * direction[1])),
-                        )
-                        cv2.arrowedLine(frame, (int(track_u), int(track_v)), arrow_end, (0, 0, 255), thickness=2, tipLength=0.25)
-
+                    drawTrack(frame, tracker.track, last_detection_px_w, last_detection_px_h,)
                     track_label = ("Confirmed" if track_status == TrackStatus.CONFIRMED else "Tentative") 
                     track_label = (
-                        track_label + " track: (x: " + f"{tracker.track.x:.4f}" + ", y: " + f"{tracker.track.y:.4f}"  + ", z: " + f"{tracker.track.z:.4f}" 
+                        track_label 
+                        + " track: (x: " + f"{tracker.track.x:.4f}" + ", y: " + f"{tracker.track.y:.4f}"  + ", z: " + f"{tracker.track.z:.4f}" 
                         + ", dx: " + f"{tracker.track.dx:.4f}" + ", dy: " + f"{tracker.track.dy:.4f}"  + ", dz: " + f"{tracker.track.dz:.4f}" + ")"
                     )
 
@@ -200,7 +178,7 @@ if __name__ == "__main__":
 
             # s = screenshot
             elif key == ord("s"):
-                filename = datetime.now().strftime("screenshot_%Y%m%d_%H%M%S.png")
+                filename = datetime.now().strftime(f"screenshot_{object_type.name.lower()}_%Y%m%d_%H%M%S.png")
                 cv2.imwrite("screenshots/" + filename, frame)
                 print(f"Saved {filename}")
 
@@ -222,6 +200,5 @@ if __name__ == "__main__":
         
         cap.release()
         cv2.destroyAllWindows()
-
         print("Done.")
     

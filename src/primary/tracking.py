@@ -1,6 +1,8 @@
 import numpy as np
 from enum import Enum, auto
 from src.primary.detection import Measurement
+from src.primary.geometry import estimateTargetImagePosition 
+import cv2
 
 class TrackStatus(Enum):
     TENTATIVE = auto()
@@ -83,6 +85,23 @@ class Track:
     @property
     def dz(self):
         return self.state[DZ]   
+
+
+def drawTrack( frame: np.ndarray, track, px_w: float, px_h: float, ) -> None:
+    track_u, track_v = estimateTargetImagePosition(track.x, track.y, track.z)
+    track_center = (int(round(track_u)), int(round(track_v)))
+
+    cv2.rectangle( frame, (int(round(track_u - px_w / 2)), int(round(track_v - px_h / 2))), (int(round(track_u + px_w / 2)), int(round(track_v + px_h / 2))), color=(0, 0, 255), thickness=2, )
+
+    cv2.circle( frame, track_center, radius=5, color=(0, 0, 255), thickness=-1, )
+
+    velocity_2d = np.array([track.dx, track.dy], dtype=float)
+    velocity_norm = np.linalg.norm(velocity_2d)
+    if velocity_norm > 1e-6:
+        arrow_length_px = 40
+        direction = velocity_2d / velocity_norm
+        arrow_end = (int(round(track_u + arrow_length_px * direction[0])), int(round(track_v + arrow_length_px * direction[1])), )
+        cv2.arrowedLine( frame, track_center, arrow_end, color=(0, 0, 255), thickness=2, tipLength=0.25, )
 
 
 # eventially need to make this tracker class derived from some base class, and use the base class in platform.py definitions

@@ -1,0 +1,98 @@
+from enum import Enum, auto
+import numpy as np
+
+from src.primary.color import ColorId
+
+
+class ObjectType(Enum):
+    TENNIS_BALL = auto()
+    PAPER_PLANE_TRIANGLES = auto()
+
+
+class TriangleMarkerSpec:
+    def __init__(
+        self,
+        color_id: ColorId,
+        object_vertices_m: np.ndarray | None = None,
+    ):
+        """
+        object_vertices_m contains the known triangle vertices in the
+        paper plane's object coordinate frame.
+
+        Expected shape:
+
+            [
+                [x1, y1, z1],
+                [x2, y2, z2],
+                [x3, y3, z3],
+            ]
+
+        The vertex order must correspond to the image-vertex order used
+        by the measurement creator.
+        """
+        self.color_id = color_id
+        self.object_vertices_m = object_vertices_m
+
+
+class ObjectVisionSpec:
+    def __init__(
+        self,
+        color_ids: list[ColorId],
+        minimum_contour_area_px: float,
+
+        polygon_epsilon_ratio: float = 0.03,
+        triangle_group_distance_factor: float = 3.0,
+        triangle_markers=None,
+    ):
+        self.color_ids = color_ids
+        self.minimum_contour_area_px = minimum_contour_area_px
+        self.polygon_epsilon_ratio = polygon_epsilon_ratio
+        self.triangle_group_distance_factor = triangle_group_distance_factor
+        self.triangle_markers = (
+            triangle_markers
+            if triangle_markers is not None
+            else []
+        )
+
+
+# todo 
+#   - The three object_vertices_m=None values are placeholders. 
+#     After deciding the exact triangle placement, 
+#     replace them with measured coordinates in the paper plane’s coordinate frame.
+#
+#   -adjust the number of triangles doe paper plane
+#   -maybe have multiple paper plane versions, 1,2,3
+#
+OBJECT_VISION_SPECS = {
+    ObjectType.TENNIS_BALL: ObjectVisionSpec(
+        color_ids=[
+            ColorId.TENNIS_GREEN,
+        ],
+        minimum_contour_area_px=100.0,
+    ),
+
+    ObjectType.PAPER_PLANE_TRIANGLES: ObjectVisionSpec(
+        color_ids=[
+            ColorId.GREEN,
+            ColorId.CYAN,
+            ColorId.MAGENTA,
+        ],
+        polygon_epsilon_ratio = 0.03,
+        triangle_group_distance_factor = 3.0,
+        minimum_contour_area_px=60.0,
+        triangle_markers=[
+            TriangleMarkerSpec(
+                color_id=ColorId.GREEN,
+                object_vertices_m=None,
+            ),
+            TriangleMarkerSpec(
+                color_id=ColorId.CYAN,
+                object_vertices_m=None,
+            ),
+            TriangleMarkerSpec(
+                color_id=ColorId.MAGENTA,
+                object_vertices_m=None,
+            ),
+        ],
+    ),
+}
