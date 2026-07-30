@@ -1,7 +1,7 @@
 import numpy as np
 from enum import Enum, auto
 from src.primary.detection import Measurement
-from src.primary.geometry import estimateTargetImagePosition 
+from src.primary.geometry import estimateObjectImagePosition 
 import cv2
 
 class TrackStatus(Enum):
@@ -88,7 +88,7 @@ class Track:
 
 
 def drawTrack( frame: np.ndarray, track, px_w: float, px_h: float, ) -> None:
-    track_u, track_v = estimateTargetImagePosition(track.x, track.y, track.z)
+    track_u, track_v = estimateObjectImagePosition(track.x, track.y, track.z)
     track_center = (int(round(track_u)), int(round(track_v)))
 
     cv2.rectangle( frame, (int(round(track_u - px_w / 2)), int(round(track_v - px_h / 2))), (int(round(track_u + px_w / 2)), int(round(track_v + px_h / 2))), color=(0, 0, 255), thickness=2, )

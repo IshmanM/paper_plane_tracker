@@ -16,9 +16,10 @@ CAMERA_ORIGIN_IN_PLATFORM = np.array([-0.5, 0.15, 0.0], dtype=float)
 
 # image frame to world frame relative to camera lens
 
-def estimateTargetWorldPosition(u, v, px_w, px_h):
+def estimateObjectWorldPosition(u, v, px_w, px_h, object_w):
     # Depth estimator based on emperical calibration & Pose Converter
-    z = config.PX_FOCAL_LENGTH*config.W/max(px_w, px_h)
+    z = config.PX_FOCAL_LENGTH*object_w/max(px_w, px_h)
+
     # Position estimate based on depth estimate
     x = (u - config.FRAME_W/2)*z/config.PX_FOCAL_LENGTH 
     y = (v - config.FRAME_H/2)*z/config.PX_FOCAL_LENGTH 
@@ -27,7 +28,7 @@ def estimateTargetWorldPosition(u, v, px_w, px_h):
 
 # world frame to image frame relative to camera lens
 
-def estimateTargetImagePosition(x, y, z):
+def estimateObjectImagePosition(x, y, z):
     if z <= 0:
         return 0, 0 
     u = (x * config.PX_FOCAL_LENGTH / z) + config.FRAME_W / 2
@@ -38,7 +39,7 @@ def estimateTargetImagePosition(x, y, z):
 
 # world frame to platform frame. Assuming platform position = servo position.
 
-def estimateTargetPlatformPosition(world_position: np.ndarray) -> np.ndarray:
+def estimateObjectPlatformPosition(world_position: np.ndarray) -> np.ndarray:
     """
     Convert object position from camera/world frame to platform frame.
     

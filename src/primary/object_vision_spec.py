@@ -43,9 +43,14 @@ class ObjectVisionSpec:
         polygon_epsilon_ratio: float = 0.03,
         triangle_group_distance_factor: float = 3.0,
         triangle_markers=None,
+
+        width=None,
+        height=None,
+        length=None
     ):
         self.color_ids = color_ids
         self.minimum_contour_area_px = minimum_contour_area_px
+
         self.polygon_epsilon_ratio = polygon_epsilon_ratio
         self.triangle_group_distance_factor = triangle_group_distance_factor
         self.triangle_markers = (
@@ -53,6 +58,10 @@ class ObjectVisionSpec:
             if triangle_markers is not None
             else []
         )
+
+        self.width = width # m
+        self.height = height # m
+        self.length = length # m
 
 
 # todo 
@@ -69,6 +78,9 @@ OBJECT_VISION_SPECS = {
             ColorId.TENNIS_GREEN,
         ],
         minimum_contour_area_px=100.0,
+        width=0.0635,
+        height=0.0635,
+        length=0.0635
     ),
 
     ObjectType.PAPER_PLANE_TRIANGLES: ObjectVisionSpec(
@@ -94,5 +106,8 @@ OBJECT_VISION_SPECS = {
                 object_vertices_m=None,
             ),
         ],
+        width=None,
+        height=None,
+        length=None
     ),
 }

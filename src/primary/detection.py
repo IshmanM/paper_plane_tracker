@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 import src.primary.config as config
-from src.primary.geometry import estimateTargetWorldPosition
+from src.primary.geometry import estimateObjectWorldPosition
 from enum import Enum, auto
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec
 from src.primary.color import COLOR_SPECS
@@ -69,7 +69,7 @@ def detectTennisBall(frame: np.ndarray, object_vision_spec: ObjectVisionSpec,) -
     if detection is None:
         return failedDetectionResult()
 
-    x, y, z = estimateTargetWorldPosition(detection.u, detection.v, detection.px_w, detection.px_h,)
+    x, y, z = estimateObjectWorldPosition(detection.u, detection.v, detection.px_w, detection.px_h, object_w=object_vision_spec.width)
     measurement = Measurement(x, y, z, None, None, None,)
 
     return True, detection, measurement

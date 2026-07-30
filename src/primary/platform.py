@@ -2,7 +2,7 @@
 from src.primary.tracking import Track, TrackStatus, SingleObjectTracker
 import numpy as np
 import time
-from src.primary.geometry import estimateTargetPlatformPosition
+from src.primary.geometry import estimateObjectPlatformPosition
 import src.primary.config as config
 from src.primary.comm_buffer import CommBuffer
 from src.primary.plan import Plan, PlanType
@@ -539,7 +539,7 @@ class Platform:
                 
 
             # 2. Transform object position into platform frame.
-            object_position_platform = estimateTargetPlatformPosition(object_position_world)
+            object_position_platform = estimateObjectPlatformPosition(object_position_world)
 
             # 3. Use platform-frame point to compute servo raw pan/tilt angles and projectile flight time
             angles_valid, q_raw, projectile_flight_time = self._object_position_to_servo_angles_and_flight_time(object_position_platform)
