@@ -7,13 +7,14 @@ import src.primary.config as config
 from src.primary.geometry import estimateObjectWorldPosition
 from enum import Enum, auto
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec
-from src.primary.color import COLOR_SPECS
+from src.primary.color import COLOR_SPECS, ColorId
 
+# Detection data passed between image processing, drawing, and measurement conversion.
 class TriangleDetection:
     def __init__(
         self, 
         vertices_px: list[list[float]] | np.ndarray, 
-        color_id: str | None = None,
+        color_id: ColorId | None = None,
     ):
         self.vertices_px = np.asarray(vertices_px, dtype=np.float64)
         self.color_id = color_id
@@ -59,6 +60,7 @@ class DetectionDebug:
 
 
 
+# Public detection entry points and shared result helpers.
 def detectSingleObject(frame: np.ndarray, object_type: ObjectType) -> tuple[bool, Detection, Measurement]:
 
     object_vision_spec = OBJECT_VISION_SPECS[object_type]
@@ -152,7 +154,9 @@ def drawDetection(frame: np.ndarray, detection: Detection,) -> None:
             )
 
 
+# Tennis-ball path: threshold configured colors, clean the mask, and use the largest valid blob.
 def findSingleObjectUsingLargestColorBlob(frame: np.ndarray, object_vision_spec: ObjectVisionSpec) -> Detection | None:
+    # Build one mask from every configured HSV range.
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     combined_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8,)
 
@@ -186,12 +190,14 @@ def findSingleObjectUsingLargestColorBlob(frame: np.ndarray, object_vision_spec:
     return Detection(u, v, px_w, px_h, )
 
 
+# Triangle path: find color-based candidates, group nearby markers, then select the best group.
 def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, debug: DetectionDebug | None = None) -> Detection | None:
     triangle_markers = object_vision_spec.triangle_markers
 
     if not triangle_markers:
         raise ValueError("object_vision_spec.triangle_markers cannot be empty")
 
+    # Build the per-color search list and lowest allowed triangle area.
     unique_color_ids = list(dict.fromkeys(marker.color_id for marker in triangle_markers))
     minimum_triangle_area_by_color = {
         color_id: min(
@@ -201,6 +207,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
         for color_id in unique_color_ids
     }
 
+    # Prepare shared masks, candidate storage, and optional debug frames.
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     triangle_candidates: list[TriangleDetection] = []
     combined_raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
@@ -214,6 +221,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
     else:
         contour_debug_frame = polygon_debug_frame = candidate_debug_frame = None
 
+    # Threshold and clean each marker color independently.
     for color_id in unique_color_ids:
         color_spec = COLOR_SPECS[color_id]
         color_name = color_id.name
@@ -236,6 +244,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
         if debug is not None:
             debug.addStage(f"Cleaned mask - {color_name}", cleaned_mask)
 
+        # Convert qualifying contours into three-vertex triangle candidates.
         contours, _ = cv2.findContours(cleaned_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         for contour in contours:
@@ -247,6 +256,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
             if contour_area < minimum_triangle_area_by_color[color_id]:
                 continue
 
+            # Bridge small outline gaps before approximating the triangle.
             hull = cv2.convexHull(contour)
             perimeter = cv2.arcLength(hull, True)
 
@@ -288,6 +298,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
     if not triangle_candidates:
         return None
 
+    # Form the largest valid nearby groups allowed by the marker specification.
     triangle_groups = groupTriangleCandidates(triangle_candidates, object_vision_spec)
 
     if debug is not None:
@@ -313,6 +324,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
     if not triangle_groups:
         return None
 
+    # Prefer more visible markers, then greater combined triangle area.
     best_triangle_group = selectBestTriangleGroup(triangle_groups)
 
     if debug is not None:
@@ -329,6 +341,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
         cv2.putText(best_group_debug_frame, f"Selected best group: {len(best_triangle_group)}/{len(triangle_markers)} markers", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)        
         debug.addStage("Selected best triangle group", best_group_debug_frame)
 
+    # Use the selected markers' combined image bounds as the detection bounds.
     all_best_vertices = np.concatenate([triangle.vertices_px for triangle in best_triangle_group], axis=0)
     bbox_x, bbox_y, px_w, px_h = cv2.boundingRect(all_best_vertices.astype(np.float32))
     detection = Detection(
@@ -349,11 +362,13 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
     return detection
 
 
+# Triangle grouping and selection helpers.
 def groupTriangleCandidates(triangle_candidates: list[TriangleDetection], object_vision_spec: ObjectVisionSpec) -> list[list[TriangleDetection]]:
     triangle_markers = object_vision_spec.triangle_markers
     required_color_counts = Counter(marker.color_id for marker in triangle_markers)
     maximum_group_size = min(len(triangle_candidates), len(triangle_markers))
 
+    # Collect the configured count and minimum area for each marker color.
     marker_minimum_areas_by_color: dict[ColorId, list[float]] = {}
 
     for marker in triangle_markers:
@@ -368,6 +383,7 @@ def groupTriangleCandidates(triangle_candidates: list[TriangleDetection], object
     for marker_index, marker in enumerate(triangle_markers):
         marker_color_order.setdefault(marker.color_id, marker_index)
 
+    # Prefer the largest valid group, then fall back to partial groups.
     for group_size in range(maximum_group_size, 0, -1):
         triangle_groups: list[list[TriangleDetection]] = []
 
@@ -375,9 +391,11 @@ def groupTriangleCandidates(triangle_candidates: list[TriangleDetection], object
             triangle_group = list(triangle_combination)
             group_color_counts = Counter(triangle.color_id for triangle in triangle_group)
 
+            # Partial groups may omit markers but cannot exceed a configured color count.
             if any(count > required_color_counts[color_id] for color_id, count in group_color_counts.items()):
                 continue
 
+            # Require every marker to connect through the group's nearby-marker graph.
             connected_indices, pending_indices = {0}, [0]
 
             while pending_indices:
@@ -394,6 +412,7 @@ def groupTriangleCandidates(triangle_candidates: list[TriangleDetection], object
             if len(connected_indices) != group_size:
                 continue
 
+            # Enforce the applicable per-marker minimum area for each color.
             valid_group = True
 
             for color_id, color_count in group_color_counts.items():
@@ -426,7 +445,8 @@ def triangleCandidatesAreNear(triangle_1: TriangleDetection, triangle_2: Triangl
 def selectBestTriangleGroup(triangle_groups: list[list[TriangleDetection]]) -> list[TriangleDetection]:
     return max(triangle_groups, key=lambda group: (len(group), sum(cv2.contourArea(triangle.vertices_px.astype(np.float32)) for triangle in group),),)
 
-def createMeasurementUsingTriangleGroup(triangle_group: list[TriangleDetection]) -> Detection:
+# Convert the selected image-space detection into a world-space measurement.
+def createMeasurementUsingTriangleGroup(detection: Detection, object_vision_spec: ObjectVisionSpec) -> Measurement:
 
     #todo: implement
     #
