@@ -33,7 +33,7 @@ COLOR_SPECS = {
     ColorId.GREEN: ColorSpec(
         hsv_ranges=[
             (
-                np.array([40, 120, 100], dtype=np.uint8),
+                np.array([40, 25, 100], dtype=np.uint8),
                 np.array([80, 255, 255], dtype=np.uint8),
             ),
         ],
