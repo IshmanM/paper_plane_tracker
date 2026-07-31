@@ -264,7 +264,9 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
                 continue
 
             polygon = cv2.approxPolyDP(hull, object_vision_spec.polygon_epsilon_ratio * perimeter, True)
-
+            if len(polygon) > 3 and len(polygon) < 6: #special case, more leniency
+                polygon = cv2.approxPolyDP(contour, (object_vision_spec.polygon_epsilon_ratio + 0.02) * perimeter, True)
+            
             if polygon_debug_frame is not None:
                 cv2.polylines(polygon_debug_frame, [polygon], True, draw_bgr, 2)
                 polygon_center = np.mean(polygon.reshape(-1, 2), axis=0).astype(np.int32)
@@ -325,7 +327,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
         return None
 
     # Prefer more visible markers, then greater combined triangle area.
-    best_triangle_group = selectBestTriangleGroup(triangle_groups)
+    best_triangle_group = selectBestTriangleGroup(triangle_groups, object_vision_spec)
 
     if debug is not None:
         best_group_debug_frame = frame.copy()
@@ -442,8 +444,55 @@ def triangleCandidatesAreNear(triangle_1: TriangleDetection, triangle_2: Triangl
     return np.linalg.norm(center_1 - center_2) <= distance_factor * reference_size
 
 
-def selectBestTriangleGroup(triangle_groups: list[list[TriangleDetection]]) -> list[TriangleDetection]:
-    return max(triangle_groups, key=lambda group: (len(group), sum(cv2.contourArea(triangle.vertices_px.astype(np.float32)) for triangle in group),),)
+def selectBestTriangleGroup(
+    triangle_groups: list[list[TriangleDetection]], object_vision_spec: ObjectVisionSpec,
+    marker_count_weight: float = 0.80, compactness_weight: float = 0.15, area_weight: float = 0.05,
+) -> list[TriangleDetection] | None:
+
+    # Todo: Perhaps use object_vision_spec.object_vertices_m to reward groups matching the expected physical marker layout.
+
+    if not triangle_groups:
+        return None
+
+    # Normalize triangle area relative to the largest average group area.
+    maximum_average_area = max(
+        sum(cv2.contourArea(triangle.vertices_px.astype(np.float32)) for triangle in group) / len(group)
+        for group in triangle_groups
+    )
+
+    best_group = None
+    best_score = float("-inf")
+
+    # Score each candidate group using marker count, compactness, and marker area.
+    for group in triangle_groups:
+        marker_count_score = len(group) / len(object_vision_spec.color_ids)
+        maximum_normalized_distance = 0.0
+
+        # Measure the greatest separation between any two triangles relative to their sizes.
+        for i, triangle_1 in enumerate(group):
+            for triangle_2 in group[i + 1:]:
+                center_1, center_2 = np.mean(triangle_1.vertices_px, axis=0), np.mean(triangle_2.vertices_px, axis=0)
+                size_1 = np.max(np.linalg.norm(triangle_1.vertices_px[:, None] - triangle_1.vertices_px[None, :], axis=2))
+                size_2 = np.max(np.linalg.norm(triangle_2.vertices_px[:, None] - triangle_2.vertices_px[None, :], axis=2))
+                normalized_distance = np.linalg.norm(center_1 - center_2) / max((size_1 + size_2) / 2.0, 1e-6)
+                maximum_normalized_distance = max(maximum_normalized_distance, normalized_distance)
+
+        # Groups near the permitted distance limit receive a lower compactness score.
+        compactness_score = (
+            max(0.0, 1.0 - maximum_normalized_distance / object_vision_spec.triangle_group_distance_factor)
+            if len(group) > 1 else 0.0
+        )
+
+        average_area = sum(cv2.contourArea(triangle.vertices_px.astype(np.float32)) for triangle in group) / len(group)
+        area_score = average_area / maximum_average_area if maximum_average_area > 0.0 else 0.0
+
+        score = marker_count_weight * marker_count_score + compactness_weight * compactness_score + area_weight * area_score
+
+        if score > best_score:
+            best_group, best_score = group, score
+
+    return best_group
+
 
 # Convert the selected image-space detection into a world-space measurement.
 def createMeasurementUsingTriangleGroup(detection: Detection, object_vision_spec: ObjectVisionSpec) -> Measurement:

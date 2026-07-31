@@ -93,7 +93,7 @@ OBJECT_VISION_SPECS = {
             ColorId.CYAN,
             ColorId.MAGENTA,
         ],
-        polygon_epsilon_ratio = 0.03,
+        polygon_epsilon_ratio = 0.04,
         triangle_group_distance_factor = 3.0,
         minimum_contour_area_px=80.0,
         triangle_markers=[
