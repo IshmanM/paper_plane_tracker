@@ -88,10 +88,7 @@ def detectTennisBall(frame: np.ndarray, object_vision_spec: ObjectVisionSpec,) -
     return True, detection, measurement
 
 
-def detectPaperPlaneTriangles(
-    frame: np.ndarray,
-    object_vision_spec: ObjectVisionSpec,
-) -> tuple[bool, Detection, Measurement]:
+def detectPaperPlaneTriangles(frame: np.ndarray, object_vision_spec: ObjectVisionSpec,) -> tuple[bool, Detection, Measurement]:
 
     detection = findSingleObjectUsingBestTriangleGroup(frame, object_vision_spec,)
 
@@ -208,7 +205,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
     triangle_candidates: list[TriangleDetection] = []
     combined_raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
     combined_cleaned_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
 
     if debug is not None:
         debug.stages.clear()
@@ -232,7 +229,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
             debug.addStage(f"Raw mask - {color_name}", raw_mask)
 
         cleaned_mask = cv2.medianBlur(raw_mask, 5)
-        cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_OPEN, kernel)
+        # cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_OPEN, kernel)
         cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, kernel)
         combined_cleaned_mask = cv2.bitwise_or(combined_cleaned_mask, cleaned_mask)
 
@@ -250,12 +247,13 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
             if contour_area < minimum_triangle_area_by_color[color_id]:
                 continue
 
-            perimeter = cv2.arcLength(contour, True)
+            hull = cv2.convexHull(contour)
+            perimeter = cv2.arcLength(hull, True)
 
             if perimeter <= 0:
                 continue
 
-            polygon = cv2.approxPolyDP(contour, object_vision_spec.polygon_epsilon_ratio * perimeter, True)
+            polygon = cv2.approxPolyDP(hull, object_vision_spec.polygon_epsilon_ratio * perimeter, True)
 
             if polygon_debug_frame is not None:
                 cv2.polylines(polygon_debug_frame, [polygon], True, draw_bgr, 2)
@@ -287,7 +285,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
 
         debug.addStage("Accepted triangle candidates", candidate_debug_frame)
 
-    if len(triangle_candidates) < len(triangle_markers):
+    if not triangle_candidates:
         return None
 
     triangle_groups = groupTriangleCandidates(triangle_candidates, object_vision_spec)
@@ -305,7 +303,7 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
 
             bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(all_group_vertices.astype(np.float32))
             cv2.rectangle(group_debug_frame, (bbox_x, bbox_y), (bbox_x + bbox_w, bbox_y + bbox_h), (255, 255, 255), 2)
-            cv2.putText(group_debug_frame, f"G{group_index}: marker match", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(group_debug_frame, f"G{group_index}: {len(triangle_group)}/{len(triangle_markers)} markers", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
 
         if not triangle_groups:
             cv2.putText(group_debug_frame, "No groups matched triangle_markers", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
@@ -328,10 +326,16 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
 
         bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(all_best_vertices.astype(np.float32))
         cv2.rectangle(best_group_debug_frame, (bbox_x, bbox_y), (bbox_x + bbox_w, bbox_y + bbox_h), (0, 255, 0), 3)
-        cv2.putText(best_group_debug_frame, "Selected best matching group", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
+        cv2.putText(best_group_debug_frame, f"Selected best group: {len(best_triangle_group)}/{len(triangle_markers)} markers", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)        
         debug.addStage("Selected best triangle group", best_group_debug_frame)
 
-    detection = createMeasurementUsingTriangleGroup(best_triangle_group)
+    all_best_vertices = np.concatenate([triangle.vertices_px for triangle in best_triangle_group], axis=0)
+    bbox_x, bbox_y, px_w, px_h = cv2.boundingRect(all_best_vertices.astype(np.float32))
+    detection = Detection(
+        u=bbox_x + px_w/2.0, v=bbox_y + px_h/2.0,
+        px_w=float(px_w), px_h=float(px_h),
+        triangles=best_triangle_group
+    )
 
     if debug is not None:
         final_debug_frame = frame.copy()
@@ -347,58 +351,69 @@ def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec
 
 def groupTriangleCandidates(triangle_candidates: list[TriangleDetection], object_vision_spec: ObjectVisionSpec) -> list[list[TriangleDetection]]:
     triangle_markers = object_vision_spec.triangle_markers
-    required_triangle_count = len(triangle_markers)
     required_color_counts = Counter(marker.color_id for marker in triangle_markers)
-    triangle_groups: list[list[TriangleDetection]] = []
+    maximum_group_size = min(len(triangle_candidates), len(triangle_markers))
 
-    for triangle_combination in combinations(triangle_candidates, required_triangle_count):
-        triangle_group = list(triangle_combination)
+    marker_minimum_areas_by_color: dict[ColorId, list[float]] = {}
 
-        if Counter(triangle.color_id for triangle in triangle_group) != required_color_counts:
-            continue
+    for marker in triangle_markers:
+        minimum_area = marker.minimum_contour_area_px if marker.minimum_contour_area_px is not None else object_vision_spec.minimum_contour_area_px
+        marker_minimum_areas_by_color.setdefault(marker.color_id, []).append(minimum_area)
 
-        connected_indices, pending_indices = {0}, [0]
+    for minimum_areas in marker_minimum_areas_by_color.values():
+        minimum_areas.sort()
 
-        while pending_indices:
-            current_index = pending_indices.pop()
+    marker_color_order: dict[ColorId, int] = {}
 
-            for candidate_index in range(required_triangle_count):
-                if candidate_index in connected_indices:
-                    continue
+    for marker_index, marker in enumerate(triangle_markers):
+        marker_color_order.setdefault(marker.color_id, marker_index)
 
-                if triangleCandidatesAreNear(triangle_group[current_index], triangle_group[candidate_index], object_vision_spec.triangle_group_distance_factor):
-                    connected_indices.add(candidate_index)
-                    pending_indices.append(candidate_index)
+    for group_size in range(maximum_group_size, 0, -1):
+        triangle_groups: list[list[TriangleDetection]] = []
 
-        if len(connected_indices) != required_triangle_count:
-            continue
+        for triangle_combination in combinations(triangle_candidates, group_size):
+            triangle_group = list(triangle_combination)
+            group_color_counts = Counter(triangle.color_id for triangle in triangle_group)
 
-        triangles_by_color: dict[ColorId, list[TriangleDetection]] = {}
+            if any(count > required_color_counts[color_id] for color_id, count in group_color_counts.items()):
+                continue
 
-        for triangle in triangle_group:
-            triangles_by_color.setdefault(triangle.color_id, []).append(triangle)
+            connected_indices, pending_indices = {0}, [0]
 
-        for color_triangles in triangles_by_color.values():
-            color_triangles.sort(key=lambda triangle: (float(np.mean(triangle.vertices_px[:, 0])), float(np.mean(triangle.vertices_px[:, 1]))))
+            while pending_indices:
+                current_index = pending_indices.pop()
 
-        ordered_triangle_group: list[TriangleDetection] = []
-        valid_group = True
+                for candidate_index in range(group_size):
+                    if candidate_index in connected_indices:
+                        continue
 
-        for marker in triangle_markers:
-            triangle = triangles_by_color[marker.color_id].pop(0)
-            minimum_area = marker.minimum_contour_area_px if marker.minimum_contour_area_px is not None else object_vision_spec.minimum_contour_area_px
+                    if triangleCandidatesAreNear(triangle_group[current_index], triangle_group[candidate_index], object_vision_spec.triangle_group_distance_factor):
+                        connected_indices.add(candidate_index)
+                        pending_indices.append(candidate_index)
 
-            if cv2.contourArea(triangle.vertices_px.astype(np.float32)) < minimum_area:
-                valid_group = False
-                break
+            if len(connected_indices) != group_size:
+                continue
 
-            ordered_triangle_group.append(triangle)
+            valid_group = True
 
-        if valid_group:
-            triangle_groups.append(ordered_triangle_group)
+            for color_id, color_count in group_color_counts.items():
+                triangle_areas = sorted(cv2.contourArea(triangle.vertices_px.astype(np.float32)) for triangle in triangle_group if triangle.color_id == color_id)
+                minimum_areas = marker_minimum_areas_by_color[color_id][:color_count]
 
-    return triangle_groups
+                if any(triangle_area < minimum_area for triangle_area, minimum_area in zip(triangle_areas, minimum_areas)):
+                    valid_group = False
+                    break
 
+            if not valid_group:
+                continue
+
+            triangle_group.sort(key=lambda triangle: (marker_color_order[triangle.color_id], float(np.mean(triangle.vertices_px[:, 0])), float(np.mean(triangle.vertices_px[:, 1])),))
+            triangle_groups.append(triangle_group)
+
+        if triangle_groups:
+            return triangle_groups
+
+    return []
 
 def triangleCandidatesAreNear(triangle_1: TriangleDetection, triangle_2: TriangleDetection, distance_factor: float) -> bool:
     center_1, center_2 = np.mean(triangle_1.vertices_px, axis=0), np.mean(triangle_2.vertices_px, axis=0)
@@ -409,10 +424,12 @@ def triangleCandidatesAreNear(triangle_1: TriangleDetection, triangle_2: Triangl
 
 
 def selectBestTriangleGroup(triangle_groups: list[list[TriangleDetection]]) -> list[TriangleDetection]:
-    return max(triangle_groups, key=lambda group: sum(cv2.contourArea(triangle.vertices_px.astype(np.float32)) for triangle in group))
-
+    return max(triangle_groups, key=lambda group: (len(group), sum(cv2.contourArea(triangle.vertices_px.astype(np.float32)) for triangle in group),),)
 
 def createMeasurementUsingTriangleGroup(triangle_group: list[TriangleDetection]) -> Detection:
-    all_vertices_px = np.concatenate([triangle.vertices_px for triangle in triangle_group], axis=0)
-    bbox_x, bbox_y, px_w, px_h = cv2.boundingRect(all_vertices_px.astype(np.float32))
-    return Detection(u=bbox_x + px_w / 2.0, v=bbox_y + px_h / 2.0, px_w=float(px_w), px_h=float(px_h), triangles=triangle_group)
+
+    #todo: implement
+    #
+    #
+    #
+    raise NotImplementedError
