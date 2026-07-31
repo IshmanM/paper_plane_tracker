@@ -21,12 +21,13 @@ from src.comm.network_config import(
     DEFAULT_MAX_PACKET_BYTES
 )
 
+CAMERA_INDEX = 0
 
 if __name__ == "__main__": 
     object_type = ObjectType.TENNIS_BALL
     # object_type = ObjectType.PAPER_PLANE_TRIANGLES
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(CAMERA_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_H)
     cap.set(cv2.CAP_PROP_FPS, config.FPS)
@@ -179,7 +180,7 @@ if __name__ == "__main__":
             # s = screenshot
             elif key == ord("s"):
                 filename = datetime.now().strftime(f"screenshot_{object_type.name.lower()}_%Y%m%d_%H%M%S.png")
-                cv2.imwrite("screenshots/" + filename, frame)
+                cv2.imwrite("screenshots/primary_main_screenshots/" + filename, frame)
                 print(f"Saved {filename}")
 
     finally:

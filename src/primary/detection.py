@@ -46,6 +46,26 @@ class Measurement:
         self.yaw = yaw 
 
 
+class DetectionDebug:
+    def __init__(self):
+        self.stages: list[tuple[str, np.ndarray]] = []
+
+    def addStage(self, name: str, image: np.ndarray) -> None:
+        self.stages.append((name, image.copy()))
+
+
+DEBUG_COLORS_BGR = (
+    (0, 0, 255),
+    (0, 255, 0),
+    (255, 0, 0),
+    (0, 255, 255),
+    (255, 0, 255),
+    (255, 255, 0),
+    (0, 128, 255),
+    (255, 128, 0),
+)
+
+
 def detectSingleObject(frame: np.ndarray, object_type: ObjectType) -> tuple[bool, Detection, Measurement]:
 
     object_vision_spec = OBJECT_VISION_SPECS[object_type]
@@ -192,13 +212,35 @@ def createMeasurementUsingTriangleGroup(
     return Measurement(None, None, None, None, None, None,)
 
 
-def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec: ObjectVisionSpec,) -> Detection | None:
+def findSingleObjectUsingBestTriangleGroup(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, debug: DetectionDebug | None = None) -> Detection | None:
+
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    triangle_candidates: list[TriangleDetection] = []
+
+    combined_raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+    combined_cleaned_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    if debug is not None:
+        debug.stages.clear()
+        debug.addStage("Original image", frame)
+
+        contour_debug_frame = frame.copy()
+        polygon_debug_frame = frame.copy()
+        candidate_debug_frame = frame.copy()
+    else:
+        contour_debug_frame = None
+        polygon_debug_frame = None
+        candidate_debug_frame = None
+
+
+
 
     # Todo: implement this...
     #
     #
 
 
-
+    return
     raise NotImplementedError
 
