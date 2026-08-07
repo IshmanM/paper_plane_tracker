@@ -34,7 +34,7 @@ COLOR_SPECS = {
         hsv_ranges=[
             (
                 np.array([40, 25, 100], dtype=np.uint8),
-                np.array([80, 255, 255], dtype=np.uint8),
+                np.array([90, 255, 255], dtype=np.uint8),
             ),
         ],
         draw_bgr=(0, 255, 0),
@@ -43,8 +43,8 @@ COLOR_SPECS = {
     ColorId.CYAN: ColorSpec(
         hsv_ranges=[
             (
-                np.array([82, 40, 100], dtype=np.uint8),
-                np.array([105, 255, 255], dtype=np.uint8),
+                np.array([94, 60, 95], dtype=np.uint8),
+                np.array([114, 255, 255], dtype=np.uint8),
             ),
         ],
         draw_bgr=(255, 255, 0),

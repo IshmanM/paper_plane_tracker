@@ -1,7 +1,7 @@
 import cv2
 import numpy as np
 from collections import Counter
-from itertools import combinations
+from itertools import combinations, permutations
 
 import src.primary.config as config
 from src.primary.geometry import estimateObjectWorldPosition
@@ -98,6 +98,9 @@ def detectPaperPlaneTriangles(frame: np.ndarray, object_vision_spec: ObjectVisio
         return failedDetectionResult()
 
     measurement = createMeasurementUsingTriangleGroup(detection, object_vision_spec,)
+
+    if measurement.x is None:
+        return False, detection, measurement
 
     return True, detection, measurement
 
@@ -436,6 +439,7 @@ def groupTriangleCandidates(triangle_candidates: list[TriangleDetection], object
 
     return []
 
+
 def triangleCandidatesAreNear(triangle_1: TriangleDetection, triangle_2: TriangleDetection, distance_factor: float) -> bool:
     center_1, center_2 = np.mean(triangle_1.vertices_px, axis=0), np.mean(triangle_2.vertices_px, axis=0)
     _, _, width_1, height_1 = cv2.boundingRect(triangle_1.vertices_px.astype(np.float32))
@@ -496,9 +500,114 @@ def selectBestTriangleGroup(
 
 # Convert the selected image-space detection into a world-space measurement.
 def createMeasurementUsingTriangleGroup(detection: Detection, object_vision_spec: ObjectVisionSpec) -> Measurement:
+    failed_measurement = Measurement(None, None, None, None, None, None,)
 
-    #todo: implement
-    #
-    #
-    #
-    raise NotImplementedError
+    if not detection.triangles:
+        return failed_measurement
+
+    marker_indices_by_color: dict[ColorId, list[int]] = {}
+    for marker_index, marker in enumerate(object_vision_spec.triangle_markers):
+        marker_indices_by_color.setdefault(marker.color_id, []).append(marker_index)
+
+    object_point_groups, image_point_groups, used_marker_indices = [], [], set()
+    edge_pairs = ((0, 1), (1, 2), (2, 0))
+
+    # Match every detected triangle to its physical marker and determine its vertex correspondence.
+    for triangle in detection.triangles:
+        available_marker_indices = [
+            marker_index for marker_index in marker_indices_by_color.get(triangle.color_id, [])
+            if marker_index not in used_marker_indices
+        ]
+
+        if len(available_marker_indices) != 1:
+            raise ValueError(f"Detected color {triangle.color_id} must match exactly one unused triangle marker")
+
+        marker_index = available_marker_indices[0]
+        marker = object_vision_spec.triangle_markers[marker_index]
+
+        if marker.object_vertices_m is None:
+            raise ValueError(f"Triangle marker {triangle.color_id} has no object_vertices_m")
+
+        marker_vertices_m = np.asarray(marker.object_vertices_m, dtype=np.float64)
+        triangle_vertices_px = np.asarray(triangle.vertices_px, dtype=np.float64)
+
+        if marker_vertices_m.shape != (3, 3):
+            raise ValueError(f"object_vertices_m for {triangle.color_id} must have shape (3, 3)")
+        if triangle_vertices_px.shape != (3, 2):
+            raise ValueError(f"vertices_px for {triangle.color_id} must have shape (3, 2)")
+        if not np.all(np.isfinite(marker_vertices_m)) or not np.all(np.isfinite(triangle_vertices_px)):
+            return failed_measurement
+
+        # approxPolyDP does not guarantee a useful vertex order. Select the ordering whose edge-length ratios
+        # most closely resemble the known physical triangle.
+        object_edge_lengths = np.array([np.linalg.norm(marker_vertices_m[i] - marker_vertices_m[j]) for i, j in edge_pairs])
+        object_shape_norm = np.linalg.norm(object_edge_lengths)
+
+        if object_shape_norm <= 1e-12:
+            raise ValueError(f"object_vertices_m for {triangle.color_id} form a degenerate triangle")
+
+        normalized_object_edge_lengths = object_edge_lengths/object_shape_norm
+        best_vertices_px, best_shape_error = None, float("inf")
+
+        for vertex_order in permutations(range(3)):
+            ordered_vertices_px = triangle_vertices_px[list(vertex_order)]
+            image_edge_lengths = np.array([np.linalg.norm(ordered_vertices_px[i] - ordered_vertices_px[j]) for i, j in edge_pairs])
+            image_shape_norm = np.linalg.norm(image_edge_lengths)
+
+            if image_shape_norm <= 1e-12:
+                continue
+
+            shape_error = float(np.linalg.norm(image_edge_lengths/image_shape_norm - normalized_object_edge_lengths))
+
+            if shape_error < best_shape_error:
+                best_vertices_px, best_shape_error = ordered_vertices_px, shape_error
+
+        if best_vertices_px is None:
+            return failed_measurement
+
+        object_point_groups.append(marker_vertices_m)
+        image_point_groups.append(best_vertices_px)
+        used_marker_indices.add(marker_index)
+
+    object_points = np.concatenate(object_point_groups, axis=0)
+    image_points = np.concatenate(image_point_groups, axis=0)
+
+    # TODO: Replace these approximate intrinsics and zero distortion with calibrated camera parameters.
+    focal_length_px = float(config.PX_FOCAL_LENGTH)
+    camera_matrix = np.array([
+        [focal_length_px, 0.0, config.FRAME_W/2.0],
+        [0.0, focal_length_px, config.FRAME_H/2.0],
+        [0.0, 0.0, 1.0],
+    ], dtype=np.float64)
+    distortion_coefficients = np.zeros((5, 1), dtype=np.float64)
+
+    # SQPnP supports a partial group containing only one three-vertex marker.
+    solution_count, rotation_vectors, translation_vectors, _ = cv2.solvePnPGeneric(
+        object_points, image_points, camera_matrix, distortion_coefficients, flags=cv2.SOLVEPNP_SQPNP,
+    )
+
+    if not solution_count:
+        return failed_measurement
+
+    best_translation, best_reprojection_error = None, float("inf")
+
+    # Reject poses behind the camera and select the solution that best reproduces the detected vertices.
+    for rotation_vector, translation_vector in zip(rotation_vectors, translation_vectors):
+        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+        camera_points = (rotation_matrix@object_points.T + translation_vector.reshape(3, 1)).T
+
+        if np.any(camera_points[:, 2] <= 0.0):
+            continue
+
+        projected_points, _ = cv2.projectPoints(
+            object_points, rotation_vector, translation_vector, camera_matrix, distortion_coefficients,
+        )
+        reprojection_error = float(np.sqrt(np.mean(np.sum((projected_points.reshape(-1, 2) - image_points)**2, axis=1))))
+
+        if reprojection_error < best_reprojection_error:
+            best_translation, best_reprojection_error = translation_vector.reshape(3), reprojection_error
+
+    if best_translation is None or not np.all(np.isfinite(best_translation)):
+        return failed_measurement
+
+    return Measurement(float(best_translation[0]), float(best_translation[1]), float(best_translation[2]), None, None, None,)

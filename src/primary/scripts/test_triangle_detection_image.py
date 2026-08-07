@@ -8,7 +8,7 @@ import numpy as np
 
 from src.primary.config import FRAME_W, FRAME_H
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType
-from src.primary.detection import DetectionDebug, findSingleObjectUsingBestTriangleGroup
+from src.primary.detection import DetectionDebug, findSingleObjectUsingBestTriangleGroup, drawDetection, createMeasurementUsingTriangleGroup
 
 
 WINDOW_NAME = "Detection stages"
@@ -251,10 +251,10 @@ def main() -> None:
 
     print(f"Input image: {args.image_path.resolve()}")
     print(f"Image size: {frame_width} x {frame_height}")
-    print(f"Recorded stages: {len(debug.stages)}")
 
     if detection is None:
         print("Detection result: no object detected")
+        print("Measurement result: unavailable")
     else:
         print("Detection result:")
         print(f"  u: {detection.u:.2f} px")
@@ -263,11 +263,41 @@ def main() -> None:
         print(f"  height: {detection.px_h:.2f} px")
         print(f"  triangles: {len(detection.triangles)}")
 
+        measurement = createMeasurementUsingTriangleGroup(detection, object_vision_spec)
+        measurement_frame = frame.copy()
+        drawDetection(measurement_frame, detection)
+
+        if measurement.x is None or measurement.y is None or measurement.z is None:
+            print("Measurement result: unavailable")
+            measurement_lines = ["Measurement unavailable"]
+        else:
+            print("Measurement result:")
+            print(f"  x: {measurement.x:.4f} m")
+            print(f"  y: {measurement.y:.4f} m")
+            print(f"  z: {measurement.z:.4f} m")
+
+            measurement_lines = [
+                f"x: {measurement.x:.4f} m",
+                f"y: {measurement.y:.4f} m",
+                f"z: {measurement.z:.4f} m",
+            ]
+
+        # Add the world-space measurement as the final displayed and saved stage.
+        text_x, text_y = 20, 35
+
+        for line_index, line in enumerate(measurement_lines):
+            line_y = text_y + line_index*28
+            cv2.putText(measurement_frame, line, (text_x, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(measurement_frame, line, (text_x, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+        debug.addStage("World-space measurement", measurement_frame)
+
+    print(f"Recorded stages: {len(debug.stages)}")
+
     saveDetectionStages(debug.stages, args.save_dir)
 
     if not args.no_gui:
         showDetectionStages(debug.stages, args.columns)
-
 
 if __name__ == "__main__":
     main()

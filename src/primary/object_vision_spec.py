@@ -99,19 +99,27 @@ OBJECT_VISION_SPECS = {
         triangle_markers=[
             TriangleMarkerSpec(
                 color_id=ColorId.GREEN,
-                object_vertices_m=None,
+                object_vertices_m=np.array([
+                    [0.030, 0.000, -0.020],
+                    [-0.090,  0.000, -0.020],
+                    [-0.090,  0.000, 0.020],
+                ], dtype=np.float64),
                 minimum_contour_area_px=60.0,
             ),
             TriangleMarkerSpec(
                 color_id=ColorId.CYAN,
-                object_vertices_m=None,
+                object_vertices_m=np.array([
+                            [0.000, -0.024, 0.015],
+                            [-0.090,  -0.009, 0.030],
+                            [-0.095,  -0.041, 0.030],
+                        ], dtype=np.float64),
                 minimum_contour_area_px=60.0,
             ),
-            TriangleMarkerSpec(
-                color_id=ColorId.MAGENTA,
-                object_vertices_m=None,
-                minimum_contour_area_px=60.0,
-            ),
+            # TriangleMarkerSpec(
+            #     color_id=ColorId.MAGENTA,
+            #     object_vertices_m=None,
+            #     minimum_contour_area_px=60.0,
+            # ),
         ],
         width=None,
         height=None,

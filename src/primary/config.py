@@ -3,6 +3,8 @@ import numpy as np
 FRAME_W = 640
 FRAME_H = 480
 FPS = 60
+
+#todo: calibrate/fix this value
 PX_FOCAL_LENGTH = 500  # depends on frame width/height and = to the average of a few (reference_pixel_width * reference_distance / reference_width).
 
 UDP_TX_DELAY = 0.001 # seconds
