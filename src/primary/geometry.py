@@ -1,5 +1,6 @@
 import src.primary.config as config
 import numpy as np
+import cv2
 
 
 # need to tune platform rotation and translation according to design...
@@ -17,12 +18,19 @@ CAMERA_ORIGIN_IN_PLATFORM = np.array([-0.5, 0.15, 0.0], dtype=float)
 # image frame to world frame relative to camera lens
 
 def estimateObjectWorldPosition(u, v, px_w, px_h, object_w):
-    # Depth estimator based on emperical calibration & Pose Converter
-    z = config.PX_FOCAL_LENGTH*object_w/max(px_w, px_h)
+    fx, fy = config.CAMERA_MATRIX[0, 0], config.CAMERA_MATRIX[1, 1]
 
-    # Position estimate based on depth estimate
-    x = (u - config.FRAME_W/2)*z/config.PX_FOCAL_LENGTH 
-    y = (v - config.FRAME_H/2)*z/config.PX_FOCAL_LENGTH 
+    # Estimate depth using whichever detected dimension occupies more normalized image space.
+    z = object_w/max(px_w/fx, px_h/fy)
+
+    # Undistort the detected center and convert it to normalized camera coordinates.
+    center_px = np.array([[[u, v]]], dtype=np.float64)
+    normalized_center = cv2.undistortPoints(center_px, config.CAMERA_MATRIX, config.DISTORTION_COEFFICIENTS)
+    normalized_x, normalized_y = normalized_center[0, 0]
+
+    x = normalized_x*z
+    y = normalized_y*z
+
     return x, y, z
 
 
@@ -30,10 +38,16 @@ def estimateObjectWorldPosition(u, v, px_w, px_h, object_w):
 
 def estimateObjectImagePosition(x, y, z):
     if z <= 0:
-        return 0, 0 
-    u = (x * config.PX_FOCAL_LENGTH / z) + config.FRAME_W / 2
-    v = (y * config.PX_FOCAL_LENGTH / z) + config.FRAME_H / 2
-    return u, v
+        return 0, 0
+
+    object_point = np.array([[[x, y, z]]], dtype=np.float64)
+    image_point, _ = cv2.projectPoints(
+        object_point, np.zeros(3), np.zeros(3),
+        config.CAMERA_MATRIX, config.DISTORTION_COEFFICIENTS,
+    )
+
+    u, v = image_point[0, 0]
+    return float(u), float(v)
 
 
 

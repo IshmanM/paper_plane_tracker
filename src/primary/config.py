@@ -4,8 +4,33 @@ FRAME_W = 640
 FRAME_H = 480
 FPS = 60
 
-#todo: calibrate/fix this value
-PX_FOCAL_LENGTH = 500  # depends on frame width/height and = to the average of a few (reference_pixel_width * reference_distance / reference_width).
+#todo: adjust calibration as needed
+# PX_FOCAL_LENGTH = 500  # depends on frame width/height and = to the average of a few (reference_pixel_width * reference_distance / reference_width).
+
+# CAMERA_MATRIX = np.array([
+#     [633.737631, 0.0, 308.887194],
+#     [0.0, 633.992320, 236.067349],
+#     [0.0, 0.0, 1.0],
+# ], dtype=np.float64)
+
+# DISTORTION_COEFFICIENTS = np.array([
+#     [0.09131862, -0.47045404, 0.00119751, 0.00289575, 0.76219894]
+# ], dtype=np.float64)
+
+CAMERA_MATRIX = np.array([
+    [640.820092, 0.0, 298.963328],
+    [0.0, 639.770129, 225.482995],
+    [0.0, 0.0, 1.0],
+], dtype=np.float64)
+
+DISTORTION_COEFFICIENTS = np.array([
+    [0.09141723, -0.39690385, -0.00317970, -0.00211780, 0.48441084]
+], dtype=np.float64)
+
+CAMERA_AUTOFOCUS = False
+CAMERA_FOCUS = 0  # tune
+
+
 
 UDP_TX_DELAY = 0.001 # seconds
 

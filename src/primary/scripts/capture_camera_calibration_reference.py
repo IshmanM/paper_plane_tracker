@@ -4,6 +4,7 @@ from pathlib import Path
 
 import cv2
 
+import src.primary.config as config
 from src.primary.config import FRAME_W, FRAME_H
 
 
@@ -82,6 +83,13 @@ def main() -> None:
     camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
     camera.set(cv2.CAP_PROP_FPS, args.camera_fps)
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    camera.set(cv2.CAP_PROP_AUTOFOCUS, 1 if config.CAMERA_AUTOFOCUS else 0)
+    if not config.CAMERA_AUTOFOCUS:
+        camera.set(cv2.CAP_PROP_FOCUS, config.CAMERA_FOCUS)
+
+    print(f"Autofocus: {camera.get(cv2.CAP_PROP_AUTOFOCUS)}")
+    print(f"Focus: {camera.get(cv2.CAP_PROP_FOCUS)}")
 
     actual_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))

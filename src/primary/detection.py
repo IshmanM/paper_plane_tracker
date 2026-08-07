@@ -572,14 +572,8 @@ def createMeasurementUsingTriangleGroup(detection: Detection, object_vision_spec
     object_points = np.concatenate(object_point_groups, axis=0)
     image_points = np.concatenate(image_point_groups, axis=0)
 
-    # TODO: Replace these approximate intrinsics and zero distortion with calibrated camera parameters.
-    focal_length_px = float(config.PX_FOCAL_LENGTH)
-    camera_matrix = np.array([
-        [focal_length_px, 0.0, config.FRAME_W/2.0],
-        [0.0, focal_length_px, config.FRAME_H/2.0],
-        [0.0, 0.0, 1.0],
-    ], dtype=np.float64)
-    distortion_coefficients = np.zeros((5, 1), dtype=np.float64)
+    camera_matrix = config.CAMERA_MATRIX
+    distortion_coefficients = config.DISTORTION_COEFFICIENTS
 
     # SQPnP supports a partial group containing only one three-vertex marker.
     solution_count, rotation_vectors, translation_vectors, _ = cv2.solvePnPGeneric(

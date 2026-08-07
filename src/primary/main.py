@@ -32,6 +32,13 @@ if __name__ == "__main__":
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_H)
     cap.set(cv2.CAP_PROP_FPS, config.FPS)
 
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1 if config.CAMERA_AUTOFOCUS else 0)
+    if not config.CAMERA_AUTOFOCUS:
+        cap.set(cv2.CAP_PROP_FOCUS, config.CAMERA_FOCUS)
+
+    print(f"Autofocus: {cap.get(cv2.CAP_PROP_AUTOFOCUS)}")
+    print(f"Focus: {cap.get(cv2.CAP_PROP_FOCUS)}")
+
     if not cap.isOpened():
         raise RuntimeError("Could not open camera.")
 
