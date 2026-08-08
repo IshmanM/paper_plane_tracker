@@ -23,8 +23,8 @@ COLOR_SPECS = {
     ColorId.TENNIS_GREEN: ColorSpec(
         hsv_ranges=[
             (
-                np.array([23, 35, 110], dtype=np.uint8),
-                np.array([40, 220, 255], dtype=np.uint8),
+                np.array([27, 35, 80], dtype=np.uint8),
+                np.array([38, 255, 255], dtype=np.uint8),
             ),
         ],
         draw_bgr=(0, 255, 0),
@@ -33,8 +33,8 @@ COLOR_SPECS = {
     ColorId.GREEN: ColorSpec(
         hsv_ranges=[
             (
-                np.array([63, 60, 70], dtype=np.uint8),
-                np.array([80, 170, 230], dtype=np.uint8),
+                np.array([60, 50, 65], dtype=np.uint8),
+                np.array([82, 180, 235], dtype=np.uint8),
             ),
         ],
         draw_bgr=(0, 255, 0),
@@ -43,8 +43,8 @@ COLOR_SPECS = {
     ColorId.CYAN: ColorSpec(
         hsv_ranges=[
             (
-                np.array([93, 105, 100], dtype=np.uint8),
-                np.array([104, 190, 175], dtype=np.uint8),
+                np.array([90, 80, 90], dtype=np.uint8),
+                np.array([106, 220, 185], dtype=np.uint8),
             ),
         ],
         draw_bgr=(255, 255, 0),

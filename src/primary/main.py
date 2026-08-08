@@ -141,8 +141,8 @@ if __name__ == "__main__":
             if key != 255: # FOR DEBUG ONLY
                 print(f"key pressed: {key}, char: {chr(key) if key < 128 else '?'}")
 
-            # q = quit
-            if key == ord("q"):
+            # q / Esc = quit
+            if key in (ord("q"), 27):
                 print("Quitting...")
                 platform.halt_triggering()
                 platform.turn_off()
@@ -189,8 +189,9 @@ if __name__ == "__main__":
             # s = screenshot
             elif key == ord("s"):
                 filename = datetime.now().strftime(f"screenshot_{object_vision_spec_id.name.lower()}_%Y%m%d_%H%M%S.png")
-                cv2.imwrite("screenshots/primary_main_screenshots/" + filename, frame)
-                print(f"Saved {filename}")
+                filepath = "images/primary_main_screenshots/" + filename
+                cv2.imwrite(filepath, frame)
+                print(f"Saved {filepath}")
 
     finally:
         print("Cleaning up...")
