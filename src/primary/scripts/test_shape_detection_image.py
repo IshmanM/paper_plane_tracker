@@ -8,7 +8,7 @@ import numpy as np
 
 from src.primary.config import FRAME_W, FRAME_H
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType
-from src.primary.detection import DetectionDebug, findSingleObjectUsingBestTriangleGroup, drawDetection, createMeasurementUsingTriangleGroup
+from src.primary.detection import DetectionDebug, findSingleObjectUsingBestShapeGroup, drawDetection, createMeasurementUsingShapeGroup
 
 
 WINDOW_NAME = "Detection stages"
@@ -246,8 +246,8 @@ def main() -> None:
         raise ValueError(f"Reference image is {frame_width}x{frame_height}, but config expects {FRAME_W}x{FRAME_H}.")
 
     debug = DetectionDebug()
-    object_vision_spec = OBJECT_VISION_SPECS[ObjectType.PAPER_PLANE_TRIANGLES]
-    detection = findSingleObjectUsingBestTriangleGroup(frame, object_vision_spec, debug)
+    object_vision_spec = OBJECT_VISION_SPECS[ObjectType.PAPER_PLANE_SHAPES]
+    detection = findSingleObjectUsingBestShapeGroup(frame, object_vision_spec, debug)
 
     print(f"Input image: {args.image_path.resolve()}")
     print(f"Image size: {frame_width} x {frame_height}")
@@ -261,9 +261,9 @@ def main() -> None:
         print(f"  v: {detection.v:.2f} px")
         print(f"  width: {detection.px_w:.2f} px")
         print(f"  height: {detection.px_h:.2f} px")
-        print(f"  triangles: {len(detection.triangles)}")
+        print(f"  shapes: {len(detection.shapes)}")
 
-        measurement = createMeasurementUsingTriangleGroup(detection, object_vision_spec)
+        measurement = createMeasurementUsingShapeGroup(detection, object_vision_spec)
         measurement_frame = frame.copy()
         drawDetection(measurement_frame, detection)
 

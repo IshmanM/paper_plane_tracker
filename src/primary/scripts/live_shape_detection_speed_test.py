@@ -7,10 +7,10 @@ import numpy as np
 
 from src.primary.config import FRAME_W, FRAME_H
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType
-from src.primary.detection import findSingleObjectUsingBestTriangleGroup, createMeasurementUsingTriangleGroup
+from src.primary.detection import findSingleObjectUsingBestShapeGroup, createMeasurementUsingShapeGroup
 
 
-WINDOW_NAME = "Live triangle detection speed test"
+WINDOW_NAME = "Live shape detection speed test"
 DEFAULT_CAMERA_INDEX = 0
 DEFAULT_CAMERA_FPS = 60
 DEFAULT_TIMING_WINDOW_FRAMES = 120
@@ -20,9 +20,9 @@ def drawDetection(frame: np.ndarray, detection) -> None:
     if detection is None:
         return
 
-    # Draw each detected marker triangle, followed by the resulting group bounds and center.
-    for triangle in detection.triangles:
-        vertices_px = np.rint(triangle.vertices_px).astype(np.int32).reshape((-1, 1, 2))
+    # Draw each detected marker shape, followed by the resulting group bounds and center.
+    for shape in detection.shapes:
+        vertices_px = np.rint(shape.vertices_px).astype(np.int32).reshape((-1, 1, 2))
         cv2.polylines(frame, [vertices_px], True, (255, 255, 255), 2, cv2.LINE_AA)
 
     top_left = (int(round(detection.u - detection.px_w/2)), int(round(detection.v - detection.px_h/2)))
@@ -33,7 +33,7 @@ def drawDetection(frame: np.ndarray, detection) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run live paper-plane triangle detection and measure its speed.")
+    parser = argparse.ArgumentParser(description="Run live paper-plane shape detection and measure its speed.")
     parser.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX,
                         help=f"Camera index. Default: {DEFAULT_CAMERA_INDEX}")
     parser.add_argument("--camera-fps", type=int, default=DEFAULT_CAMERA_FPS,
@@ -58,7 +58,7 @@ def main() -> None:
     camera.set(cv2.CAP_PROP_FPS, args.camera_fps)
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    object_vision_spec = OBJECT_VISION_SPECS[ObjectType.PAPER_PLANE_TRIANGLES]
+    object_vision_spec = OBJECT_VISION_SPECS[ObjectType.PAPER_PLANE_SHAPES]
     detection_times_s = deque(maxlen=args.timing_window)
     loop_periods_s = deque(maxlen=args.timing_window)
     previous_loop_start_s = None
@@ -92,13 +92,13 @@ def main() -> None:
                     f"but config expects {FRAME_W}x{FRAME_H}."
                 )
 
-            # Time only triangle detection; capture, measurement, drawing, and display are excluded.
+            # Time only shape detection; capture, measurement, drawing, and display are excluded.
             detection_start_s = time.perf_counter()
-            detection = findSingleObjectUsingBestTriangleGroup(frame, object_vision_spec)
+            detection = findSingleObjectUsingBestShapeGroup(frame, object_vision_spec)
             detection_times_s.append(time.perf_counter() - detection_start_s)
 
             measurement = (
-                createMeasurementUsingTriangleGroup(detection, object_vision_spec)
+                createMeasurementUsingShapeGroup(detection, object_vision_spec)
                 if detection is not None else None
             )
 
@@ -107,7 +107,7 @@ def main() -> None:
             average_detection_s = sum(detection_times_s)/len(detection_times_s)
             detector_rate_hz = 1.0/average_detection_s if average_detection_s > 0.0 else 0.0
             live_fps = 1.0/(sum(loop_periods_s)/len(loop_periods_s)) if loop_periods_s else 0.0
-            triangle_count = len(detection.triangles) if detection is not None else 0
+            shape_count = len(detection.shapes) if detection is not None else 0
 
             cv2.putText(
                 frame,
@@ -116,7 +116,7 @@ def main() -> None:
             )
             cv2.putText(
                 frame,
-                f"Live loop: {live_fps:.1f} FPS | triangles: {triangle_count}",
+                f"Live loop: {live_fps:.1f} FPS | shapes: {shape_count}",
                 (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2, cv2.LINE_AA,
             )
 
