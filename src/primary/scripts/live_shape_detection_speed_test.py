@@ -7,7 +7,7 @@ import numpy as np
 
 from src.primary.config import FRAME_W, FRAME_H
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpecId
-from src.primary.detection import findSingleObjectUsingBestShapeGroup, createMeasurementUsingShapeGroup
+from src.primary.detection import findSingleObjectUsingBestShapeGroup, createMeasurementUsingShapeGroup, drawModelOrigin
 
 
 WINDOW_NAME = "Live shape detection speed test"
@@ -26,7 +26,7 @@ def drawDetection(frame: np.ndarray, detection) -> None:
     if detection is None:
         return
 
-    # Draw each detected marker shape, followed by the resulting group bounds and center.
+    # Draw each detected marker shape, followed by the resulting group bounds and bbox center.
     for shape in detection.shapes:
         vertices_px = np.rint(shape.vertices_px).astype(np.int32).reshape((-1, 1, 2))
         cv2.polylines(frame, [vertices_px], True, (255, 255, 255), 1, cv2.LINE_AA)
@@ -58,7 +58,6 @@ def main() -> None:
     if args.timing_window < 1:
         parser.error("--timing-window must be at least 1.")
 
-    # Configure the camera to match the resolution expected by the detector.
     camera = cv2.VideoCapture(args.camera)
 
     if not camera.isOpened():
@@ -81,7 +80,7 @@ def main() -> None:
 
     print(f"Camera: {actual_width}x{actual_height} at reported {actual_fps:.1f} FPS")
     print(f"ObjectVisionSpecId: {object_vision_spec_id.name}")
-    print("Press Q or Esc to quit.")
+    print("Red dot = bbox center; yellow X = model origin. Press Q or Esc to quit.")
 
     try:
         while True:
@@ -91,7 +90,6 @@ def main() -> None:
                 loop_periods_s.append(loop_start_s - previous_loop_start_s)
 
             previous_loop_start_s = loop_start_s
-
             success, frame = camera.read()
 
             if not success:
@@ -100,49 +98,35 @@ def main() -> None:
             frame_height, frame_width = frame.shape[:2]
 
             if frame_width != FRAME_W or frame_height != FRAME_H:
-                raise ValueError(
-                    f"Camera produced {frame_width}x{frame_height}, "
-                    f"but config expects {FRAME_W}x{FRAME_H}."
-                )
+                raise ValueError(f"Camera produced {frame_width}x{frame_height}, but config expects {FRAME_W}x{FRAME_H}.")
 
             # Time only shape detection; capture, measurement, drawing, and display are excluded.
             detection_start_s = time.perf_counter()
             detection = findSingleObjectUsingBestShapeGroup(frame, object_vision_spec)
             detection_times_s.append(time.perf_counter() - detection_start_s)
 
-            measurement = (
-                createMeasurementUsingShapeGroup(detection, object_vision_spec)
-                if detection is not None else None
-            )
-
+            measurement = createMeasurementUsingShapeGroup(detection, object_vision_spec) if detection is not None else None
             drawDetection(frame, detection)
+
+            if measurement is not None:
+                drawModelOrigin(frame, measurement)
 
             average_detection_s = sum(detection_times_s)/len(detection_times_s)
             detector_rate_hz = 1.0/average_detection_s if average_detection_s > 0.0 else 0.0
             live_fps = 1.0/(sum(loop_periods_s)/len(loop_periods_s)) if loop_periods_s else 0.0
             shape_count = len(detection.shapes) if detection is not None else 0
 
-            cv2.putText(
-                frame,
-                f"Detection: {average_detection_s*1000.0:.2f} ms | detector rate: {detector_rate_hz:.1f} Hz",
-                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2, cv2.LINE_AA,
-            )
-            cv2.putText(
-                frame,
-                f"Live loop: {live_fps:.1f} FPS | shapes: {shape_count}",
-                (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2, cv2.LINE_AA,
-            )
+            cv2.putText(frame, f"Detection: {average_detection_s*1000.0:.2f} ms | detector rate: {detector_rate_hz:.1f} Hz",
+                        (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(frame, f"Live loop: {live_fps:.1f} FPS | shapes: {shape_count}",
+                        (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2, cv2.LINE_AA)
 
             if measurement is not None and measurement.x is not None and measurement.y is not None and measurement.z is not None:
                 measurement_text = f"x: {measurement.x:.3f} m | y: {measurement.y:.3f} m | z: {measurement.z:.3f} m"
             else:
                 measurement_text = "Measurement: unavailable"
 
-            cv2.putText(
-                frame, measurement_text,
-                (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2, cv2.LINE_AA,
-            )
-
+            cv2.putText(frame, measurement_text, (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2, cv2.LINE_AA)
             cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(1) & 0xFF
 

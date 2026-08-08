@@ -117,10 +117,26 @@ def drawDetection(frame: np.ndarray, detection: Detection,) -> None:
     for shape in detection.shapes:
         vertices_px = shape.vertices_px.astype(np.int32)
         color_spec = COLOR_SPECS[shape.color_id]
-        cv2.polylines(frame, [vertices_px.reshape(-1, 1, 2)], isClosed=True, color=color_spec.draw_bgr, thickness=2,)
+        cv2.polylines(frame, [vertices_px.reshape(-1, 1, 2)], isClosed=True, color=color_spec.draw_bgr, thickness=1,)
 
         for vertex_u, vertex_v in vertices_px:
             cv2.circle(frame, (int(vertex_u), int(vertex_v)), radius=4, color=color_spec.draw_bgr, thickness=-1,)
+
+
+def drawModelOrigin(frame: np.ndarray, measurement: Measurement,) -> None:
+    if measurement.x is None or measurement.y is None or measurement.z is None or measurement.z <= 0.0:
+        return
+
+    # The PnP translation is the model/object-frame origin in camera coordinates.
+    origin_px, _ = cv2.projectPoints(
+        np.zeros((1, 3), dtype=np.float64), np.zeros((3, 1), dtype=np.float64),
+        np.array([[measurement.x], [measurement.y], [measurement.z]], dtype=np.float64),
+        config.CAMERA_MATRIX, config.DISTORTION_COEFFICIENTS,
+    )
+    origin_u, origin_v = np.rint(origin_px.reshape(2)).astype(np.int32)
+    cv2.drawMarker(frame, (int(origin_u), int(origin_v)), (0, 255, 255), cv2.MARKER_TILTED_CROSS, 16, 2, cv2.LINE_AA)
+    cv2.putText(frame, "model origin", (int(origin_u) + 8, int(origin_v) - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
 
 # Tennis-ball path: threshold configured colors, clean the mask, and use the largest valid blob.
@@ -284,7 +300,9 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
     shape_candidates: list[ShapeDetection] = []
     combined_raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
     combined_cleaned_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    loose_hue_margin, loose_saturation_margin, loose_value_margin = 3, 25, 8
+    growth_iterations = 4
+    growth_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     if debug is not None:
         debug.stages.clear()
@@ -299,18 +317,47 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         color_name = color_id.name
         draw_bgr = color_spec.draw_bgr
         raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+        loose_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
 
+        # Strict HSV finds confident marker pixels; loose HSV allows nearby faded marker pixels.
         for lower_hsv, upper_hsv in color_spec.hsv_ranges:
             raw_mask = cv2.bitwise_or(raw_mask, cv2.inRange(hsv_frame, lower_hsv, upper_hsv))
+            loose_lower_hsv = np.array([
+                max(0, int(lower_hsv[0]) - loose_hue_margin),
+                max(15, int(lower_hsv[1]) - loose_saturation_margin),
+                max(50, int(lower_hsv[2]) - loose_value_margin),
+            ], dtype=np.uint8)
+            loose_upper_hsv = np.array([
+                min(179, int(upper_hsv[0]) + loose_hue_margin),
+                min(255, int(upper_hsv[1]) + loose_saturation_margin),
+                min(255, int(upper_hsv[2]) + loose_value_margin),
+            ], dtype=np.uint8)
+            loose_mask = cv2.bitwise_or(loose_mask, cv2.inRange(hsv_frame, loose_lower_hsv, loose_upper_hsv))
 
         combined_raw_mask = cv2.bitwise_or(combined_raw_mask, raw_mask)
 
         if debug is not None:
             debug.addStage(f"Raw mask - {color_name}", raw_mask)
+            debug.addStage(f"Loose mask - {color_name}", loose_mask)
 
-        cleaned_mask = cv2.medianBlur(raw_mask, 5)
-        # cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_OPEN, kernel)
-        cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, kernel)
+        # Remove tiny strict-color seeds before allowing limited growth into the loose mask.
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw_mask, connectivity=8)
+        seed_mask = np.zeros_like(raw_mask)
+        minimum_seed_area = max(3, int(round(0.10*minimum_shape_area_by_color[color_id])))
+
+        for label in range(1, num_labels):
+            if stats[label, cv2.CC_STAT_AREA] >= minimum_seed_area:
+                seed_mask[labels == label] = 255
+
+        loose_mask = cv2.medianBlur(loose_mask, 3)
+
+        # Grow confident marker pixels only a limited distance into plausible faded color.
+        cleaned_mask = seed_mask.copy()
+        for _ in range(growth_iterations):
+            grown_mask = cv2.dilate(cleaned_mask, growth_kernel)
+            cleaned_mask = cv2.bitwise_or(cleaned_mask, cv2.bitwise_and(grown_mask, loose_mask))
+
+        cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, growth_kernel)
         combined_cleaned_mask = cv2.bitwise_or(combined_cleaned_mask, cleaned_mask)
 
         if debug is not None:
@@ -337,7 +384,7 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
             base_polygon = cv2.approxPolyDP(hull, object_vision_spec.polygon_epsilon_ratio*perimeter, True)
 
             if polygon_debug_frame is not None:
-                cv2.polylines(polygon_debug_frame, [base_polygon], True, draw_bgr, 2)
+                cv2.polylines(polygon_debug_frame, [base_polygon], True, draw_bgr, 1)
                 polygon_center = np.mean(base_polygon.reshape(-1, 2), axis=0).astype(np.int32)
                 cv2.putText(polygon_debug_frame, f"{color_name}: {len(base_polygon)} vertices", tuple(polygon_center), cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_bgr, 1, cv2.LINE_AA)
 
@@ -366,7 +413,7 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
                     shape_index = len(shape_candidates) - 1
                     center_px = np.mean(vertices_px, axis=0).astype(np.int32)
                     shape_points = np.round(vertices_px).astype(np.int32).reshape(-1, 1, 2)
-                    cv2.polylines(candidate_debug_frame, [shape_points], True, draw_bgr, 3)
+                    cv2.polylines(candidate_debug_frame, [shape_points], True, draw_bgr, 1)
                     cv2.circle(candidate_debug_frame, tuple(center_px), 4, draw_bgr, -1)
                     cv2.putText(candidate_debug_frame, f"S{shape_index}: {color_name}, N={num_sides}", (int(center_px[0]) + 5, int(center_px[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_bgr, 2, cv2.LINE_AA)
 
@@ -395,7 +442,7 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
             for shape in shape_group:
                 draw_bgr = COLOR_SPECS[shape.color_id].draw_bgr
                 shape_points = np.round(shape.vertices_px).astype(np.int32).reshape(-1, 1, 2)
-                cv2.polylines(group_debug_frame, [shape_points], True, draw_bgr, 3)
+                cv2.polylines(group_debug_frame, [shape_points], True, draw_bgr, 1)
 
             bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(all_group_vertices.astype(np.float32))
             cv2.rectangle(group_debug_frame, (bbox_x, bbox_y), (bbox_x + bbox_w, bbox_y + bbox_h), (255, 255, 255), 2)
@@ -418,10 +465,10 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         for shape in best_shape_group:
             draw_bgr = COLOR_SPECS[shape.color_id].draw_bgr
             shape_points = np.round(shape.vertices_px).astype(np.int32).reshape(-1, 1, 2)
-            cv2.polylines(best_group_debug_frame, [shape_points], True, draw_bgr, 3)
+            cv2.polylines(best_group_debug_frame, [shape_points], True, draw_bgr, 1)
 
         bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(all_best_vertices.astype(np.float32))
-        cv2.rectangle(best_group_debug_frame, (bbox_x, bbox_y), (bbox_x + bbox_w, bbox_y + bbox_h), (0, 255, 0), 3)
+        cv2.rectangle(best_group_debug_frame, (bbox_x, bbox_y), (bbox_x + bbox_w, bbox_y + bbox_h), (0, 255, 0), 2)
         cv2.putText(best_group_debug_frame, f"Selected best group: {len(best_shape_group)}/{len(polygon_markers)} markers", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
         debug.addStage("Selected best shape group", best_group_debug_frame)
 
@@ -436,7 +483,7 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         final_debug_frame = frame.copy()
         bbox_x, bbox_y = int(round(detection.u - detection.px_w/2.0)), int(round(detection.v - detection.px_h/2.0))
         bbox_x_2, bbox_y_2 = int(round(detection.u + detection.px_w/2.0)), int(round(detection.v + detection.px_h/2.0))
-        cv2.rectangle(final_debug_frame, (bbox_x, bbox_y), (bbox_x_2, bbox_y_2), (0, 0, 255), 3)
+        cv2.rectangle(final_debug_frame, (bbox_x, bbox_y), (bbox_x_2, bbox_y_2), (0, 0, 255), 2)
         cv2.circle(final_debug_frame, (int(round(detection.u)), int(round(detection.v))), 5, (0, 0, 255), -1)
         cv2.putText(final_debug_frame, f"u={detection.u:.1f}, v={detection.v:.1f}, w={detection.px_w:.1f}, h={detection.px_h:.1f}", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
         debug.addStage("Final object detection", final_debug_frame)
