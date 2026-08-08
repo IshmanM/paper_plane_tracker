@@ -133,19 +133,19 @@ OBJECT_VISION_SPECS = {
             # Re-measure the final marker geometry and rigid-plane transforms more accurately.
             RigidPlaneSpec(
                 rotation_object_from_plane=np.array([
-                    [-1.0, 0.0, 0.0],
-                    [0.0, 0.0, 1.0],
-                    [0.0, 1.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, -1.0, 0.0],
+                    [0.0, 0.0, -1.0],
                 ], dtype=np.float64),
-                translation_object_from_plane_m=np.array([0.030, 0.000, -0.020], dtype=np.float64),
+                translation_object_from_plane_m=np.array([0.000, 0.000, 0.000], dtype=np.float64),
                 shape_markers=[
                     ShapeMarkerSpec(
                         color_id=ColorId.GREEN,
                         num_sides=3,
                         object_vertices_m=np.array([
                             [0.019, -0.020],
-                            [0.090, -0.020],
-                            [0.090, 0.020],
+                            [-0.090, -0.020],
+                            [-0.090, 0.020],
                         ], dtype=np.float64),
                         minimum_contour_area_px=60.0,
                     ),
@@ -163,9 +163,9 @@ OBJECT_VISION_SPECS = {
                         color_id=ColorId.CYAN,
                         num_sides=3,
                         object_vertices_m=np.array([
-                            [0.00000000, 0.00000000],
-                            [0.09246621, 0.00000000],
-                            [0.09214177, 0.03238664],
+                            [0.000, 0.000],
+                            [-0.091, 0.000],
+                            [-0.091, 0.035],
                         ], dtype=np.float64),
                         minimum_contour_area_px=60.0,
                     ),
