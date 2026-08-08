@@ -5,6 +5,7 @@ from tkinter import messagebox, ttk
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.ticker import FuncFormatter
 from mpl_toolkits.mplot3d import proj3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -23,15 +24,20 @@ ISOMETRIC_ELEV_DEG = 35.26438968
 ISOMETRIC_AZIM_DEG = -45.0
 ISOMETRIC_ROLL_DEG = -120.0
 
+# Orthographic-style presets are rolled so the airplane is oriented naturally:
+# top/bottom keep the nose (+x) upward; front/back/left/right keep +y visually downward.
 VIEW_PRESETS = {
-    "Top": (0.0, -90.0, 0.0),       # camera on -y
-    "Front": (0.0, 0.0, 0.0),       # camera on +x
-    "Back": (0.0, 180.0, 0.0),      # camera on -x
-    "Left": (90.0, 0.0, 0.0),       # camera on +z
-    "Right": (-90.0, 0.0, 0.0),     # camera on -z
-    "Bottom": (0.0, 90.0, 0.0),     # camera on +y
+    "Top": (0.0, -90.0, 90.0),       # camera on -y; +x up, +z left
+    "Front": (0.0, 0.0, -90.0),      # camera on +x; +y down
+    "Back": (0.0, 180.0, 90.0),      # camera on -x; +y down
+    "Left": (90.0, -90.0, 180.0),    # camera on +z; +y down, nose left
+    "Right": (-90.0, 90.0, 180.0),   # camera on -z; +y down, nose right
+    "Bottom": (0.0, 90.0, -90.0),    # camera on +y; +x up
     "Isometric": (ISOMETRIC_ELEV_DEG, ISOMETRIC_AZIM_DEG, ISOMETRIC_ROLL_DEG),
 }
+
+UNIT_TO_METERS = {"m": 1.0, "cm": 0.01, "mm": 0.001}
+DEFAULT_DISPLAY_UNIT = "cm"
 
 
 class EditableShape:
@@ -118,10 +124,11 @@ def edgeSelectionName(selection: EdgePointSelection, rigid_planes: list[Editable
     return f"P{selection.plane_index} S{selection.shape_index} E{selection.edge_index} (V{selection.edge_index}→V{next_vertex})"
 
 
-def setAxesEqual(ax, points: np.ndarray) -> None:
+def setAxesEqual(ax, points: np.ndarray, zoom_factor: float = 1.0) -> None:
     mins, maxs = points.min(axis=0), points.max(axis=0)
     center = (mins + maxs)/2.0
-    radius = max(np.max(maxs - mins)/2.0, 0.01)
+    base_radius = max(np.max(maxs - mins)/2.0, 0.01)
+    radius = base_radius/max(zoom_factor, 1e-6)
     ax.set_xlim(center[0] - radius, center[0] + radius)
     ax.set_ylim(center[1] - radius, center[1] + radius)
     ax.set_zlim(center[2] - radius, center[2] + radius)
@@ -131,6 +138,7 @@ def drawModel(
     ax, rigid_planes: list[EditableRigidPlane], object_type: ObjectType,
     view_elev: float = ISOMETRIC_ELEV_DEG, view_azim: float = ISOMETRIC_AZIM_DEG, view_roll: float = 0.0,
     edge_pick_data: list | None = None, measurement_points: list[EdgePointSelection] | None = None,
+    display_unit: str = DEFAULT_DISPLAY_UNIT, zoom_factor: float = 1.0,
 ) -> None:
     ax.clear()
     all_points = [np.zeros(3)]
@@ -243,10 +251,15 @@ def drawModel(
                 color="black", linestyle="--", linewidth=1.5,
             )
 
-    setAxesEqual(ax, np.asarray(all_points))
-    ax.set_xlabel("Object x [m] — forward")
-    ax.set_ylabel("Object y [m] — down")
-    ax.set_zlabel("Object z [m] — left")
+    setAxesEqual(ax, np.asarray(all_points), zoom_factor)
+    unit_to_m = UNIT_TO_METERS[display_unit]
+    tick_formatter = FuncFormatter(lambda value, _position: f"{value/unit_to_m:g}")
+    ax.xaxis.set_major_formatter(tick_formatter)
+    ax.yaxis.set_major_formatter(tick_formatter)
+    ax.zaxis.set_major_formatter(tick_formatter)
+    ax.set_xlabel(f"Object x [{display_unit}] — forward")
+    ax.set_ylabel(f"Object y [{display_unit}] — down")
+    ax.set_zlabel(f"Object z [{display_unit}] — left")
     ax.set_title(f"{object_type.name}\np_object = R @ [x, y, 0] + t")
 
     try:
@@ -286,11 +299,11 @@ def parseRotation(entries: list[list[tk.Entry]]) -> np.ndarray:
     return np.array([[float(entries[row][col].get()) for col in range(3)] for row in range(3)], dtype=np.float64)
 
 
-def parseTranslation(entries: list[tk.Entry]) -> np.ndarray:
-    return np.array([float(entry.get()) for entry in entries], dtype=np.float64)
+def parseTranslation(entries: list[tk.Entry], unit_to_m: float = 1.0) -> np.ndarray:
+    return unit_to_m*np.array([float(entry.get()) for entry in entries], dtype=np.float64)
 
 
-def parsePoints(text: str) -> np.ndarray:
+def parsePoints(text: str, unit_to_m: float = 1.0) -> np.ndarray:
     points = []
 
     for line in text.replace(";", "\n").splitlines():
@@ -306,7 +319,7 @@ def parsePoints(text: str) -> np.ndarray:
     if len(points) < 3:
         raise ValueError("A polygon requires at least 3 points")
 
-    return np.asarray(points, dtype=np.float64)
+    return unit_to_m*np.asarray(points, dtype=np.float64)
 
 
 def modelCode(rigid_planes: list[EditableRigidPlane]) -> str:
@@ -356,6 +369,9 @@ class ModelEditor(tk.Tk):
         self.mouse_press_xy: tuple[float, float] | None = None
         self.updating_measure_controls = False
 
+        self.display_unit = DEFAULT_DISPLAY_UNIT
+        self.zoom_factor = 1.0
+
         # Default view: front + top + left.
         self.view_elev = ISOMETRIC_ELEV_DEG
         self.view_azim = ISOMETRIC_AZIM_DEG
@@ -373,34 +389,45 @@ class ModelEditor(tk.Tk):
 
         self.buildControls()
         self.buildPlot()
+        self.updateUnitLabels()
         self.refreshPlaneList()
         self.redraw()
 
     def buildControls(self) -> None:
-        ttk.Label(self.controls, text="Rigid planes").grid(row=0, column=0, columnspan=3, sticky="w")
+        unit_frame = ttk.Frame(self.controls)
+        unit_frame.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        ttk.Label(unit_frame, text="Display/edit units:").pack(side="left")
+        self.unit_var = tk.StringVar(value=self.display_unit)
+        self.unit_combo = ttk.Combobox(
+            unit_frame, textvariable=self.unit_var, values=list(UNIT_TO_METERS), state="readonly", width=6,
+        )
+        self.unit_combo.pack(side="left", padx=(6, 0))
+        self.unit_combo.bind("<<ComboboxSelected>>", self.onUnitChanged)
+
+        ttk.Label(self.controls, text="Rigid planes").grid(row=1, column=0, columnspan=3, sticky="w")
         self.plane_list = tk.Listbox(self.controls, height=6, exportselection=False)
-        self.plane_list.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(3, 5))
+        self.plane_list.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(3, 5))
         self.plane_list.bind("<<ListboxSelect>>", self.onPlaneSelected)
 
-        ttk.Button(self.controls, text="Add plane", command=self.addPlane).grid(row=2, column=0, sticky="ew")
-        ttk.Button(self.controls, text="Delete plane", command=self.deletePlane).grid(row=2, column=1, sticky="ew")
-        ttk.Button(self.controls, text="Apply plane", command=self.applyPlane).grid(row=2, column=2, sticky="ew")
+        ttk.Button(self.controls, text="Add plane", command=self.addPlane).grid(row=3, column=0, sticky="ew")
+        ttk.Button(self.controls, text="Delete plane", command=self.deletePlane).grid(row=3, column=1, sticky="ew")
+        ttk.Button(self.controls, text="Apply plane", command=self.applyPlane).grid(row=3, column=2, sticky="ew")
 
         self.plane_visible_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             self.controls, text="Selected plane surface visible", variable=self.plane_visible_var,
             command=self.onPlaneVisibilityChanged,
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(5, 0))
 
-        ttk.Label(self.controls, text="Rotation angles [deg]").grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 2))
-        ttk.Label(self.controls, text="Convention: R = Rz(z) @ Ry(y) @ Rx(x)").grid(row=5, column=0, columnspan=3, sticky="w")
+        ttk.Label(self.controls, text="Rotation angles [deg]").grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 2))
+        ttk.Label(self.controls, text="Convention: R = Rz(z) @ Ry(y) @ Rx(x)").grid(row=6, column=0, columnspan=3, sticky="w")
 
         self.angle_vars = [tk.DoubleVar(value=0.0) for _ in range(3)]
         self.angle_entries, self.angle_scales = [], []
         self.updating_rotation_controls = False
 
         for axis_index, axis_name in enumerate(("x", "y", "z")):
-            row = 6 + axis_index
+            row = 7 + axis_index
             ttk.Label(self.controls, text=f"{axis_name}:").grid(row=row, column=0, sticky="w")
 
             entry = ttk.Entry(self.controls, width=9)
@@ -416,55 +443,57 @@ class ModelEditor(tk.Tk):
             scale.grid(row=row, column=2, sticky="ew")
             self.angle_scales.append(scale)
 
-        ttk.Label(self.controls, text="Rotation matrix R").grid(row=9, column=0, columnspan=3, sticky="w", pady=(8, 2))
+        ttk.Label(self.controls, text="Rotation matrix R").grid(row=10, column=0, columnspan=3, sticky="w", pady=(8, 2))
         self.rotation_entries = []
 
         for row in range(3):
             entry_row = []
             for col in range(3):
                 entry = ttk.Entry(self.controls, width=10)
-                entry.grid(row=10 + row, column=col, padx=2, pady=2, sticky="ew")
+                entry.grid(row=11 + row, column=col, padx=2, pady=2, sticky="ew")
                 entry_row.append(entry)
             self.rotation_entries.append(entry_row)
 
-        ttk.Label(self.controls, text="Translation t [m]").grid(row=13, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        self.translation_label_var = tk.StringVar()
+        ttk.Label(self.controls, textvariable=self.translation_label_var).grid(row=14, column=0, columnspan=3, sticky="w", pady=(6, 2))
         self.translation_entries = []
 
         for col, axis_name in enumerate(("x", "y", "z")):
             frame = ttk.Frame(self.controls)
-            frame.grid(row=14, column=col, padx=2, sticky="ew")
+            frame.grid(row=15, column=col, padx=2, sticky="ew")
             ttk.Label(frame, text=axis_name).pack(side="left")
             entry = ttk.Entry(frame, width=9)
             entry.pack(side="left", fill="x", expand=True)
             self.translation_entries.append(entry)
 
-        ttk.Separator(self.controls).grid(row=15, column=0, columnspan=3, sticky="ew", pady=8)
+        ttk.Separator(self.controls).grid(row=16, column=0, columnspan=3, sticky="ew", pady=8)
 
-        ttk.Label(self.controls, text="Shapes on selected plane").grid(row=16, column=0, columnspan=3, sticky="w")
+        ttk.Label(self.controls, text="Shapes on selected plane").grid(row=17, column=0, columnspan=3, sticky="w")
         self.shape_list = tk.Listbox(self.controls, height=5, exportselection=False)
-        self.shape_list.grid(row=17, column=0, columnspan=3, sticky="ew", pady=(3, 5))
+        self.shape_list.grid(row=18, column=0, columnspan=3, sticky="ew", pady=(3, 5))
         self.shape_list.bind("<<ListboxSelect>>", self.onShapeSelected)
 
-        ttk.Button(self.controls, text="Add shape", command=self.addShape).grid(row=18, column=0, sticky="ew")
-        ttk.Button(self.controls, text="Delete shape", command=self.deleteShape).grid(row=18, column=1, sticky="ew")
-        ttk.Button(self.controls, text="Apply shape", command=self.applyShape).grid(row=18, column=2, sticky="ew")
+        ttk.Button(self.controls, text="Add shape", command=self.addShape).grid(row=19, column=0, sticky="ew")
+        ttk.Button(self.controls, text="Delete shape", command=self.deleteShape).grid(row=19, column=1, sticky="ew")
+        ttk.Button(self.controls, text="Apply shape", command=self.applyShape).grid(row=19, column=2, sticky="ew")
 
         self.shape_visible_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             self.controls, text="Selected shape visible", variable=self.shape_visible_var,
             command=self.onShapeVisibilityChanged,
-        ).grid(row=19, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        ).grid(row=20, column=0, columnspan=3, sticky="w", pady=(5, 0))
 
-        ttk.Label(self.controls, text="Color").grid(row=20, column=0, sticky="w", pady=(6, 2))
+        ttk.Label(self.controls, text="Color").grid(row=21, column=0, sticky="w", pady=(6, 2))
         self.color_var = tk.StringVar(value=next(iter(ColorId.__members__)))
         self.color_combo = ttk.Combobox(self.controls, textvariable=self.color_var, values=list(ColorId.__members__), state="readonly")
-        self.color_combo.grid(row=20, column=1, columnspan=2, sticky="ew", pady=(6, 2))
+        self.color_combo.grid(row=21, column=1, columnspan=2, sticky="ew", pady=(6, 2))
 
-        ttk.Label(self.controls, text="Plane-local points [m] — one x y pair per line").grid(row=21, column=0, columnspan=3, sticky="w", pady=(4, 2))
+        self.points_label_var = tk.StringVar()
+        ttk.Label(self.controls, textvariable=self.points_label_var).grid(row=22, column=0, columnspan=3, sticky="w", pady=(4, 2))
         self.points_text = tk.Text(self.controls, width=36, height=6)
-        self.points_text.grid(row=22, column=0, columnspan=3, sticky="ew")
+        self.points_text.grid(row=23, column=0, columnspan=3, sticky="ew")
 
-        ttk.Button(self.controls, text="Show / copy spec code", command=self.showCode).grid(row=23, column=0, columnspan=3, sticky="ew", pady=(6, 2))
+        ttk.Button(self.controls, text="Show / copy spec code", command=self.showCode).grid(row=24, column=0, columnspan=3, sticky="ew", pady=(6, 2))
 
         for col in range(3):
             self.controls.columnconfigure(col, weight=1)
@@ -492,6 +521,15 @@ class ModelEditor(tk.Tk):
             ttk.Button(view_frame, text=name, command=lambda n=name: self.setViewPreset(n)).grid(row=0, column=column, padx=2, sticky="ew")
             view_frame.columnconfigure(column, weight=1)
 
+        ttk.Label(view_frame, text="Zoom").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        self.zoom_var = tk.DoubleVar(value=self.zoom_factor)
+        self.zoom_scale = ttk.Scale(
+            view_frame, from_=0.6, to=3.0, variable=self.zoom_var, command=self.onZoomChanged,
+        )
+        self.zoom_scale.grid(row=1, column=1, columnspan=5, sticky="ew", padx=6, pady=(5, 0))
+        self.zoom_value_var = tk.StringVar(value=f"{self.zoom_factor:.2f}×")
+        ttk.Label(view_frame, textvariable=self.zoom_value_var, width=8).grid(row=1, column=6, sticky="e", pady=(5, 0))
+
         measurement_frame = ttk.LabelFrame(self.plot_frame, text="Edge-to-edge measurement", padding=6)
         measurement_frame.grid(row=3, column=0, sticky="ew", padx=6, pady=(0, 6))
         measurement_frame.columnconfigure(1, weight=1)
@@ -513,7 +551,8 @@ class ModelEditor(tk.Tk):
         )
         self.measure_a_scale.grid(row=1, column=1, columnspan=3, sticky="ew", padx=6)
         ttk.Label(measurement_frame, textvariable=self.measure_t_value_vars[0], width=10).grid(row=1, column=4, sticky="e")
-        ttk.Label(measurement_frame, text="A xyz [m] (type one + Enter):").grid(row=2, column=0, sticky="w")
+        self.measure_a_xyz_label_var = tk.StringVar()
+        ttk.Label(measurement_frame, textvariable=self.measure_a_xyz_label_var).grid(row=2, column=0, sticky="w")
 
         for axis_index, axis_name in enumerate(("x", "y", "z")):
             frame = ttk.Frame(measurement_frame)
@@ -532,7 +571,8 @@ class ModelEditor(tk.Tk):
         )
         self.measure_b_scale.grid(row=4, column=1, columnspan=3, sticky="ew", padx=6)
         ttk.Label(measurement_frame, textvariable=self.measure_t_value_vars[1], width=10).grid(row=4, column=4, sticky="e")
-        ttk.Label(measurement_frame, text="B xyz [m] (type one + Enter):").grid(row=5, column=0, sticky="w")
+        self.measure_b_xyz_label_var = tk.StringVar()
+        ttk.Label(measurement_frame, textvariable=self.measure_b_xyz_label_var).grid(row=5, column=0, sticky="w")
 
         for axis_index, axis_name in enumerate(("x", "y", "z")):
             frame = ttk.Frame(measurement_frame)
@@ -552,6 +592,38 @@ class ModelEditor(tk.Tk):
             measurement_frame.columnconfigure(column, weight=1)
 
         self.updateMeasurementControls()
+
+    def unitToMeters(self) -> float:
+        return UNIT_TO_METERS[self.display_unit]
+
+    def metersToDisplay(self, value):
+        return np.asarray(value)/self.unitToMeters()
+
+    def updateUnitLabels(self) -> None:
+        unit = self.display_unit
+        if hasattr(self, "translation_label_var"):
+            self.translation_label_var.set(f"Translation t [{unit}]")
+        if hasattr(self, "points_label_var"):
+            self.points_label_var.set(f"Plane-local points [{unit}] — one x y pair per line")
+        if hasattr(self, "measure_a_xyz_label_var"):
+            self.measure_a_xyz_label_var.set(f"A xyz [{unit}] (type one + Enter):")
+            self.measure_b_xyz_label_var.set(f"B xyz [{unit}] (type one + Enter):")
+
+    def onUnitChanged(self, _event=None) -> None:
+        self.display_unit = self.unit_var.get()
+        self.updateUnitLabels()
+
+        if self.selected_plane_index is not None:
+            self.loadPlaneFields()
+        if self.selected_shape_index is not None:
+            self.loadShapeFields()
+
+        self.redraw()
+
+    def onZoomChanged(self, value: str) -> None:
+        self.zoom_factor = float(value)
+        self.zoom_value_var.set(f"{self.zoom_factor:.2f}×")
+        self.redraw()
 
     def savePlotView(self) -> None:
         self.view_elev = float(self.ax.elev)
@@ -640,6 +712,7 @@ class ModelEditor(tk.Tk):
             self.ax, self.rigid_planes, self.object_type,
             self.view_elev, self.view_azim, self.view_roll,
             self.edge_pick_data, self.measurement_points,
+            self.display_unit, self.zoom_factor,
         )
         self.figure.tight_layout()
         self.canvas.draw_idle()
@@ -651,6 +724,17 @@ class ModelEditor(tk.Tk):
             if getEdgePointObjectPosition(self.rigid_planes, selection) is not None
         ][:2]
 
+    def getMeasurementEdgeLengthM(self, selection: EdgePointSelection) -> float:
+        point_0 = getEdgePointObjectPosition(
+            self.rigid_planes,
+            EdgePointSelection(selection.plane_index, selection.shape_index, selection.edge_index, 0.0),
+        )
+        point_1 = getEdgePointObjectPosition(
+            self.rigid_planes,
+            EdgePointSelection(selection.plane_index, selection.shape_index, selection.edge_index, 1.0),
+        )
+        return float(np.linalg.norm(point_1 - point_0))
+
     def updateMeasurementControls(self) -> None:
         if not hasattr(self, "measure_a_scale"):
             return
@@ -661,17 +745,23 @@ class ModelEditor(tk.Tk):
         for index, scale in enumerate(scales):
             if index < len(self.measurement_points):
                 selection = self.measurement_points[index]
-                self.measure_t_vars[index].set(selection.t)
-                self.measure_t_value_vars[index].set(f"t = {selection.t:.3f}")
+                edge_length_display = self.getMeasurementEdgeLengthM(selection)/self.unitToMeters()
+                distance_display = selection.t*edge_length_display
+                scale.configure(from_=0.0, to=max(edge_length_display, 1e-12))
+                self.measure_t_vars[index].set(distance_display)
+                self.measure_t_value_vars[index].set(f"s = {distance_display:.3f} {self.display_unit}")
                 scale.state(["!disabled"])
             else:
+                scale.configure(from_=0.0, to=1.0)
                 self.measure_t_vars[index].set(0.0)
-                self.measure_t_value_vars[index].set("t = —")
+                self.measure_t_value_vars[index].set("s = —")
                 scale.state(["disabled"])
 
         for point_index, entries in enumerate(self.measure_coord_entries):
             if point_index < len(self.measurement_points):
-                point = getEdgePointObjectPosition(self.rigid_planes, self.measurement_points[point_index])
+                point = self.metersToDisplay(
+                    getEdgePointObjectPosition(self.rigid_planes, self.measurement_points[point_index])
+                )
                 for axis_index, entry in enumerate(entries):
                     entry.state(["!disabled"])
                     entry.delete(0, tk.END)
@@ -691,10 +781,11 @@ class ModelEditor(tk.Tk):
             self.measure_distance_var.set("3D distance: —")
             return
 
-        point_a = getEdgePointObjectPosition(self.rigid_planes, self.measurement_points[0])
+        point_a_m = getEdgePointObjectPosition(self.rigid_planes, self.measurement_points[0])
+        point_a = self.metersToDisplay(point_a_m)
         self.measure_a_var.set(
             f"A: {edgeSelectionName(self.measurement_points[0], self.rigid_planes)}, "
-            f"t={self.measurement_points[0].t:.3f} → ({point_a[0]:.5f}, {point_a[1]:.5f}, {point_a[2]:.5f}) m"
+            f"({point_a[0]:.4f}, {point_a[1]:.4f}, {point_a[2]:.4f}) {self.display_unit}"
         )
 
         if len(self.measurement_points) < 2:
@@ -704,28 +795,33 @@ class ModelEditor(tk.Tk):
             self.measure_distance_var.set("3D distance: —")
             return
 
-        point_b = getEdgePointObjectPosition(self.rigid_planes, self.measurement_points[1])
-        delta = point_b - point_a
-        distance = float(np.linalg.norm(delta))
+        point_b_m = getEdgePointObjectPosition(self.rigid_planes, self.measurement_points[1])
+        delta_m = point_b_m - point_a_m
+        distance_m = float(np.linalg.norm(delta_m))
+        point_b = self.metersToDisplay(point_b_m)
+        delta = self.metersToDisplay(delta_m)
+        distance = distance_m/self.unitToMeters()
 
         self.measure_b_var.set(
             f"B: {edgeSelectionName(self.measurement_points[1], self.rigid_planes)}, "
-            f"t={self.measurement_points[1].t:.3f} → ({point_b[0]:.5f}, {point_b[1]:.5f}, {point_b[2]:.5f}) m"
+            f"({point_b[0]:.4f}, {point_b[1]:.4f}, {point_b[2]:.4f}) {self.display_unit}"
         )
         self.measure_delta_var.set(
-            f"Δ(B-A): x={delta[0]:+.5f}, y={delta[1]:+.5f}, z={delta[2]:+.5f} m"
+            f"Δ(B-A): x={delta[0]:+.4f}, y={delta[1]:+.4f}, z={delta[2]:+.4f} {self.display_unit}"
         )
         self.measure_axis_abs_var.set(
-            f"|Δ axes|: x={abs(delta[0]):.5f}, y={abs(delta[1]):.5f}, z={abs(delta[2]):.5f} m"
+            f"|Δ axes|: x={abs(delta[0]):.4f}, y={abs(delta[1]):.4f}, z={abs(delta[2]):.4f} {self.display_unit}"
         )
-        self.measure_distance_var.set(f"3D distance: {distance:.5f} m  ({100.0*distance:.2f} cm)")
+        self.measure_distance_var.set(f"3D distance: {distance:.4f} {self.display_unit}")
 
     def onMeasurementSlider(self, index: int, value: str) -> None:
         if self.updating_measure_controls or index >= len(self.measurement_points):
             return
 
-        self.measurement_points[index].t = float(value)
-        self.measure_t_value_vars[index].set(f"t = {float(value):.3f}")
+        selection = self.measurement_points[index]
+        edge_length_display = self.getMeasurementEdgeLengthM(selection)/self.unitToMeters()
+        selection.t = 0.0 if edge_length_display <= 1e-12 else float(np.clip(float(value)/edge_length_display, 0.0, 1.0))
+        self.measure_t_value_vars[index].set(f"s = {float(value):.3f} {self.display_unit}")
         self.redraw()
 
     def onMeasurementCoordinateEntered(self, point_index: int, axis_index: int) -> None:
@@ -735,9 +831,9 @@ class ModelEditor(tk.Tk):
         entry = self.measure_coord_entries[point_index][axis_index]
 
         try:
-            target_coordinate = float(entry.get())
+            target_coordinate = float(entry.get())*self.unitToMeters()
         except ValueError:
-            messagebox.showerror("Invalid coordinate", "Enter a numeric coordinate in meters.")
+            messagebox.showerror("Invalid coordinate", f"Enter a numeric coordinate in {self.display_unit}.")
             self.updateMeasurementControls()
             return
 
@@ -762,7 +858,8 @@ class ModelEditor(tk.Tk):
             low, high = sorted((point_0[axis_index], point_1[axis_index]))
             messagebox.showerror(
                 "Coordinate is outside the selected edge",
-                f"{('x', 'y', 'z')[axis_index]} must be between {low:.6f} m and {high:.6f} m for this edge.",
+                f"{('x', 'y', 'z')[axis_index]} must be between "
+                f"{low/self.unitToMeters():.6f} and {high/self.unitToMeters():.6f} {self.display_unit} for this edge.",
             )
             self.updateMeasurementControls()
             return
@@ -881,9 +978,10 @@ class ModelEditor(tk.Tk):
         self.plane_visible_var.set(plane.visible)
         self.setRotationControlsFromMatrix(plane.rotation_object_from_plane)
 
+        translation_display = self.metersToDisplay(plane.translation_object_from_plane_m)
         for index, entry in enumerate(self.translation_entries):
             entry.delete(0, tk.END)
-            entry.insert(0, f"{plane.translation_object_from_plane_m[index]:.8g}")
+            entry.insert(0, f"{translation_display[index]:.8g}")
 
     def setRotationControlsFromMatrix(self, rotation: np.ndarray) -> None:
         self.updating_rotation_controls = True
@@ -951,8 +1049,9 @@ class ModelEditor(tk.Tk):
         shape = self.rigid_planes[self.selected_plane_index].shape_markers[self.selected_shape_index]
         self.shape_visible_var.set(shape.visible)
         self.color_var.set(shape.color_id.name)
+        points_display = self.metersToDisplay(shape.object_vertices_m)
         self.points_text.delete("1.0", tk.END)
-        self.points_text.insert("1.0", "\n".join(f"{x:.8g} {y:.8g}" for x, y in shape.object_vertices_m))
+        self.points_text.insert("1.0", "\n".join(f"{x:.8g} {y:.8g}" for x, y in points_display))
 
     def addPlane(self) -> None:
         self.rigid_planes.append(EditableRigidPlane(np.eye(3), np.zeros(3)))
@@ -975,7 +1074,7 @@ class ModelEditor(tk.Tk):
 
         try:
             rotation = parseRotation(self.rotation_entries)
-            translation = parseTranslation(self.translation_entries)
+            translation = parseTranslation(self.translation_entries, self.unitToMeters())
         except ValueError as error:
             messagebox.showerror("Invalid plane transform", str(error))
             return
@@ -1017,7 +1116,7 @@ class ModelEditor(tk.Tk):
 
         try:
             color_id = ColorId[self.color_var.get()]
-            points = parsePoints(self.points_text.get("1.0", tk.END))
+            points = parsePoints(self.points_text.get("1.0", tk.END), self.unitToMeters())
         except (ValueError, KeyError) as error:
             messagebox.showerror("Invalid shape", str(error))
             return
