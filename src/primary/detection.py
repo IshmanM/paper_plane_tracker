@@ -159,7 +159,7 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
     num_sides = len(rough_vertices)
     edge_distances, fitted_lines = [], []
 
-    # Assign each contour point to the nearest rough polygon edge.
+    # Assign contour points to the nearest rough polygon edge.
     for edge_index in range(num_sides):
         edge_start = rough_vertices[edge_index]
         edge_end = rough_vertices[(edge_index + 1)%num_sides]
@@ -175,26 +175,27 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
 
     edge_assignments = np.argmin(np.stack(edge_distances, axis=1), axis=1)
 
-    # Fit each line mainly from the middle of its edge so imperfect corners contribute less.
+    # Fit each edge using only contour points well inside that rough edge.
     for edge_index in range(num_sides):
         edge_start = rough_vertices[edge_index]
         edge_end = rough_vertices[(edge_index + 1)%num_sides]
         edge_vector = edge_end - edge_start
-        edge_points = contour_points[edge_assignments == edge_index]
+        edge_length_squared = np.dot(edge_vector, edge_vector)
 
-        if len(edge_points) < 2:
+        edge_points = contour_points[edge_assignments == edge_index]
+        if len(edge_points) < 3:
             return rough_vertices
 
-        projection = ((edge_points - edge_start)@edge_vector)/np.dot(edge_vector, edge_vector)
-        middle_points = edge_points[(projection >= 0.15) & (projection <= 0.85)]
+        projection = ((edge_points - edge_start)@edge_vector)/edge_length_squared
+        edge_points = edge_points[(projection >= 0.10) & (projection <= 0.90)]
 
-        if len(middle_points) >= 2:
-            edge_points = middle_points
+        if len(edge_points) < 3:
+            return rough_vertices
 
         vx, vy, x0, y0 = cv2.fitLine(edge_points.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(4)
         fitted_lines.append((np.array([x0, y0], dtype=np.float64), np.array([vx, vy], dtype=np.float64)))
 
-    # Reconstruct each corner from the intersection of its two neighboring fitted edges.
+    # Intersect neighboring fitted edges to recover refined corners.
     refined_vertices = []
 
     for vertex_index in range(num_sides):
@@ -202,7 +203,7 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
         point_2, direction_2 = fitted_lines[vertex_index]
         cross = direction_1[0]*direction_2[1] - direction_1[1]*direction_2[0]
 
-        if abs(cross) <= 1e-6:
+        if abs(cross) <= 1e-4:
             return rough_vertices
 
         difference = point_2 - point_1
@@ -210,14 +211,29 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
         refined_vertices.append(point_1 + t*direction_1)
 
     refined_vertices = np.asarray(refined_vertices, dtype=np.float64)
-    maximum_edge_length = max(np.linalg.norm(rough_vertices[i] - rough_vertices[(i + 1)%num_sides]) for i in range(num_sides))
 
-    # Fall back to approxPolyDP if a noisy fit produces an implausibly distant intersection.
-    if np.any(np.linalg.norm(refined_vertices - rough_vertices, axis=1) > 0.4*maximum_edge_length):
+    # Refinement should move corners only modestly; otherwise trust approxPolyDP.
+    maximum_edge_length = max(
+        np.linalg.norm(rough_vertices[i] - rough_vertices[(i + 1)%num_sides])
+        for i in range(num_sides)
+    )
+
+    if np.any(np.linalg.norm(refined_vertices - rough_vertices, axis=1) > 0.15*maximum_edge_length):
+        return rough_vertices
+
+    # Reject geometry that changes the polygon topology.
+    refined_polygon = refined_vertices.astype(np.float32).reshape(-1, 1, 2)
+
+    if not cv2.isContourConvex(refined_polygon):
+        return rough_vertices
+
+    rough_area = cv2.contourArea(rough_vertices.astype(np.float32))
+    refined_area = cv2.contourArea(refined_polygon)
+
+    if rough_area <= 0.0 or not 0.75 <= refined_area/rough_area <= 1.25:
         return rough_vertices
 
     return refined_vertices
-
 
 # Shape path: find color-based polygon candidates, group nearby markers, then select the best group.
 def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, debug: DetectionDebug | None = None) -> Detection | None:

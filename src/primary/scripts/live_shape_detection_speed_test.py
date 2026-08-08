@@ -23,7 +23,7 @@ def drawDetection(frame: np.ndarray, detection) -> None:
     # Draw each detected marker shape, followed by the resulting group bounds and center.
     for shape in detection.shapes:
         vertices_px = np.rint(shape.vertices_px).astype(np.int32).reshape((-1, 1, 2))
-        cv2.polylines(frame, [vertices_px], True, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.polylines(frame, [vertices_px], True, (255, 255, 255), 1, cv2.LINE_AA)
 
     top_left = (int(round(detection.u - detection.px_w/2)), int(round(detection.v - detection.px_h/2)))
     bottom_right = (int(round(detection.u + detection.px_w/2)), int(round(detection.v + detection.px_h/2)))
