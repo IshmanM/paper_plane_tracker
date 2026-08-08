@@ -175,14 +175,14 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
 
     edge_assignments = np.argmin(np.stack(edge_distances, axis=1), axis=1)
 
-    # Fit each edge using only contour points well inside that rough edge.
+    # Fit each edge from its straight middle section and measure how well the contour supports that line.
     for edge_index in range(num_sides):
         edge_start = rough_vertices[edge_index]
         edge_end = rough_vertices[(edge_index + 1)%num_sides]
         edge_vector = edge_end - edge_start
         edge_length_squared = np.dot(edge_vector, edge_vector)
-
         edge_points = contour_points[edge_assignments == edge_index]
+
         if len(edge_points) < 3:
             return rough_vertices
 
@@ -193,9 +193,26 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
             return rough_vertices
 
         vx, vy, x0, y0 = cv2.fitLine(edge_points.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(4)
-        fitted_lines.append((np.array([x0, y0], dtype=np.float64), np.array([vx, vy], dtype=np.float64)))
+        line_point = np.array([x0, y0], dtype=np.float64)
+        line_direction = np.array([vx, vy], dtype=np.float64)
+        direction_norm = np.linalg.norm(line_direction)
 
-    # Intersect neighboring fitted edges to recover refined corners.
+        if direction_norm <= 1e-6:
+            return rough_vertices
+
+        line_direction /= direction_norm
+        relative_points = edge_points - line_point
+        residuals = np.abs(line_direction[0]*relative_points[:, 1] - line_direction[1]*relative_points[:, 0])
+        edge_fit_error = float(np.sqrt(np.mean(residuals**2)))
+
+        # Poorly supported lines are too risky to extrapolate into a corner.
+        if edge_fit_error > 1.0:
+            return rough_vertices
+
+        fitted_lines.append((line_point, line_direction))
+
+    # Intersect neighboring fitted edges to recover refined corners. Acute corners may move substantially
+    # beyond approxPolyDP when both neighboring edge fits are clean.
     refined_vertices = []
 
     for vertex_index in range(num_sides):
@@ -212,30 +229,32 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
 
     refined_vertices = np.asarray(refined_vertices, dtype=np.float64)
 
-    # Refinement should move corners only modestly; otherwise trust approxPolyDP.
+    # Keep only an emergency displacement limit; fit residuals above are the main refinement confidence test.
     maximum_edge_length = max(
         np.linalg.norm(rough_vertices[i] - rough_vertices[(i + 1)%num_sides])
         for i in range(num_sides)
     )
 
-    if np.any(np.linalg.norm(refined_vertices - rough_vertices, axis=1) > 0.15*maximum_edge_length):
+    if np.any(np.linalg.norm(refined_vertices - rough_vertices, axis=1) > 0.50*maximum_edge_length):
         return rough_vertices
 
-    # Reject geometry that changes the polygon topology.
+    # Reject geometry that changes the polygon topology or area implausibly.
     refined_polygon = refined_vertices.astype(np.float32).reshape(-1, 1, 2)
 
+    # Refinement currently supports convex polygons only. A future concave-shape path
+    # would need different edge assignment/topology validation.
     if not cv2.isContourConvex(refined_polygon):
         return rough_vertices
 
     rough_area = cv2.contourArea(rough_vertices.astype(np.float32))
     refined_area = cv2.contourArea(refined_polygon)
 
-    if rough_area <= 0.0 or not 0.75 <= refined_area/rough_area <= 1.25:
+    if rough_area <= 0.0 or not 0.65 <= refined_area/rough_area <= 1.35:
         return rough_vertices
 
     return refined_vertices
 
-# Shape path: find color-based polygon candidates, group nearby markers, then select the best group.
+# Shape path: find color-based convex polygon candidates, group nearby markers, then select the best group.
 def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, debug: DetectionDebug | None = None) -> Detection | None:
     shape_markers = object_vision_spec.shape_markers
 
@@ -307,6 +326,8 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
             if cv2.contourArea(contour) < minimum_shape_area_by_color[color_id]:
                 continue
 
+            # Current polygon detection assumes convex markers. The convex hull bridges small contour
+            # defects but intentionally removes concavities. TODO: handle concave markers separately if needed.
             hull = cv2.convexHull(contour)
             perimeter = cv2.arcLength(hull, True)
 
@@ -334,6 +355,7 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
                             candidate_polygons.append((num_sides, retry_polygon))
 
             for num_sides, polygon in candidate_polygons:
+                # Concave polygon markers are currently unsupported.
                 if not cv2.isContourConvex(polygon):
                     continue
 
@@ -634,6 +656,27 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
 
     if not solution_count:
         return failed_measurement
+
+    # FOR DEBUG ONLY
+    # print(f"solutions: {solution_count}")
+
+    # for i, (rotation_vector, translation_vector) in enumerate(zip(rotation_vectors, translation_vectors)):
+    #     projected_points, _ = cv2.projectPoints(
+    #         object_points, rotation_vector, translation_vector,
+    #         config.CAMERA_MATRIX, config.DISTORTION_COEFFICIENTS,
+    #     )
+
+    #     reprojection_error = float(np.sqrt(np.mean(np.sum(
+    #         (projected_points.reshape(-1, 2) - image_points)**2, axis=1,
+    #     ))))
+
+    #     print(
+    #         f"{i}: x={translation_vector[0, 0]:.3f}, "
+    #         f"y={translation_vector[1, 0]:.3f}, "
+    #         f"z={translation_vector[2, 0]:.3f}, "
+    #         f"error={reprojection_error:.17f}"
+    #     )
+    
 
     best_translation, best_reprojection_error = None, float("inf")
 

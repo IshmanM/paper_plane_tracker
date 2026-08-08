@@ -18,12 +18,19 @@ class ShapeMarkerSpec:
         minimum_contour_area_px: float | None = None,
     ):
         """
-        num_sides defines the marker shape. A circle uses 0, a triangle uses 3, a square uses 4, etc.
+        num_sides defines the marker shape. A circle uses 0, a triangle uses 3,
+        a square uses 4, etc.
 
-        object_vertices_m contains the known polygon vertices in the object's coordinate frame,
-        ordered around the polygon perimeter. For polygons its shape must be (num_sides, 3).
+        Polygon markers are currently assumed to be convex. Concave polygon
+        detection/refinement is not yet supported.
 
-        TODO: num_sides=0 reserves circles as a special non-polygon case; circle detection/measurement is not implemented yet.
+        object_vertices_m contains the known polygon vertices in the object's
+        coordinate frame, ordered around the polygon perimeter. For polygons
+        its shape must be (num_sides, 3).
+
+        TODO: num_sides=0 reserves circles as a special non-polygon case;
+        circle detection/measurement is not implemented yet.
+        TODO: Add concave-polygon support if needed.
         """
         if num_sides != 0 and num_sides < 3:
             raise ValueError("num_sides must be 0 for a circle or at least 3 for a polygon")
@@ -86,7 +93,7 @@ OBJECT_VISION_SPECS = {
                 color_id=ColorId.GREEN,
                 num_sides=3,
                 object_vertices_m=np.array([
-                    [0.030, 0.000, -0.020],
+                    [0.019, 0.000, -0.020],
                     [-0.090, 0.000, -0.020],
                     [-0.090, 0.000, 0.020],
                 ], dtype=np.float64),
@@ -102,6 +109,16 @@ OBJECT_VISION_SPECS = {
                 ], dtype=np.float64),
                 minimum_contour_area_px=60.0,
             ),
+            # ShapeMarkerSpec( # For coplanar triangles experiment
+            #     color_id=ColorId.CYAN,
+            #     num_sides=3,
+            #     object_vertices_m=np.array([
+            #         [0.000, 0.000, 0.038],
+            #         [-0.090, 0.000, 0.038],
+            #         [-0.090, 0.000, 0.073],
+            #     ], dtype=np.float64),
+            #     minimum_contour_area_px=60.0,
+            # ),
             # Example future square marker:
             # ShapeMarkerSpec(color_id=ColorId.MAGENTA, num_sides=4, object_vertices_m=..., minimum_contour_area_px=60.0),
             # TODO: Circle marker support is intentionally unimplemented. Use num_sides=0 for that special case.
