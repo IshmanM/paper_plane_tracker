@@ -153,11 +153,11 @@ OBJECT_VISION_SPECS = {
             ),
             RigidPlaneSpec(
                 rotation_object_from_plane=np.array([
-                    [-0.97332853, -0.16413523, 0.16028476],
-                    [0.16222142, -0.98643651, -0.02504449],
-                    [0.16222142, 0.00162510, 0.98675304],
+                    [0.96605224, -0.17034108, 0.19423435],
+                    [0.19128349, -0.033728441, -0.98095516],
+                    [0.17364818, 0.98480775, 6.0302083e-17],
                 ], dtype=np.float64),
-                translation_object_from_plane_m=np.array([0.000, -0.024, 0.015], dtype=np.float64),
+                translation_object_from_plane_m=np.array([-0.004, -0.0125, 0.025], dtype=np.float64),
                 shape_markers=[
                     ShapeMarkerSpec(
                         color_id=ColorId.CYAN,

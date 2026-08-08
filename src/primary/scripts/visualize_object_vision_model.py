@@ -74,10 +74,18 @@ def setAxesEqual(ax, points: np.ndarray) -> None:
     ax.set_zlim(center[2] - radius, center[2] + radius)
 
 
-def drawModel(ax, rigid_planes: list[EditableRigidPlane], object_type: ObjectType) -> None:
-    current_elev, current_azim = getattr(ax, "elev", 25), getattr(ax, "azim", -55)
+def drawModel(
+    ax, rigid_planes: list[EditableRigidPlane], object_type: ObjectType,
+    view_elev: float = 25.0, view_azim: float = -55.0, view_roll: float = 0.0,
+    vertex_pick_map: dict | None = None, selected_vertex_keys: list[tuple[int, int, int]] | None = None,
+) -> None:
     ax.clear()
     all_points = [np.zeros(3)]
+    selected_vertex_keys = selected_vertex_keys if selected_vertex_keys is not None else []
+    selected_labels = {key: ("A" if index == 0 else "B") for index, key in enumerate(selected_vertex_keys[:2])}
+
+    if vertex_pick_map is not None:
+        vertex_pick_map.clear()
 
     # Object/reference frame: +x forward, +y down, +z left.
     for vector, label, color in zip(
@@ -131,20 +139,41 @@ def drawModel(ax, rigid_planes: list[EditableRigidPlane], object_type: ObjectTyp
             b, g, r = COLOR_SPECS[shape.color_id].draw_bgr
             marker_color = (r/255.0, g/255.0, b/255.0)
             ax.plot(closed_vertices[:, 0], closed_vertices[:, 1], closed_vertices[:, 2], color=marker_color, linewidth=3)
-            ax.scatter(vertices_object[:, 0], vertices_object[:, 1], vertices_object[:, 2], color=[marker_color], s=35)
+            vertex_artist = ax.scatter(
+                vertices_object[:, 0], vertices_object[:, 1], vertices_object[:, 2],
+                color=[marker_color], s=55, picker=8,
+            )
+
+            if vertex_pick_map is not None:
+                vertex_pick_map[vertex_artist] = [
+                    ((plane_index, shape_index, vertex_index), vertex.copy())
+                    for vertex_index, vertex in enumerate(vertices_object)
+                ]
 
             center = vertices_object.mean(axis=0)
             ax.text(*center, f"P{plane_index} S{shape_index} {shape.color_id.name}", color=marker_color, fontsize=9)
 
             for vertex_index, vertex in enumerate(vertices_object):
+                vertex_key = (plane_index, shape_index, vertex_index)
                 ax.text(*vertex, f" {vertex_index}", color=marker_color, fontsize=8)
+
+                if vertex_key in selected_labels:
+                    ax.scatter(
+                        [vertex[0]], [vertex[1]], [vertex[2]], s=130,
+                        facecolors="none", edgecolors="black", linewidths=2,
+                    )
+                    ax.text(*vertex, f"  {selected_labels[vertex_key]}", color="black", fontsize=10, fontweight="bold")
 
     setAxesEqual(ax, np.asarray(all_points))
     ax.set_xlabel("Object x [m] — forward")
     ax.set_ylabel("Object y [m] — down")
     ax.set_zlabel("Object z [m] — left")
     ax.set_title(f"{object_type.name}\np_object = R @ [x, y, 0] + t")
-    ax.view_init(elev=current_elev, azim=current_azim)
+
+    try:
+        ax.view_init(elev=view_elev, azim=view_azim, roll=view_roll)
+    except TypeError:  # Older Matplotlib versions do not expose roll.
+        ax.view_init(elev=view_elev, azim=view_azim)
 
 
 def rotationMatrixFromAnglesDeg(x_deg: float, y_deg: float, z_deg: float) -> np.ndarray:
@@ -241,6 +270,16 @@ class ModelEditor(tk.Tk):
         self.rigid_planes = copyModelFromSpec(object_type)
         self.selected_plane_index: int | None = None
         self.selected_shape_index: int | None = None
+
+        # Clickable marker-vertex measurement state.
+        self.vertex_pick_map: dict = {}
+        self.measure_vertex_keys: list[tuple[int, int, int]] = []
+
+        # Keep the 3D camera independent of model redraws. ax.clear() resets the
+        # Matplotlib 3D view, so redraw() always restores these saved angles.
+        self.view_elev = 25.0
+        self.view_azim = -55.0
+        self.view_roll = 0.0
 
         self.columnconfigure(1, weight=1)
         self.rowconfigure(0, weight=1)
@@ -342,10 +381,12 @@ class ModelEditor(tk.Tk):
     def buildPlot(self) -> None:
         self.figure = plt.Figure(figsize=(9, 8))
         self.ax = self.figure.add_subplot(111, projection="3d")
-        self.ax.view_init(elev=25, azim=-55)
+        self.setPlotView()
 
         self.canvas = FigureCanvasTkAgg(self.figure, master=self.plot_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+        self.canvas.mpl_connect("button_release_event", self.savePlotView)
+        self.canvas.mpl_connect("pick_event", self.onVertexPicked)
 
         toolbar_frame = ttk.Frame(self.plot_frame)
         toolbar_frame.grid(row=1, column=0, sticky="ew")
@@ -353,10 +394,140 @@ class ModelEditor(tk.Tk):
         self.toolbar.update()
         self.toolbar.pack(fill="x")
 
+        measurement_frame = ttk.LabelFrame(self.plot_frame, text="Vertex measurement", padding=6)
+        measurement_frame.grid(row=2, column=0, sticky="ew", padx=6, pady=(0, 6))
+        measurement_frame.columnconfigure(0, weight=1)
+
+        self.measure_a_var = tk.StringVar(value="A: click a marker vertex")
+        self.measure_b_var = tk.StringVar(value="B: click a second marker vertex")
+        self.measure_delta_var = tk.StringVar(value="Δ(B-A): —")
+        self.measure_axis_abs_var = tk.StringVar(value="|Δ axes|: —")
+        self.measure_distance_var = tk.StringVar(value="3D distance: —")
+
+        ttk.Label(measurement_frame, textvariable=self.measure_a_var).grid(row=0, column=0, sticky="w")
+        ttk.Label(measurement_frame, textvariable=self.measure_b_var).grid(row=1, column=0, sticky="w")
+        ttk.Label(measurement_frame, textvariable=self.measure_delta_var).grid(row=2, column=0, sticky="w")
+        ttk.Label(measurement_frame, textvariable=self.measure_axis_abs_var).grid(row=3, column=0, sticky="w")
+        ttk.Label(measurement_frame, textvariable=self.measure_distance_var).grid(row=4, column=0, sticky="w")
+        ttk.Button(measurement_frame, text="Clear measurement", command=self.clearVertexMeasurement).grid(
+            row=0, column=1, rowspan=5, padx=(12, 0), sticky="ns",
+        )
+
+    def savePlotView(self, _event=None) -> None:
+        self.view_elev = float(self.ax.elev)
+        self.view_azim = float(self.ax.azim)
+        self.view_roll = float(getattr(self.ax, "roll", 0.0))
+
+    def setPlotView(self) -> None:
+        try:
+            self.ax.view_init(elev=self.view_elev, azim=self.view_azim, roll=self.view_roll)
+        except TypeError:
+            self.ax.view_init(elev=self.view_elev, azim=self.view_azim)
+
     def redraw(self) -> None:
-        drawModel(self.ax, self.rigid_planes, self.object_type)
+        # Capture the live camera before clearing/redrawing the model. This also
+        # covers a redraw that happens before the mouse-release callback fires.
+        self.savePlotView()
+        self.updateVertexMeasurement()
+        drawModel(
+            self.ax, self.rigid_planes, self.object_type,
+            self.view_elev, self.view_azim, self.view_roll,
+            self.vertex_pick_map, self.measure_vertex_keys,
+        )
         self.figure.tight_layout()
         self.canvas.draw_idle()
+
+    def getVertexObjectPosition(self, vertex_key: tuple[int, int, int]) -> np.ndarray | None:
+        try:
+            plane_index, shape_index, vertex_index = vertex_key
+            plane = self.rigid_planes[plane_index]
+            shape = plane.shape_markers[shape_index]
+            vertex_xy = shape.object_vertices_m[vertex_index]
+        except IndexError:
+            return None
+
+        return transformPlanePoints(
+            np.asarray([vertex_xy], dtype=np.float64),
+            plane.rotation_object_from_plane, plane.translation_object_from_plane_m,
+        )[0]
+
+    def vertexName(self, vertex_key: tuple[int, int, int]) -> str:
+        plane_index, shape_index, vertex_index = vertex_key
+        return f"P{plane_index} S{shape_index} V{vertex_index}"
+
+    def onVertexPicked(self, event) -> None:
+        vertex_options = self.vertex_pick_map.get(event.artist)
+
+        if not vertex_options or len(event.ind) == 0:
+            return
+
+        picked_index = int(event.ind[0])
+        if picked_index >= len(vertex_options):
+            return
+
+        vertex_key, _ = vertex_options[picked_index]
+
+        # First two clicks form A/B. A third click starts a new measurement.
+        if len(self.measure_vertex_keys) >= 2:
+            self.measure_vertex_keys = [vertex_key]
+        else:
+            self.measure_vertex_keys.append(vertex_key)
+
+        self.redraw()
+
+    def clearVertexMeasurement(self) -> None:
+        self.measure_vertex_keys.clear()
+        self.updateVertexMeasurement()
+        self.redraw()
+
+    def updateVertexMeasurement(self) -> None:
+        valid_keys = [
+            key for key in self.measure_vertex_keys
+            if self.getVertexObjectPosition(key) is not None
+        ]
+        self.measure_vertex_keys = valid_keys[:2]
+
+        if not hasattr(self, "measure_a_var"):
+            return
+
+        if not self.measure_vertex_keys:
+            self.measure_a_var.set("A: click a marker vertex")
+            self.measure_b_var.set("B: click a second marker vertex")
+            self.measure_delta_var.set("Δ(B-A): —")
+            self.measure_axis_abs_var.set("|Δ axes|: —")
+            self.measure_distance_var.set("3D distance: —")
+            return
+
+        point_a = self.getVertexObjectPosition(self.measure_vertex_keys[0])
+        self.measure_a_var.set(
+            f"A: {self.vertexName(self.measure_vertex_keys[0])} = "
+            f"({point_a[0]:.5f}, {point_a[1]:.5f}, {point_a[2]:.5f}) m"
+        )
+
+        if len(self.measure_vertex_keys) < 2:
+            self.measure_b_var.set("B: click a second marker vertex")
+            self.measure_delta_var.set("Δ(B-A): —")
+            self.measure_axis_abs_var.set("|Δ axes|: —")
+            self.measure_distance_var.set("3D distance: —")
+            return
+
+        point_b = self.getVertexObjectPosition(self.measure_vertex_keys[1])
+        delta = point_b - point_a
+        distance = float(np.linalg.norm(delta))
+
+        self.measure_b_var.set(
+            f"B: {self.vertexName(self.measure_vertex_keys[1])} = "
+            f"({point_b[0]:.5f}, {point_b[1]:.5f}, {point_b[2]:.5f}) m"
+        )
+        self.measure_delta_var.set(
+            f"Δ(B-A): x={delta[0]:+.5f}, y={delta[1]:+.5f}, z={delta[2]:+.5f} m"
+        )
+        self.measure_axis_abs_var.set(
+            f"|Δ axes|: x={abs(delta[0]):.5f}, y={abs(delta[1]):.5f}, z={abs(delta[2]):.5f} m"
+        )
+        self.measure_distance_var.set(
+            f"3D distance: {distance:.5f} m  ({100.0*distance:.2f} cm)"
+        )
 
     def refreshPlaneList(self, select_index: int | None = None) -> None:
         self.plane_list.delete(0, tk.END)
@@ -522,6 +693,7 @@ class ModelEditor(tk.Tk):
             return
 
         index = self.selected_plane_index
+        self.measure_vertex_keys.clear()
         del self.rigid_planes[index]
         self.refreshPlaneList(min(index, len(self.rigid_planes) - 1) if self.rigid_planes else None)
         self.redraw()
@@ -561,6 +733,7 @@ class ModelEditor(tk.Tk):
             return
 
         plane_index, shape_index = self.selected_plane_index, self.selected_shape_index
+        self.measure_vertex_keys.clear()
         shapes = self.rigid_planes[plane_index].shape_markers
         del shapes[shape_index]
         self.refreshPlaneList(plane_index)
@@ -608,7 +781,10 @@ class ModelEditor(tk.Tk):
         ttk.Button(button_frame, text="Copy to clipboard", command=copyCode).pack(side="right")
 
     def resetView(self) -> None:
-        self.ax.view_init(elev=25, azim=-55)
+        self.view_elev = 25.0
+        self.view_azim = -55.0
+        self.view_roll = 0.0
+        self.setPlotView()
         self.canvas.draw_idle()
 
 
