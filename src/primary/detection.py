@@ -575,15 +575,21 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
     if not detection.shapes:
         return failed_measurement
 
+    # Keep each marker paired with the rigid plane that defines its local-to-object transform.
+    plane_marker_specs = [
+        (rigid_plane, marker)
+        for rigid_plane in object_vision_spec.rigid_planes
+        for marker in rigid_plane.shape_markers
+        if marker.num_sides != 0
+    ]
     marker_indices_by_key: dict[tuple[ColorId, int], list[int]] = {}
 
-    for marker_index, marker in enumerate(object_vision_spec.shape_markers):
-        if marker.num_sides != 0:
-            marker_indices_by_key.setdefault((marker.color_id, marker.num_sides), []).append(marker_index)
+    for marker_index, (_, marker) in enumerate(plane_marker_specs):
+        marker_indices_by_key.setdefault((marker.color_id, marker.num_sides), []).append(marker_index)
 
     object_point_groups, image_point_groups, used_marker_indices = [], [], set()
 
-    # Match each detected polygon to its configured physical marker and determine vertex correspondence.
+    # Match each detected polygon to its physical marker and determine vertex correspondence.
     for shape in detection.shapes:
         marker_key = (shape.color_id, shape.num_sides)
         available_marker_indices = [
@@ -595,24 +601,31 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
             raise ValueError(f"Detected marker {marker_key} must match exactly one unused shape marker")
 
         marker_index = available_marker_indices[0]
-        marker = object_vision_spec.shape_markers[marker_index]
+        rigid_plane, marker = plane_marker_specs[marker_index]
 
         if marker.object_vertices_m is None:
             raise ValueError(f"Shape marker {marker_key} has no object_vertices_m")
 
-        marker_vertices_m = np.asarray(marker.object_vertices_m, dtype=np.float64)
+        marker_vertices_plane_xy_m = np.asarray(marker.object_vertices_m, dtype=np.float64)
         shape_vertices_px = np.asarray(shape.vertices_px, dtype=np.float64)
         num_vertices = marker.num_sides
 
-        if marker_vertices_m.shape != (num_vertices, 3):
-            raise ValueError(f"object_vertices_m for {marker_key} must have shape ({num_vertices}, 3)")
+        if marker_vertices_plane_xy_m.shape != (num_vertices, 2):
+            raise ValueError(f"object_vertices_m for {marker_key} must have shape ({num_vertices}, 2)")
         if shape_vertices_px.shape != (num_vertices, 2):
             raise ValueError(f"vertices_px for {marker_key} must have shape ({num_vertices}, 2)")
-        if not np.all(np.isfinite(marker_vertices_m)) or not np.all(np.isfinite(shape_vertices_px)):
+        if not np.all(np.isfinite(marker_vertices_plane_xy_m)) or not np.all(np.isfinite(shape_vertices_px)):
+            return failed_measurement
+
+        # Marker vertices are plane-local (x, y), with local z=0. Rotate first, then translate into the common object/reference frame.
+        marker_vertices_plane_m = np.column_stack((marker_vertices_plane_xy_m, np.zeros(num_vertices, dtype=np.float64)))
+        marker_vertices_object_m = (rigid_plane.rotation_object_from_plane@marker_vertices_plane_m.T).T + rigid_plane.translation_object_from_plane_m
+
+        if not np.all(np.isfinite(marker_vertices_object_m)):
             return failed_measurement
 
         edge_pairs = [(i, (i + 1)%num_vertices) for i in range(num_vertices)]
-        object_edge_lengths = np.array([np.linalg.norm(marker_vertices_m[i] - marker_vertices_m[j]) for i, j in edge_pairs])
+        object_edge_lengths = np.array([np.linalg.norm(marker_vertices_plane_xy_m[i] - marker_vertices_plane_xy_m[j]) for i, j in edge_pairs])
         object_shape_norm = np.linalg.norm(object_edge_lengths)
 
         if object_shape_norm <= 1e-12:
@@ -643,10 +656,11 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
         if best_vertices_px is None:
             return failed_measurement
 
-        object_point_groups.append(marker_vertices_m)
+        object_point_groups.append(marker_vertices_object_m)
         image_point_groups.append(best_vertices_px)
         used_marker_indices.add(marker_index)
 
+    # All visible markers are now expressed in one common object frame, including each rigid plane's R and t.
     object_points = np.concatenate(object_point_groups, axis=0)
     image_points = np.concatenate(image_point_groups, axis=0)
 
@@ -665,21 +679,19 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
     #         object_points, rotation_vector, translation_vector,
     #         config.CAMERA_MATRIX, config.DISTORTION_COEFFICIENTS,
     #     )
-
     #     reprojection_error = float(np.sqrt(np.mean(np.sum(
     #         (projected_points.reshape(-1, 2) - image_points)**2, axis=1,
     #     ))))
-
     #     print(
     #         f"{i}: x={translation_vector[0, 0]:.3f}, "
     #         f"y={translation_vector[1, 0]:.3f}, "
     #         f"z={translation_vector[2, 0]:.3f}, "
     #         f"error={reprojection_error:.17f}"
     #     )
-    
 
     best_translation, best_reprojection_error = None, float("inf")
 
+    # PnP translation is the common object-frame origin in camera coordinates.
     # Reject poses behind the camera and select the solution that best reproduces the detected vertices.
     for rotation_vector, translation_vector in zip(rotation_vectors, translation_vectors):
         rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
