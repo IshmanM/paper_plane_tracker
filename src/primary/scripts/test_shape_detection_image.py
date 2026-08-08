@@ -6,7 +6,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from src.primary.config import FRAME_W, FRAME_H
+import src.primary.config as config
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpecId
 from src.primary.detection import DetectionDebug, findSingleObjectUsingBestShapeGroup, drawDetection, drawModelOrigin, createMeasurementUsingShapeGroup
 
@@ -190,9 +190,12 @@ def showDetectionStages(stages: list[tuple[str, np.ndarray]], columns: int) -> N
 def saveDetectionStages(stages: list[tuple[str, np.ndarray]], output_directory: Path) -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
 
+    for old_image_path in output_directory.glob("*.png"):
+        old_image_path.unlink()
+
     for stage_index, (stage_name, stage_image) in enumerate(stages):
         safe_stage_name = re.sub(r"[^A-Za-z0-9_-]+", "_", stage_name).strip("_")
-        output_path = output_directory/f"{stage_index:02d}_{safe_stage_name}.png"
+        output_path = output_directory / f"{stage_index:02d}_{safe_stage_name}.png"
 
         if not cv2.imwrite(str(output_path), stage_image):
             raise RuntimeError(f"Could not save debug image: {output_path}")
@@ -228,8 +231,8 @@ def main() -> None:
 
     frame_height, frame_width = frame.shape[:2]
 
-    if frame_width != FRAME_W or frame_height != FRAME_H:
-        raise ValueError(f"Reference image is {frame_width}x{frame_height}, but config expects {FRAME_W}x{FRAME_H}.")
+    if frame_width != config.FRAME_W or frame_height != config.FRAME_H:
+        raise ValueError(f"Reference image is {frame_width}x{frame_height}, but config expects {config.FRAME_W}x{config.FRAME_H}.")
 
     debug = DetectionDebug()
     object_vision_spec_id = ObjectVisionSpecId[args.spec]

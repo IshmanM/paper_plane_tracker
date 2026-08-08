@@ -63,8 +63,8 @@ def main() -> None:
     if not camera.isOpened():
         raise RuntimeError(f"Could not open camera {args.camera}.")
 
-    camera.set(cv2.CAP_PROP_config.FRAME_WIDTH, config.FRAME_W)
-    camera.set(cv2.CAP_PROP_config.FRAME_HEIGHT, config.FRAME_H)
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_W)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_H)
     camera.set(cv2.CAP_PROP_FPS, args.camera_fps)
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
@@ -90,8 +90,8 @@ def main() -> None:
     loop_periods_s = deque(maxlen=args.timing_window)
     previous_loop_start_s = None
 
-    actual_width = int(camera.get(cv2.CAP_PROP_config.FRAME_WIDTH))
-    actual_height = int(camera.get(cv2.CAP_PROP_config.FRAME_HEIGHT))
+    actual_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
     actual_fps = camera.get(cv2.CAP_PROP_FPS)
 
     print(f"Camera: {actual_width}x{actual_height} at reported {actual_fps:.1f} FPS")
