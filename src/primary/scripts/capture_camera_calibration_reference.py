@@ -5,14 +5,11 @@ from pathlib import Path
 import cv2
 
 import src.primary.config as config
-from src.primary.config import FRAME_W, FRAME_H
 
 
 IMAGE_DIRECTORY = Path("images/camera_calibration")
 
 WINDOW_NAME = "Camera calibration capture"
-DEFAULT_CAMERA_INDEX = 0
-DEFAULT_CAMERA_FPS = 60
 DEFAULT_PHOTO_COUNT = 25
 DEFAULT_INTERVAL_S = 2.0
 INITIAL_COUNTDOWN_S = 5.0
@@ -25,10 +22,10 @@ def main() -> None:
                         help=f"Number of photos to capture. Default: {DEFAULT_PHOTO_COUNT}")
     parser.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S,
                         help=f"Seconds between photos. Default: {DEFAULT_INTERVAL_S}")
-    parser.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX,
-                        help=f"Camera index. Default: {DEFAULT_CAMERA_INDEX}")
-    parser.add_argument("--camera-fps", type=int, default=DEFAULT_CAMERA_FPS,
-                        help=f"Requested camera FPS. Default: {DEFAULT_CAMERA_FPS}")
+    parser.add_argument("--camera", type=int, default=config.CAMERA_INDEX,
+                        help=f"Camera index. Default: {config.CAMERA_INDEX}")
+    parser.add_argument("--camera-fps", type=int, default=config.FPS,
+                        help=f"Requested camera FPS. Default: {config.FPS}")
     parser.add_argument("--mode", choices=("overwrite", "append"), default=None,
                         help="Whether to overwrite existing calibration photos or append new ones.")
     args = parser.parse_args()
@@ -73,30 +70,45 @@ def main() -> None:
 
         image_index = max(existing_indices, default=-1) + 1
 
-    # Configure the same camera resolution used by the detection system.
-    camera = cv2.VideoCapture(args.camera)
+    # Configure the same camera settings used by the detection system.
+    camera = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
 
     if not camera.isOpened():
         raise RuntimeError(f"Could not open camera {args.camera}.")
 
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_W)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_H)
     camera.set(cv2.CAP_PROP_FPS, args.camera_fps)
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if config.CAMERA_AUTO_EXPOSURE else 0.25)
+    if not config.CAMERA_AUTO_EXPOSURE:
+        camera.set(cv2.CAP_PROP_EXPOSURE, config.CAMERA_EXPOSURE)
+        camera.set(cv2.CAP_PROP_GAIN, config.CAMERA_GAIN)
+
+    camera.set(cv2.CAP_PROP_AUTO_WB, 1 if config.CAMERA_AUTO_WHITE_BALANCE else 0)
+    if not config.CAMERA_AUTO_WHITE_BALANCE:
+        camera.set(cv2.CAP_PROP_WB_TEMPERATURE, config.CAMERA_WHITE_BALANCE_TEMPERATURE)
 
     camera.set(cv2.CAP_PROP_AUTOFOCUS, 1 if config.CAMERA_AUTOFOCUS else 0)
     if not config.CAMERA_AUTOFOCUS:
         camera.set(cv2.CAP_PROP_FOCUS, config.CAMERA_FOCUS)
 
+    print(f"Backend: {camera.getBackendName()}")
+    print(f"Auto exposure: {camera.get(cv2.CAP_PROP_AUTO_EXPOSURE)}")
+    print(f"Exposure: {camera.get(cv2.CAP_PROP_EXPOSURE)}")
+    print(f"Gain: {camera.get(cv2.CAP_PROP_GAIN)}")
+    print(f"Auto WB: {camera.get(cv2.CAP_PROP_AUTO_WB)}")
+    print(f"WB temperature: {camera.get(cv2.CAP_PROP_WB_TEMPERATURE)}")
     print(f"Autofocus: {camera.get(cv2.CAP_PROP_AUTOFOCUS)}")
     print(f"Focus: {camera.get(cv2.CAP_PROP_FOCUS)}")
 
     actual_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    if actual_width != FRAME_W or actual_height != FRAME_H:
+    if actual_width != config.FRAME_W or actual_height != config.FRAME_H:
         camera.release()
-        raise ValueError(f"Camera produced {actual_width}x{actual_height}, but config expects {FRAME_W}x{FRAME_H}.")
+        raise ValueError(f"Camera produced {actual_width}x{actual_height}, but config expects {config.FRAME_W}x{config.FRAME_H}.")
 
     print(f"Capturing {args.photos} photos every {args.interval:.1f} s.")
     print("Move the checkerboard to a different position/orientation after each photo.")

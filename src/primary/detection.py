@@ -300,9 +300,7 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
     shape_candidates: list[ShapeDetection] = []
     combined_raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
     combined_cleaned_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
-    loose_hue_margin, loose_saturation_margin, loose_value_margin = 3, 25, 8
-    growth_iterations = 4
-    growth_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     if debug is not None:
         debug.stages.clear()
@@ -317,47 +315,17 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         color_name = color_id.name
         draw_bgr = color_spec.draw_bgr
         raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
-        loose_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
 
-        # Strict HSV finds confident marker pixels; loose HSV allows nearby faded marker pixels.
         for lower_hsv, upper_hsv in color_spec.hsv_ranges:
             raw_mask = cv2.bitwise_or(raw_mask, cv2.inRange(hsv_frame, lower_hsv, upper_hsv))
-            loose_lower_hsv = np.array([
-                max(0, int(lower_hsv[0]) - loose_hue_margin),
-                max(15, int(lower_hsv[1]) - loose_saturation_margin),
-                max(50, int(lower_hsv[2]) - loose_value_margin),
-            ], dtype=np.uint8)
-            loose_upper_hsv = np.array([
-                min(179, int(upper_hsv[0]) + loose_hue_margin),
-                min(255, int(upper_hsv[1]) + loose_saturation_margin),
-                min(255, int(upper_hsv[2]) + loose_value_margin),
-            ], dtype=np.uint8)
-            loose_mask = cv2.bitwise_or(loose_mask, cv2.inRange(hsv_frame, loose_lower_hsv, loose_upper_hsv))
 
         combined_raw_mask = cv2.bitwise_or(combined_raw_mask, raw_mask)
 
         if debug is not None:
             debug.addStage(f"Raw mask - {color_name}", raw_mask)
-            debug.addStage(f"Loose mask - {color_name}", loose_mask)
 
-        # Remove tiny strict-color seeds before allowing limited growth into the loose mask.
-        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw_mask, connectivity=8)
-        seed_mask = np.zeros_like(raw_mask)
-        minimum_seed_area = max(3, int(round(0.10*minimum_shape_area_by_color[color_id])))
-
-        for label in range(1, num_labels):
-            if stats[label, cv2.CC_STAT_AREA] >= minimum_seed_area:
-                seed_mask[labels == label] = 255
-
-        loose_mask = cv2.medianBlur(loose_mask, 3)
-
-        # Grow confident marker pixels only a limited distance into plausible faded color.
-        cleaned_mask = seed_mask.copy()
-        for _ in range(growth_iterations):
-            grown_mask = cv2.dilate(cleaned_mask, growth_kernel)
-            cleaned_mask = cv2.bitwise_or(cleaned_mask, cv2.bitwise_and(grown_mask, loose_mask))
-
-        cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, growth_kernel)
+        cleaned_mask = cv2.medianBlur(raw_mask, 3)
+        cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, kernel)
         combined_cleaned_mask = cv2.bitwise_or(combined_cleaned_mask, cleaned_mask)
 
         if debug is not None:

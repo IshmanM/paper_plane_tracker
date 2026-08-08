@@ -4,7 +4,8 @@ FRAME_W = 640
 FRAME_H = 480
 FPS = 60
 
-#todo: adjust calibration as needed
+# todo: adjust calibration as needed
+
 # PX_FOCAL_LENGTH = 500  # depends on frame width/height and = to the average of a few (reference_pixel_width * reference_distance / reference_width).
 
 # CAMERA_MATRIX = np.array([
@@ -27,13 +28,17 @@ DISTORTION_COEFFICIENTS = np.array([
     [0.09141723, -0.39690385, -0.00317970, -0.00211780, 0.48441084]
 ], dtype=np.float64)
 
+CAMERA_INDEX = 0
+CAMERA_AUTO_EXPOSURE = False
+CAMERA_EXPOSURE = -6.0
+CAMERA_GAIN = 0.0
+CAMERA_AUTO_WHITE_BALANCE = False
+CAMERA_WHITE_BALANCE_TEMPERATURE = 4600.0
 CAMERA_AUTOFOCUS = False
 CAMERA_FOCUS = 0  # tune
 
 
-
 UDP_TX_DELAY = 0.001 # seconds
-
 
 SERVO_NAMES = ("pan", "tilt")
 NUM_SERVOS = len(SERVO_NAMES)

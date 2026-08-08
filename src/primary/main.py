@@ -4,7 +4,7 @@ import os
 import threading
 from src.primary.tracking import TrackStatus, SingleObjectTracker, drawTrack
 from src.primary.detection import detectSingleObject, drawDetection
-from src.primary.object_vision_spec import ObjectType
+from src.primary.object_vision_spec import ObjectVisionSpecId
 import src.primary.config as config
 from datetime import datetime
 import time
@@ -21,16 +21,25 @@ from src.comm.network_config import(
     DEFAULT_MAX_PACKET_BYTES
 )
 
-CAMERA_INDEX = 0
 
 if __name__ == "__main__": 
-    object_type = ObjectType.TENNIS_BALL
-    # object_type = ObjectType.PAPER_PLANE_SHAPES
+    object_vision_spec_id = ObjectVisionSpecId.TENNIS_BALL_DEFAULT
+    # object_vision_spec_id = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
 
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+    cap = cv2.VideoCapture(config.CAMERA_INDEX, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config.FRAME_H)
     cap.set(cv2.CAP_PROP_FPS, config.FPS)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if config.CAMERA_AUTO_EXPOSURE else 0.25)
+    if not config.CAMERA_AUTO_EXPOSURE:
+        cap.set(cv2.CAP_PROP_EXPOSURE, config.CAMERA_EXPOSURE)
+        cap.set(cv2.CAP_PROP_GAIN, config.CAMERA_GAIN)
+
+    cap.set(cv2.CAP_PROP_AUTO_WB, 1 if config.CAMERA_AUTO_WHITE_BALANCE else 0)
+    if not config.CAMERA_AUTO_WHITE_BALANCE:
+        cap.set(cv2.CAP_PROP_WB_TEMPERATURE, config.CAMERA_WHITE_BALANCE_TEMPERATURE)
 
     if not cap.isOpened():
         raise RuntimeError("Could not open camera.")
@@ -82,7 +91,7 @@ if __name__ == "__main__":
                     break
 
                 # Detect the object and produce a measurement
-                object_detected, detection, measurement = detectSingleObject(frame, object_type)
+                object_detected, detection, measurement = detectSingleObject(frame, object_vision_spec_id)
     
                 if object_detected:
                     last_detection_px_w = detection.px_w
@@ -179,7 +188,7 @@ if __name__ == "__main__":
 
             # s = screenshot
             elif key == ord("s"):
-                filename = datetime.now().strftime(f"screenshot_{object_type.name.lower()}_%Y%m%d_%H%M%S.png")
+                filename = datetime.now().strftime(f"screenshot_{object_vision_spec_id.name.lower()}_%Y%m%d_%H%M%S.png")
                 cv2.imwrite("screenshots/primary_main_screenshots/" + filename, frame)
                 print(f"Saved {filename}")
 

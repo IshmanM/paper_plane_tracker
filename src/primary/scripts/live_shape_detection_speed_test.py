@@ -5,14 +5,14 @@ from collections import deque
 import cv2
 import numpy as np
 
-from src.primary.config import FRAME_W, FRAME_H
+import src.primary.config as config
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpecId
 from src.primary.detection import findSingleObjectUsingBestShapeGroup, createMeasurementUsingShapeGroup, drawModelOrigin
 
 
 WINDOW_NAME = "Live shape detection speed test"
-DEFAULT_CAMERA_INDEX = 0
-DEFAULT_CAMERA_FPS = 60
+DEFAULT_CAMERA_INDEX = config.CAMERA_INDEX
+DEFAULT_CAMERA_FPS = config.FPS
 DEFAULT_TIMING_WINDOW_FRAMES = 120
 
 DEFAULT_OBJECT_VISION_SPEC_ID = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
@@ -58,15 +58,31 @@ def main() -> None:
     if args.timing_window < 1:
         parser.error("--timing-window must be at least 1.")
 
-    camera = cv2.VideoCapture(args.camera)
+    camera = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
 
     if not camera.isOpened():
         raise RuntimeError(f"Could not open camera {args.camera}.")
 
-    camera.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
-    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    camera.set(cv2.CAP_PROP_config.FRAME_WIDTH, config.FRAME_W)
+    camera.set(cv2.CAP_PROP_config.FRAME_HEIGHT, config.FRAME_H)
     camera.set(cv2.CAP_PROP_FPS, args.camera_fps)
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+    print("Set auto exposure:", camera.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.75 if config.CAMERA_AUTO_EXPOSURE else 0.25))
+    if not config.CAMERA_AUTO_EXPOSURE:
+        print("Set exposure:", camera.set(cv2.CAP_PROP_EXPOSURE, config.CAMERA_EXPOSURE))
+        print("Set gain:", camera.set(cv2.CAP_PROP_GAIN, config.CAMERA_GAIN))
+
+    print("Set auto WB:", camera.set(cv2.CAP_PROP_AUTO_WB, 1 if config.CAMERA_AUTO_WHITE_BALANCE else 0))
+    if not config.CAMERA_AUTO_WHITE_BALANCE:
+        print("Set WB temperature:", camera.set(cv2.CAP_PROP_WB_TEMPERATURE, config.CAMERA_WHITE_BALANCE_TEMPERATURE))
+
+    print("Backend:", camera.getBackendName())
+    print("Auto exposure:", camera.get(cv2.CAP_PROP_AUTO_EXPOSURE))
+    print("Exposure:", camera.get(cv2.CAP_PROP_EXPOSURE))
+    print("Gain:", camera.get(cv2.CAP_PROP_GAIN))
+    print("Auto WB:", camera.get(cv2.CAP_PROP_AUTO_WB))
+    print("WB temperature:", camera.get(cv2.CAP_PROP_WB_TEMPERATURE))
 
     object_vision_spec_id = ObjectVisionSpecId[args.spec]
     object_vision_spec = OBJECT_VISION_SPECS[object_vision_spec_id]
@@ -74,8 +90,8 @@ def main() -> None:
     loop_periods_s = deque(maxlen=args.timing_window)
     previous_loop_start_s = None
 
-    actual_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_width = int(camera.get(cv2.CAP_PROP_config.FRAME_WIDTH))
+    actual_height = int(camera.get(cv2.CAP_PROP_config.FRAME_HEIGHT))
     actual_fps = camera.get(cv2.CAP_PROP_FPS)
 
     print(f"Camera: {actual_width}x{actual_height} at reported {actual_fps:.1f} FPS")
@@ -97,8 +113,8 @@ def main() -> None:
 
             frame_height, frame_width = frame.shape[:2]
 
-            if frame_width != FRAME_W or frame_height != FRAME_H:
-                raise ValueError(f"Camera produced {frame_width}x{frame_height}, but config expects {FRAME_W}x{FRAME_H}.")
+            if frame_width != config.FRAME_W or frame_height != config.FRAME_H:
+                raise ValueError(f"Camera produced {frame_width}x{frame_height}, but config expects {config.FRAME_W}x{config.FRAME_H}.")
 
             # Time only shape detection; capture, measurement, drawing, and display are excluded.
             detection_start_s = time.perf_counter()
