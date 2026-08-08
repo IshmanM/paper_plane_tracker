@@ -1,6 +1,7 @@
 import argparse
 import tkinter as tk
-from tkinter import messagebox, ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -9,11 +10,14 @@ from matplotlib.ticker import FuncFormatter
 from mpl_toolkits.mplot3d import proj3d
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType
+from src.primary.object_vision_spec import (
+    MODELS_DIR, OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec, ObjectVisionSpecId,
+    RigidPlaneSpec, ShapeMarkerSpec, loadObjectVisionSpecModel, saveObjectVisionSpecModel,
+)
 from src.primary.color import COLOR_SPECS, ColorId
 
 
-DEFAULT_OBJECT_TYPE = ObjectType.PAPER_PLANE_SHAPES
+DEFAULT_OBJECT_VISION_SPEC_ID = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
 PLANE_MARGIN_M = 0.015
 EMPTY_PLANE_HALF_SIZE_M = 0.03
 OBJECT_AXIS_LENGTH_M = 0.08
@@ -74,10 +78,10 @@ class EdgePointSelection:
         self.t = float(np.clip(t, 0.0, 1.0))
 
 
-def copyModelFromSpec(object_type: ObjectType) -> list[EditableRigidPlane]:
+def copyModelFromSpec(object_vision_spec: ObjectVisionSpec) -> list[EditableRigidPlane]:
     rigid_planes = []
 
-    for rigid_plane in OBJECT_VISION_SPECS[object_type].rigid_planes:
+    for rigid_plane in object_vision_spec.rigid_planes:
         shapes = []
 
         for marker in rigid_plane.shape_markers:
@@ -322,45 +326,107 @@ def parsePoints(text: str, unit_to_m: float = 1.0) -> np.ndarray:
     return unit_to_m*np.asarray(points, dtype=np.float64)
 
 
-def modelCode(rigid_planes: list[EditableRigidPlane]) -> str:
-    lines = ["rigid_planes=["]
+def createObjectVisionSpec(source_spec: ObjectVisionSpec, rigid_planes: list[EditableRigidPlane]) -> ObjectVisionSpec:
+    color_ids = []
 
     for plane in rigid_planes:
+        for shape in plane.shape_markers:
+            if shape.color_id not in color_ids:
+                color_ids.append(shape.color_id)
+
+    if not color_ids:
+        color_ids = list(source_spec.color_ids)
+
+    return ObjectVisionSpec(
+        object_type=source_spec.object_type,
+        color_ids=color_ids,
+        minimum_contour_area_px=source_spec.minimum_contour_area_px,
+        polygon_epsilon_ratio=source_spec.polygon_epsilon_ratio,
+        shape_group_distance_factor=source_spec.shape_group_distance_factor,
+        rigid_planes=[
+            RigidPlaneSpec(
+                rotation_object_from_plane=plane.rotation_object_from_plane.copy(),
+                translation_object_from_plane_m=plane.translation_object_from_plane_m.copy(),
+                shape_markers=[
+                    ShapeMarkerSpec(
+                        color_id=shape.color_id, num_sides=shape.num_sides,
+                        object_vertices_m=shape.object_vertices_m.copy(),
+                        minimum_contour_area_px=shape.minimum_contour_area_px,
+                    )
+                    for shape in plane.shape_markers
+                ],
+            )
+            for plane in rigid_planes
+        ],
+        width=source_spec.width, height=source_spec.height, length=source_spec.length,
+    )
+
+
+def objectVisionSpecCode(spec_id_name: str, spec: ObjectVisionSpec) -> str:
+    lines = [
+        "import numpy as np",
+        "",
+        "from src.primary.color import ColorId",
+        "from src.primary.object_vision_spec import ObjectType, ObjectVisionSpec, RigidPlaneSpec, ShapeMarkerSpec",
+        "",
+        f"# Suggested ObjectVisionSpecId member: {spec_id_name} = auto()",
+        f'EXPORTED_OBJECT_VISION_SPEC_ID_NAME = "{spec_id_name}"',
+        "",
+        "EXPORTED_OBJECT_VISION_SPEC = ObjectVisionSpec(",
+        f"    object_type=ObjectType.{spec.object_type.name},",
+        "    color_ids=[" + ", ".join(f"ColorId.{color_id.name}" for color_id in spec.color_ids) + "],",
+        f"    minimum_contour_area_px={spec.minimum_contour_area_px!r},",
+        f"    polygon_epsilon_ratio={spec.polygon_epsilon_ratio!r},",
+        f"    shape_group_distance_factor={spec.shape_group_distance_factor!r},",
+        "    rigid_planes=[",
+    ]
+
+    for plane in spec.rigid_planes:
         lines += [
-            "    RigidPlaneSpec(",
-            "        rotation_object_from_plane=np.array([",
-            *[f"            {row.tolist()}," for row in plane.rotation_object_from_plane],
-            "        ], dtype=np.float64),",
-            f"        translation_object_from_plane_m=np.array({plane.translation_object_from_plane_m.tolist()}, dtype=np.float64),",
-            "        shape_markers=[",
+            "        RigidPlaneSpec(",
+            "            rotation_object_from_plane=np.array([",
+            *[f"                {row.tolist()}," for row in plane.rotation_object_from_plane],
+            "            ], dtype=np.float64),",
+            f"            translation_object_from_plane_m=np.array({plane.translation_object_from_plane_m.tolist()}, dtype=np.float64),",
+            "            shape_markers=[",
         ]
 
-        for shape in plane.shape_markers:
+        for marker in plane.shape_markers:
             lines += [
-                "            ShapeMarkerSpec(",
-                f"                color_id=ColorId.{shape.color_id.name},",
-                f"                object_vertices_m={shape.object_vertices_m.tolist()},",
-                f"                num_sides={shape.num_sides},",
+                "                ShapeMarkerSpec(",
+                f"                    color_id=ColorId.{marker.color_id.name}, num_sides={marker.num_sides},",
+                f"                    object_vertices_m=np.array({marker.object_vertices_m.tolist()}, dtype=np.float64),",
             ]
-            if shape.minimum_contour_area_px is not None:
-                lines.append(f"                minimum_contour_area_px={shape.minimum_contour_area_px},")
-            lines.append("            ),")
+            if marker.minimum_contour_area_px is not None:
+                lines.append(f"                    minimum_contour_area_px={marker.minimum_contour_area_px!r},")
+            lines.append("                ),")
 
-        lines += ["        ],", "    ),"]
+        lines += ["            ],", "        ),"]
 
-    lines.append("]")
+    lines += [
+        "    ],",
+        f"    width={spec.width!r}, height={spec.height!r}, length={spec.length!r},",
+        ")",
+        "",
+        f"# Registry entry after adding the enum member:",
+        f"# ObjectVisionSpecId.{spec_id_name}: EXPORTED_OBJECT_VISION_SPEC,",
+        "",
+    ]
     return "\n".join(lines)
 
 
 class ModelEditor(tk.Tk):
-    def __init__(self, object_type: ObjectType):
+    def __init__(self, object_vision_spec_id: ObjectVisionSpecId):
         super().__init__()
         self.title("Object Vision Model Editor")
-        self.geometry("1500x900")
-        self.minsize(1150, 720)
+        self.geometry("1500x940")
+        self.minsize(1150, 760)
 
-        self.object_type = object_type
-        self.rigid_planes = copyModelFromSpec(object_type)
+        self.object_vision_spec_id: ObjectVisionSpecId | None = object_vision_spec_id
+        self.source_spec = OBJECT_VISION_SPECS[object_vision_spec_id]
+        self.model_name = object_vision_spec_id.name
+        self.model_path: Path | None = None
+        self.rigid_planes = copyModelFromSpec(self.source_spec)
         self.selected_plane_index: int | None = None
         self.selected_shape_index: int | None = None
 
@@ -495,6 +561,27 @@ class ModelEditor(tk.Tk):
 
         ttk.Button(self.controls, text="Show / copy spec code", command=self.showCode).grid(row=24, column=0, columnspan=3, sticky="ew", pady=(6, 2))
 
+        ttk.Separator(self.controls).grid(row=25, column=0, columnspan=3, sticky="ew", pady=8)
+        ttk.Label(self.controls, text="Model / ObjectVisionSpec").grid(row=26, column=0, columnspan=3, sticky="w")
+
+        self.spec_id_var = tk.StringVar(value=self.object_vision_spec_id.name)
+        self.spec_id_combo = ttk.Combobox(
+            self.controls, textvariable=self.spec_id_var,
+            values=[spec_id.name for spec_id in ObjectVisionSpecId], state="readonly",
+        )
+        self.spec_id_combo.grid(row=27, column=0, columnspan=2, sticky="ew")
+        ttk.Button(self.controls, text="Load registered", command=self.loadRegisteredSpec).grid(row=27, column=2, sticky="ew")
+
+        self.model_name_var = tk.StringVar(value=f"Current: {self.model_name}")
+        ttk.Label(self.controls, textvariable=self.model_name_var).grid(row=28, column=0, columnspan=3, sticky="w", pady=(4, 2))
+
+        ttk.Button(self.controls, text="New blank", command=self.newBlankModel).grid(row=29, column=0, sticky="ew")
+        ttk.Button(self.controls, text="Import JSON", command=self.importModelJson).grid(row=29, column=1, sticky="ew")
+        ttk.Button(self.controls, text="Save", command=self.saveModelJson).grid(row=29, column=2, sticky="ew")
+
+        ttk.Button(self.controls, text="Save As JSON", command=self.saveModelJsonAs).grid(row=30, column=0, columnspan=2, sticky="ew")
+        ttk.Button(self.controls, text="Export Python", command=self.exportPythonSpec).grid(row=30, column=2, sticky="ew")
+
         for col in range(3):
             self.controls.columnconfigure(col, weight=1)
 
@@ -625,6 +712,129 @@ class ModelEditor(tk.Tk):
         self.zoom_value_var.set(f"{self.zoom_factor:.2f}×")
         self.redraw()
 
+    def currentObjectVisionSpec(self) -> ObjectVisionSpec:
+        return createObjectVisionSpec(self.source_spec, self.rigid_planes)
+
+    def setModel(self, spec: ObjectVisionSpec, name: str, spec_id: ObjectVisionSpecId | None = None, path: Path | None = None) -> None:
+        self.object_vision_spec_id = spec_id
+        self.source_spec = spec
+        self.model_name = name
+        self.model_path = path
+        self.rigid_planes = copyModelFromSpec(spec)
+        self.selected_plane_index = None
+        self.selected_shape_index = None
+        self.measurement_points.clear()
+        self.model_name_var.set(f"Current: {name}")
+        if spec_id is not None:
+            self.spec_id_var.set(spec_id.name)
+        self.refreshPlaneList(0 if self.rigid_planes else None)
+        self.redraw()
+
+    def loadRegisteredSpec(self) -> None:
+        spec_id = ObjectVisionSpecId[self.spec_id_var.get()]
+        self.setModel(OBJECT_VISION_SPECS[spec_id], spec_id.name, spec_id=spec_id)
+
+    def newBlankModel(self) -> None:
+        name = simpledialog.askstring("New model", "Model name:", initialvalue=f"{self.source_spec.object_type.name.lower()}_new", parent=self)
+        if not name:
+            return
+
+        blank_spec = ObjectVisionSpec(
+            object_type=self.source_spec.object_type,
+            color_ids=list(self.source_spec.color_ids),
+            minimum_contour_area_px=self.source_spec.minimum_contour_area_px,
+            polygon_epsilon_ratio=self.source_spec.polygon_epsilon_ratio,
+            shape_group_distance_factor=self.source_spec.shape_group_distance_factor,
+            rigid_planes=[],
+            width=self.source_spec.width, height=self.source_spec.height, length=self.source_spec.length,
+        )
+        self.setModel(blank_spec, name)
+
+    def importModelJson(self) -> None:
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        path_text = filedialog.askopenfilename(
+            title="Import ObjectVisionSpec model",
+            initialdir=MODELS_DIR,
+            filetypes=[("ObjectVisionSpec JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path_text:
+            return
+
+        try:
+            path = Path(path_text)
+            spec = loadObjectVisionSpecModel(path)
+        except Exception as error:
+            messagebox.showerror("Import failed", str(error))
+            return
+
+        self.setModel(spec, path.stem, path=path)
+
+    def saveModelJson(self) -> None:
+        if self.model_path is None:
+            self.saveModelJsonAs()
+            return
+
+        try:
+            saveObjectVisionSpecModel(self.currentObjectVisionSpec(), self.model_path)
+        except Exception as error:
+            messagebox.showerror("Save failed", str(error))
+            return
+
+        self.model_name_var.set(f"Current: {self.model_path.stem}")
+        messagebox.showinfo("Saved", f"Saved model to:\n{self.model_path}")
+
+    def saveModelJsonAs(self) -> None:
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        initial_name = (self.model_path.stem if self.model_path is not None else self.model_name).lower() + ".json"
+        path_text = filedialog.asksaveasfilename(
+            title="Save ObjectVisionSpec model",
+            initialdir=MODELS_DIR,
+            initialfile=initial_name,
+            defaultextension=".json",
+            filetypes=[("ObjectVisionSpec JSON", "*.json"), ("All files", "*.*")],
+        )
+        if not path_text:
+            return
+
+        self.model_path = Path(path_text)
+        self.model_name = self.model_path.stem
+        self.saveModelJson()
+
+    def exportPythonSpec(self) -> None:
+        spec_id_name = simpledialog.askstring(
+            "Export Python spec",
+            "Suggested ObjectVisionSpecId name:",
+            initialvalue=(self.object_vision_spec_id.name if self.object_vision_spec_id is not None else self.model_name.upper()),
+            parent=self,
+        )
+        if not spec_id_name:
+            return
+
+        spec_id_name = spec_id_name.strip().upper().replace(" ", "_")
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        path_text = filedialog.asksaveasfilename(
+            title="Export Python ObjectVisionSpec",
+            initialdir=MODELS_DIR,
+            initialfile=spec_id_name.lower() + ".py",
+            defaultextension=".py",
+            filetypes=[("Python files", "*.py"), ("All files", "*.*")],
+        )
+        if not path_text:
+            return
+
+        try:
+            Path(path_text).write_text(objectVisionSpecCode(spec_id_name, self.currentObjectVisionSpec()), encoding="utf-8")
+        except Exception as error:
+            messagebox.showerror("Export failed", str(error))
+            return
+
+        messagebox.showinfo(
+            "Exported",
+            "Exported a standalone Python spec file.\n"
+            "When you promote it into detection, add the suggested member to ObjectVisionSpecId "
+            "and add the spec to OBJECT_VISION_SPECS.",
+        )
+
     def savePlotView(self) -> None:
         self.view_elev = float(self.ax.elev)
         self.view_azim = float(self.ax.azim)
@@ -709,7 +919,7 @@ class ModelEditor(tk.Tk):
         self.savePlotView()
         self.validateMeasurementPoints()
         drawModel(
-            self.ax, self.rigid_planes, self.object_type,
+            self.ax, self.rigid_planes, self.source_spec.object_type,
             self.view_elev, self.view_azim, self.view_roll,
             self.edge_pick_data, self.measurement_points,
             self.display_unit, self.zoom_factor,
@@ -1130,9 +1340,12 @@ class ModelEditor(tk.Tk):
         self.redraw()
 
     def showCode(self) -> None:
-        code = modelCode(self.rigid_planes)
+        code = objectVisionSpecCode(
+            self.object_vision_spec_id.name if self.object_vision_spec_id is not None else self.model_name.upper(),
+            self.currentObjectVisionSpec(),
+        )
         window = tk.Toplevel(self)
-        window.title("Generated model code")
+        window.title("Generated ObjectVisionSpec code")
         window.geometry("850x650")
 
         text = tk.Text(window, wrap="none")
@@ -1153,6 +1366,10 @@ class ModelEditor(tk.Tk):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="GUI editor for ObjectVisionSpec rigid-plane marker models.")
-    parser.add_argument("--object", default=DEFAULT_OBJECT_TYPE.name, choices=[object_type.name for object_type in ObjectType])
+    parser.add_argument(
+        "--spec", default=DEFAULT_OBJECT_VISION_SPEC_ID.name,
+        choices=[spec_id.name for spec_id in ObjectVisionSpecId],
+        help="registered ObjectVisionSpecId to open",
+    )
     args = parser.parse_args()
-    ModelEditor(ObjectType[args.object]).mainloop()
+    ModelEditor(ObjectVisionSpecId[args.spec]).mainloop()

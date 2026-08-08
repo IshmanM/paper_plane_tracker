@@ -5,7 +5,7 @@ from itertools import combinations
 
 import src.primary.config as config
 from src.primary.geometry import estimateObjectWorldPosition
-from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec
+from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec, ObjectVisionSpecId
 from src.primary.color import COLOR_SPECS, ColorId
 
 
@@ -60,15 +60,15 @@ class DetectionDebug:
 
 
 # Public detection entry points and shared result helpers.
-def detectSingleObject(frame: np.ndarray, object_type: ObjectType) -> tuple[bool, Detection, Measurement]:
-    object_vision_spec = OBJECT_VISION_SPECS[object_type]
+def detectSingleObject(frame: np.ndarray, object_vision_spec_id: ObjectVisionSpecId) -> tuple[bool, Detection, Measurement]:
+    object_vision_spec = OBJECT_VISION_SPECS[object_vision_spec_id]
 
-    if object_type == ObjectType.TENNIS_BALL:
+    if object_vision_spec.object_type == ObjectType.TENNIS_BALL:
         return detectTennisBall(frame, object_vision_spec,)
-    elif object_type == ObjectType.PAPER_PLANE_SHAPES:
+    elif object_vision_spec.object_type == ObjectType.PAPER_PLANE_SHAPES:
         return detectPaperPlaneShapes(frame, object_vision_spec,)
 
-    raise ValueError(f"Unsupported object type: {object_type}")
+    raise ValueError(f"Unsupported object type for {object_vision_spec_id}: {object_vision_spec.object_type}")
 
 
 def detectTennisBall(frame: np.ndarray, object_vision_spec: ObjectVisionSpec,) -> tuple[bool, Detection, Measurement]:

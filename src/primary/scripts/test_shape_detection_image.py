@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 from src.primary.config import FRAME_W, FRAME_H
-from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType
+from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpecId
 from src.primary.detection import DetectionDebug, findSingleObjectUsingBestShapeGroup, drawDetection, createMeasurementUsingShapeGroup
 
 
@@ -21,6 +21,12 @@ DEFAULT_WINDOW_HEIGHT = 900
 STATUS_BAR_HEIGHT = 32
 ZOOM_STEP = 1.25
 MAX_ZOOM = 10.0
+
+DEFAULT_OBJECT_VISION_SPEC_ID = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
+PAPER_PLANE_SHAPE_SPEC_IDS = [
+    spec_id for spec_id, spec in OBJECT_VISION_SPECS.items()
+    if spec.object_type == ObjectType.PAPER_PLANE_SHAPES
+]
 
 
 def createStageGridImage(stages: list[tuple[str, np.ndarray]], columns: int) -> np.ndarray:
@@ -227,6 +233,11 @@ def main() -> None:
     parser.add_argument("--columns", type=int, default=DEFAULT_DISPLAY_COLUMNS,
                         help=f"Number of stage-grid columns. Default: {DEFAULT_DISPLAY_COLUMNS}")
     parser.add_argument("--no-gui", action="store_true", help="Do not open the OpenCV stage viewer.")
+    parser.add_argument(
+        "--spec", default=DEFAULT_OBJECT_VISION_SPEC_ID.name,
+        choices=[spec_id.name for spec_id in PAPER_PLANE_SHAPE_SPEC_IDS],
+        help=f"Registered paper-plane ObjectVisionSpecId. Default: {DEFAULT_OBJECT_VISION_SPEC_ID.name}",
+    )
     args = parser.parse_args()
 
     if not args.image_path.is_file():
@@ -246,10 +257,12 @@ def main() -> None:
         raise ValueError(f"Reference image is {frame_width}x{frame_height}, but config expects {FRAME_W}x{FRAME_H}.")
 
     debug = DetectionDebug()
-    object_vision_spec = OBJECT_VISION_SPECS[ObjectType.PAPER_PLANE_SHAPES]
+    object_vision_spec_id = ObjectVisionSpecId[args.spec]
+    object_vision_spec = OBJECT_VISION_SPECS[object_vision_spec_id]
     detection = findSingleObjectUsingBestShapeGroup(frame, object_vision_spec, debug)
 
     print(f"Input image: {args.image_path.resolve()}")
+    print(f"ObjectVisionSpecId: {object_vision_spec_id.name}")
     print(f"Image size: {frame_width} x {frame_height}")
 
     if detection is None:

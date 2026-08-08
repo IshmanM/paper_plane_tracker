@@ -1,0 +1,106 @@
+{
+  "format_version": 1,
+  "object_type": "PAPER_PLANE_SHAPES",
+  "color_ids": [
+    "GREEN",
+    "CYAN"
+  ],
+  "minimum_contour_area_px": 80.0,
+  "polygon_epsilon_ratio": 0.04,
+  "shape_group_distance_factor": 3.0,
+  "width": null,
+  "height": null,
+  "length": null,
+  "rigid_planes": [
+    {
+      "rotation_object_from_plane": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          -1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          -1.0
+        ]
+      ],
+      "translation_object_from_plane_m": [
+        0.03,
+        0.0,
+        -0.02
+      ],
+      "shape_markers": [
+        {
+          "color_id": "GREEN",
+          "num_sides": 3,
+          "object_vertices_m": [
+            [
+              0.019,
+              -0.02
+            ],
+            [
+              -0.09,
+              -0.02
+            ],
+            [
+              -0.09,
+              0.02
+            ]
+          ],
+          "minimum_contour_area_px": 60.0
+        }
+      ]
+    },
+    {
+      "rotation_object_from_plane": [
+        [
+          0.96605224,
+          -0.17034108,
+          0.19423435
+        ],
+        [
+          0.19128349,
+          -0.033728441,
+          -0.98095516
+        ],
+        [
+          0.17364818,
+          0.98480775,
+          6.0302083e-17
+        ]
+      ],
+      "translation_object_from_plane_m": [
+        0.0,
+        -0.024,
+        0.015
+      ],
+      "shape_markers": [
+        {
+          "color_id": "CYAN",
+          "num_sides": 3,
+          "object_vertices_m": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              -0.091,
+              0.0
+            ],
+            [
+              -0.091,
+              0.035
+            ]
+          ],
+          "minimum_contour_area_px": 60.0
+        }
+      ]
+    }
+  ]
+}

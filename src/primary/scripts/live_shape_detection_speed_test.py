@@ -6,7 +6,7 @@ import cv2
 import numpy as np
 
 from src.primary.config import FRAME_W, FRAME_H
-from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType
+from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpecId
 from src.primary.detection import findSingleObjectUsingBestShapeGroup, createMeasurementUsingShapeGroup
 
 
@@ -14,6 +14,12 @@ WINDOW_NAME = "Live shape detection speed test"
 DEFAULT_CAMERA_INDEX = 0
 DEFAULT_CAMERA_FPS = 60
 DEFAULT_TIMING_WINDOW_FRAMES = 120
+
+DEFAULT_OBJECT_VISION_SPEC_ID = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
+PAPER_PLANE_SHAPE_SPEC_IDS = [
+    spec_id for spec_id, spec in OBJECT_VISION_SPECS.items()
+    if spec.object_type == ObjectType.PAPER_PLANE_SHAPES
+]
 
 
 def drawDetection(frame: np.ndarray, detection) -> None:
@@ -40,6 +46,11 @@ def main() -> None:
                         help=f"Requested camera FPS. Default: {DEFAULT_CAMERA_FPS}")
     parser.add_argument("--timing-window", type=int, default=DEFAULT_TIMING_WINDOW_FRAMES,
                         help=f"Frames used for rolling timing averages. Default: {DEFAULT_TIMING_WINDOW_FRAMES}")
+    parser.add_argument(
+        "--spec", default=DEFAULT_OBJECT_VISION_SPEC_ID.name,
+        choices=[spec_id.name for spec_id in PAPER_PLANE_SHAPE_SPEC_IDS],
+        help=f"Registered paper-plane ObjectVisionSpecId. Default: {DEFAULT_OBJECT_VISION_SPEC_ID.name}",
+    )
     args = parser.parse_args()
 
     if args.camera_fps < 1:
@@ -58,7 +69,8 @@ def main() -> None:
     camera.set(cv2.CAP_PROP_FPS, args.camera_fps)
     camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-    object_vision_spec = OBJECT_VISION_SPECS[ObjectType.PAPER_PLANE_SHAPES]
+    object_vision_spec_id = ObjectVisionSpecId[args.spec]
+    object_vision_spec = OBJECT_VISION_SPECS[object_vision_spec_id]
     detection_times_s = deque(maxlen=args.timing_window)
     loop_periods_s = deque(maxlen=args.timing_window)
     previous_loop_start_s = None
@@ -68,6 +80,7 @@ def main() -> None:
     actual_fps = camera.get(cv2.CAP_PROP_FPS)
 
     print(f"Camera: {actual_width}x{actual_height} at reported {actual_fps:.1f} FPS")
+    print(f"ObjectVisionSpecId: {object_vision_spec_id.name}")
     print("Press Q or Esc to quit.")
 
     try:
