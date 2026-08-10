@@ -3,7 +3,7 @@ import numpy as np
 from collections import Counter
 from itertools import combinations
 
-import src.primary.config as config
+from src.primary.camera_calibration import CameraCalibration
 from src.primary.geometry import estimateObjectWorldPosition
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec, ObjectVisionSpecId
 from src.primary.color import COLOR_SPECS, ColorId
@@ -60,35 +60,35 @@ class DetectionDebug:
 
 
 # Public detection entry points and shared result helpers.
-def detectSingleObject(frame: np.ndarray, object_vision_spec_id: ObjectVisionSpecId) -> tuple[bool, Detection, Measurement]:
+def detectSingleObject(frame: np.ndarray, object_vision_spec_id: ObjectVisionSpecId, camera_calibration: CameraCalibration) -> tuple[bool, Detection, Measurement]:
     object_vision_spec = OBJECT_VISION_SPECS[object_vision_spec_id]
 
     if object_vision_spec.object_type == ObjectType.TENNIS_BALL:
-        return detectTennisBall(frame, object_vision_spec,)
+        return detectTennisBall(frame, object_vision_spec, camera_calibration)
     elif object_vision_spec.object_type == ObjectType.PAPER_PLANE_SHAPES:
-        return detectPaperPlaneShapes(frame, object_vision_spec,)
+        return detectPaperPlaneShapes(frame, object_vision_spec, camera_calibration)
 
     raise ValueError(f"Unsupported object type for {object_vision_spec_id}: {object_vision_spec.object_type}")
 
 
-def detectTennisBall(frame: np.ndarray, object_vision_spec: ObjectVisionSpec,) -> tuple[bool, Detection, Measurement]:
+def detectTennisBall(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration) -> tuple[bool, Detection, Measurement]:
     detection = findSingleObjectUsingLargestColorBlob(frame, object_vision_spec,)
 
     if detection is None:
         return failedDetectionResult()
 
-    x, y, z = estimateObjectWorldPosition(detection.u, detection.v, detection.px_w, detection.px_h, object_w=object_vision_spec.width)
+    x, y, z = estimateObjectWorldPosition(detection.u, detection.v, detection.px_w, detection.px_h, object_vision_spec.width, camera_calibration)
     measurement = Measurement(x, y, z, None, None, None,)
     return True, detection, measurement
 
 
-def detectPaperPlaneShapes(frame: np.ndarray, object_vision_spec: ObjectVisionSpec,) -> tuple[bool, Detection, Measurement]:
+def detectPaperPlaneShapes(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration) -> tuple[bool, Detection, Measurement]:
     detection = findSingleObjectUsingBestShapeGroup(frame, object_vision_spec,)
 
     if detection is None:
         return failedDetectionResult()
 
-    measurement = createMeasurementUsingShapeGroup(detection, object_vision_spec,)
+    measurement = createMeasurementUsingShapeGroup(detection, object_vision_spec, camera_calibration)
 
     if measurement.x is None:
         return False, detection, measurement
@@ -123,7 +123,7 @@ def drawDetection(frame: np.ndarray, detection: Detection,) -> None:
             cv2.circle(frame, (int(vertex_u), int(vertex_v)), radius=4, color=color_spec.draw_bgr, thickness=-1,)
 
 
-def drawModelOrigin(frame: np.ndarray, measurement: Measurement,) -> None:
+def drawModelOrigin(frame: np.ndarray, measurement: Measurement, camera_calibration: CameraCalibration) -> None:
     if measurement.x is None or measurement.y is None or measurement.z is None or measurement.z <= 0.0:
         return
 
@@ -131,7 +131,7 @@ def drawModelOrigin(frame: np.ndarray, measurement: Measurement,) -> None:
     origin_px, _ = cv2.projectPoints(
         np.zeros((1, 3), dtype=np.float64), np.zeros((3, 1), dtype=np.float64),
         np.array([[measurement.x], [measurement.y], [measurement.z]], dtype=np.float64),
-        config.CAMERA_MATRIX, config.DISTORTION_COEFFICIENTS,
+        camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
     )
     origin_u, origin_v = np.rint(origin_px.reshape(2)).astype(np.int32)
     cv2.drawMarker(frame, (int(origin_u), int(origin_v)), (0, 255, 255), cv2.MARKER_TILTED_CROSS, 16, 2, cv2.LINE_AA)
@@ -584,7 +584,7 @@ def selectBestShapeGroup(
 
 
 # Convert the selected image-space shape group into a camera-frame measurement.
-def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: ObjectVisionSpec) -> Measurement:
+def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration) -> Measurement:
     failed_measurement = Measurement(None, None, None, None, None, None,)
 
     if not detection.shapes:
@@ -680,7 +680,7 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
     image_points = np.concatenate(image_point_groups, axis=0)
 
     solution_count, rotation_vectors, translation_vectors, _ = cv2.solvePnPGeneric(
-        object_points, image_points, config.CAMERA_MATRIX, config.DISTORTION_COEFFICIENTS, flags=cv2.SOLVEPNP_SQPNP,
+        object_points, image_points, camera_calibration.camera_matrix, camera_calibration.distortion_coefficients, flags=cv2.SOLVEPNP_SQPNP,
     )
 
     if not solution_count:
@@ -692,7 +692,7 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
     # for i, (rotation_vector, translation_vector) in enumerate(zip(rotation_vectors, translation_vectors)):
     #     projected_points, _ = cv2.projectPoints(
     #         object_points, rotation_vector, translation_vector,
-    #         config.CAMERA_MATRIX, config.DISTORTION_COEFFICIENTS,
+    #         camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
     #     )
     #     reprojection_error = float(np.sqrt(np.mean(np.sum(
     #         (projected_points.reshape(-1, 2) - image_points)**2, axis=1,
@@ -716,7 +716,7 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
             continue
 
         projected_points, _ = cv2.projectPoints(
-            object_points, rotation_vector, translation_vector, config.CAMERA_MATRIX, config.DISTORTION_COEFFICIENTS,
+            object_points, rotation_vector, translation_vector, camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
         )
         reprojection_error = float(np.sqrt(np.mean(np.sum((projected_points.reshape(-1, 2) - image_points)**2, axis=1))))
 

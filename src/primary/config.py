@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import numpy as np
 
 FRAME_W = 640
@@ -18,19 +20,21 @@ FPS = 60
 #     [0.09131862, -0.47045404, 0.00119751, 0.00289575, 0.76219894]
 # ], dtype=np.float64)
 
-CAMERA_MATRIX = np.array([
-    [640.820092, 0.0, 298.963328],
-    [0.0, 639.770129, 225.482995],
-    [0.0, 0.0, 1.0],
-], dtype=np.float64)
+# CAMERA_MATRIX = np.array([
+#     [640.820092, 0.0, 298.963328],
+#     [0.0, 639.770129, 225.482995],
+#     [0.0, 0.0, 1.0],
+# ], dtype=np.float64)
 
-DISTORTION_COEFFICIENTS = np.array([
-    [0.09141723, -0.39690385, -0.00317970, -0.00211780, 0.48441084]
-], dtype=np.float64)
+# DISTORTION_COEFFICIENTS = np.array([
+#     [0.09141723, -0.39690385, -0.00317970, -0.00211780, 0.48441084]
+# ], dtype=np.float64)
+
+CAMERA_CALIBRATION_PATH = Path("src/primary/calibration_data/camera/asus_laptop_webcam.json")
 
 CAMERA_INDEX = 0
 CAMERA_AUTO_EXPOSURE = False
-CAMERA_EXPOSURE = -5.0 #originally -6.0
+CAMERA_EXPOSURE = -4.5 #originally -6.0
 CAMERA_GAIN = 0.0
 CAMERA_AUTO_WHITE_BALANCE = False
 CAMERA_WHITE_BALANCE_TEMPERATURE = 4600.0

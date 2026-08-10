@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 import os
 import threading
+from src.primary.camera_calibration import CameraCalibration
 from src.primary.tracking import TrackStatus, SingleObjectTracker, drawTrack
 from src.primary.detection import detectSingleObject, drawDetection
 from src.primary.object_vision_spec import ObjectVisionSpecId
@@ -25,6 +26,10 @@ from src.comm.network_config import(
 if __name__ == "__main__": 
     object_vision_spec_id = ObjectVisionSpecId.TENNIS_BALL_DEFAULT
     # object_vision_spec_id = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
+
+    camera_calibration = CameraCalibration(config.CAMERA_CALIBRATION_PATH, config.FRAME_W, config.FRAME_H)
+    if (camera_calibration.image_width_px, camera_calibration.image_height_px) != (config.FRAME_W, config.FRAME_H):
+        raise ValueError(f"Camera calibration resolution {camera_calibration.image_width_px}x{camera_calibration.image_height_px} does not match configured frame resolution {config.FRAME_W}x{config.FRAME_H}")
 
     cap = cv2.VideoCapture(config.CAMERA_INDEX, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_W)
@@ -91,7 +96,7 @@ if __name__ == "__main__":
                     break
 
                 # Detect the object and produce a measurement
-                object_detected, detection, measurement = detectSingleObject(frame, object_vision_spec_id)
+                object_detected, detection, measurement = detectSingleObject(frame, object_vision_spec_id, camera_calibration)
     
                 if object_detected:
                     last_detection_px_w = detection.px_w
@@ -112,7 +117,7 @@ if __name__ == "__main__":
                 track_label = "Dead track"
                 if track_status == TrackStatus.CONFIRMED or track_status == TrackStatus.TENTATIVE:
                     # rectangle is drawn based on last detected px_w, px_h. might change this...
-                    drawTrack(frame, tracker.track, last_detection_px_w, last_detection_px_h,)
+                    drawTrack(frame, tracker.track, last_detection_px_w, last_detection_px_h, camera_calibration)
                     track_label = ("Confirmed" if track_status == TrackStatus.CONFIRMED else "Tentative") 
                     track_label = (
                         track_label 
