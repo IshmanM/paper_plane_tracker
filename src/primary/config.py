@@ -30,7 +30,8 @@ FPS = 60
 #     [0.09141723, -0.39690385, -0.00317970, -0.00211780, 0.48441084]
 # ], dtype=np.float64)
 
-CAMERA_CALIBRATION_PATH = Path("src/primary/calibration_data/camera/asus_laptop_webcam.json")
+CAMERA_CALIBRATION_NAME = "asus_laptop_webcam"
+CAMERA_CALIBRATION_PATH = Path(f"src/primary/calibration_data/camera/{CAMERA_CALIBRATION_NAME}.json")
 
 CAMERA_INDEX = 0
 CAMERA_AUTO_EXPOSURE = False
