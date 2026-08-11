@@ -184,9 +184,9 @@ def main() -> None:
     print(f"Platform geometry used by laser model: {CALIBRATION_PLATFORM_GEOMETRY_SPEC_ID.name}")
     print(f"Samples: {SAMPLES_PATH}")
     print(f"Results: {RESULTS_PATH}")
-    print("Stored camera samples: +x RIGHT, +y UP, +z FORWARD.")
-    print("Platform convention: +x RIGHT, +y UP, +z FORWARD.")
-    print("Positive yaw = RIGHT / CLOCKWISE viewed from above.")
+    print("Stored camera samples: +x RIGHT, +y DOWN, +z FORWARD (raw OpenCV).")
+    print("Platform convention (FLU): +x FORWARD, +y LEFT, +z UP.")
+    print("Positive yaw = LEFT / ANTICLOCKWISE viewed from above.")
     print("A = LEFT / ANTICLOCKWISE, D = RIGHT / CLOCKWISE, W = UP, S = DOWN.")
     print("Latch a target with T, physically verify these controls, then press C to confirm the convention.")
     print(f"Loaded {len(samples)} existing samples.")
@@ -209,11 +209,10 @@ def main() -> None:
                 )
 
                 if object_detected:
-                    # Detection returns OpenCV camera coordinates (+y down).
-                    # Store calibration samples in the robot-style camera frame (+y up).
+                    # Store raw OpenCV camera coordinates: +x right, +y down, +z forward.
                     position_camera_m = np.array([
                         measurement.x,
-                        -measurement.y,
+                        measurement.y,
                         measurement.z,
                     ], dtype=float)
 
@@ -306,7 +305,7 @@ def main() -> None:
                     ("FRAME CHECK - verify physically before recording:", (0, 165, 255)),
                     ("A LEFT / ANTICLOCKWISE above | D RIGHT / CLOCKWISE above | W UP | S DOWN", (0, 165, 255)),
                     (
-                        f"+x RIGHT, +y UP, +z FORWARD | yaw {yaw_deg:+.2f} deg | "
+                        f"FLU +x FORWARD, +y LEFT, +z UP | yaw {yaw_deg:+.2f} deg | "
                         f"elev {elevation_deg:+.2f} deg",
                         (0, 165, 255),
                     ),
@@ -393,9 +392,9 @@ def main() -> None:
                 tilt_sign = config.SERVO_SIGNS[tilt_idx]
 
                 with servo_angles_lock:
-                    if key == ord("d"):      # physical RIGHT / clockwise viewed from above
+                    if key == ord("a"):      # physical LEFT / positive yaw / anticlockwise viewed from above
                         servo_angles[pan_idx] += pan_sign*step
-                    elif key == ord("a"):    # physical LEFT / anticlockwise viewed from above
+                    elif key == ord("d"):    # physical RIGHT / negative yaw / clockwise viewed from above
                         servo_angles[pan_idx] -= pan_sign*step
                     elif key == ord("w"):    # physical UP
                         servo_angles[tilt_idx] += tilt_sign*step
@@ -450,7 +449,7 @@ def main() -> None:
                     q_record = servo_angles.copy()
 
                 sample = {
-                    # position_camera_m is already +y up here.
+                    # position_camera_m is raw OpenCV camera coordinates.
                     "position_camera_m": latched_position_camera_m.tolist(),
                     "pan_deg": float(q_record[config.SERVO_IDX["pan"]]),
                     "tilt_deg": float(q_record[config.SERVO_IDX["tilt"]]),

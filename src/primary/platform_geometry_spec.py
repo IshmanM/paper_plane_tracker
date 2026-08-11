@@ -13,15 +13,15 @@ class PlatformGeometrySpec:
         rotation_platform_from_foam_mechanism_at_forward: np.ndarray,
         laser_origin_offset_foam_mechanism_m: np.ndarray | None = None,
     ):
-        # Platform origin -> dart exit when pan/tilt are forward.
+        # Platform origin -> dart exit when pan/tilt are forward, in platform FLU coordinates.
         self.foam_mechanism_origin_offset_m = np.asarray(foam_mechanism_origin_offset_m, dtype=float).copy()
 
-        # Foam-mechanism frame -> platform frame when pan/tilt are forward.
+        # Foam-mechanism FLU frame -> platform FLU frame when pan/tilt are forward.
         self.rotation_platform_from_foam_mechanism_at_forward = np.asarray(
             rotation_platform_from_foam_mechanism_at_forward, dtype=float
         ).copy()
 
-        # Dart exit -> laser origin, expressed in the foam-mechanism frame.
+        # Dart exit -> laser origin, expressed in the foam-mechanism FLU frame.
         self.laser_origin_offset_foam_mechanism_m = (
             np.zeros(3, dtype=float)
             if laser_origin_offset_foam_mechanism_m is None
@@ -46,9 +46,9 @@ class PlatformGeometrySpec:
 PLATFORM_GEOMETRY_SPECS = {
     PlatformGeometrySpecId.PLATFORM_1: PlatformGeometrySpec(
         foam_mechanism_origin_offset_m=np.array([
-            0.0,  # right
-            0.0,  # up
             0.0,  # forward
+            0.0,  # left
+            0.0,  # up
         ]),
         rotation_platform_from_foam_mechanism_at_forward=np.eye(3),
         laser_origin_offset_foam_mechanism_m=np.zeros(3),  # coaxial laser

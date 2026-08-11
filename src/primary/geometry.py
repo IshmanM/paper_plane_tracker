@@ -1,25 +1,13 @@
+from __future__ import annotations
+from typing import TYPE_CHECKING
+
 import numpy as np
 import cv2
 
 from src.primary.camera_calibration import CameraCalibration
-from src.primary.camera_to_platform_calibration import CameraToPlatformCalibration
 
-
-
-#TODO: ensure the -1 determinant is preserved when validating camera_to_platform_calibration 
-
-# # todo: getting rid of this once replaced
-# # need to tune platform rotation and translation according to design...
-# CAMERA_TO_PLATFORM_R = np.array([
-#     [1.0,  0.0, 0.0],
-#     [0.0, -1.0, 0.0], # -1.0 since +y is up
-#     [0.0,  0.0, 1.0],
-# ])
-
-# # todo: getting rid of this once replaced
-# # meters camera x, y, z relative to platform origin
-# CAMERA_ORIGIN_IN_PLATFORM = np.array([-0.5, 0.15, 0.0], dtype=float) 
-
+if TYPE_CHECKING:
+    from src.primary.camera_to_platform_calibration import CameraToPlatformCalibration
 
 
 # image frame to world frame relative to camera lens
@@ -59,26 +47,20 @@ def estimateObjectImagePosition(x, y, z, camera_calibration: CameraCalibration):
     return float(u), float(v)
 
 
-# world frame to platform frame. Assuming platform position = servo position.
-# todo: replace CAMERA_TO_PLATFORM_R use with the new camera_to_platform_calibration stuff
+# Camera/world frame to platform frame.
 def estimateObjectPlatformPosition(world_position: np.ndarray, camera_to_platform_calibration: CameraToPlatformCalibration) -> np.ndarray:
     """
-    Convert object position from camera/world frame to platform frame.
+    Convert raw OpenCV camera coordinates to the platform FLU frame.
 
-    Returns:
-        np.ndarray shape (3,), object position relative to the platform origin.
+    Camera:   +x right, +y down, +z forward
+    Platform: +x forward, +y left, +z up
 
-    Convention:
-        p_P = R_PC @ p_C + t_PC
+    p_P = R_PC @ p_C + t_PC
     """
-
     p_C = np.asarray(world_position, dtype=float).reshape(-1)
 
     if p_C.shape != (3,) or not np.all(np.isfinite(p_C)):
         raise ValueError(f"world_position must be a finite shape-(3,) array, got {p_C.shape}")
-
-    # Vision/OpenCV (+y down) -> camera-relative robot convention (+y up).
-    p_C[1] *= -1.0
 
     return camera_to_platform_calibration.transformPosition(p_C)
 
@@ -86,23 +68,24 @@ def estimateObjectPlatformPosition(world_position: np.ndarray, camera_to_platfor
 # For use in platform.py and calibration
 def rotationPlatformFromPanTilt(platform_yaw_rad: float, platform_theta_rad: float) -> np.ndarray:
     """
-    Rotation caused by the pan/tilt joints.
-    +yaw points right and +theta points up.
+    Rotation caused by the pan/tilt joints in the platform FLU frame.
+    +yaw points left and +theta points up.
     """
-
     cy, sy = np.cos(platform_yaw_rad), np.sin(platform_yaw_rad)
     ct, st = np.cos(platform_theta_rad), np.sin(platform_theta_rad)
 
+    # +yaw rotates +x (forward) toward +y (left).
     rotation_yaw = np.array([
-        [cy, 0.0, sy],
-        [0.0, 1.0, 0.0],
-        [-sy, 0.0, cy],
+        [cy, -sy, 0.0],
+        [sy,  cy, 0.0],
+        [0.0, 0.0, 1.0],
     ])
 
+    # +theta rotates +x (forward) toward +z (up).
     rotation_theta = np.array([
-        [1.0, 0.0, 0.0],
-        [0.0, ct, st],
-        [0.0, -st, ct],
+        [ct, 0.0, -st],
+        [0.0, 1.0, 0.0],
+        [st, 0.0,  ct],
     ])
 
     return rotation_yaw@rotation_theta

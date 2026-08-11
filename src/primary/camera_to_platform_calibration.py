@@ -12,19 +12,21 @@ from src.primary.platform_geometry_spec import PlatformGeometrySpec
 MIN_CALIBRATION_SAMPLES = 6
 MAX_RAY_FIT_ITERATIONS = 100
 
-# Used only for the OpenCV PnP initialization. Calibration samples themselves
-# use +x right, +y up, +z forward.
-Y_DOWN_FROM_Y_UP = np.diag([1.0, -1.0, 1.0])
+# Platform FLU -> OpenCV-like axes for the PnP initializer only:
+# [forward, left, up] -> [right, down, forward].
+OPENCV_LIKE_FROM_PLATFORM = np.array([
+    [0.0, -1.0,  0.0],
+    [0.0,  0.0, -1.0],
+    [1.0,  0.0,  0.0],
+], dtype=np.float64)
 
 
 class CameraToPlatformCalibration:
     """
-    Camera-relative y-up coordinates -> platform coordinates.
+    Raw OpenCV camera coordinates -> platform FLU coordinates.
 
-    Both frames use:
-        +x = right
-        +y = up
-        +z = forward
+    Camera:   +x right, +y down, +z forward
+    Platform: +x forward, +y left, +z up
 
     p_platform = R_platform_from_camera @ p_camera + t_platform_from_camera
     """
@@ -60,7 +62,7 @@ class CameraToPlatformCalibration:
             raise ValueError("rotation_platform_from_camera must be a proper rotation matrix")
 
     def transformPosition(self, position_camera_m: np.ndarray) -> np.ndarray:
-        """Transform a camera-relative position that already uses +y up."""
+        """Transform a raw OpenCV camera-frame position into the platform FLU frame."""
         position_camera_m = np.asarray(position_camera_m, dtype=np.float64)
 
         if position_camera_m.shape != (3,) or not np.all(np.isfinite(position_camera_m)):
@@ -105,7 +107,7 @@ def servoAnglesToPlatformYawElevation(pan_deg: float, tilt_deg: float) -> tuple[
 def servoAnglesToLaserRay(pan_deg: float, tilt_deg: float, platform_geometry_spec: PlatformGeometrySpec) -> tuple[np.ndarray, np.ndarray]:
     """
     Return laser origin and direction in the platform frame.
-    Laser direction is assumed aligned with foam-mechanism +z.
+    Laser direction is assumed aligned with foam-mechanism +x (forward in FLU).
     """
     yaw_deg, elevation_deg = servoAnglesToPlatformYawElevation(pan_deg, tilt_deg)
     R_joint = rotationPlatformFromPanTilt(np.deg2rad(yaw_deg), np.deg2rad(elevation_deg))
@@ -116,7 +118,7 @@ def servoAnglesToLaserRay(pan_deg: float, tilt_deg: float, platform_geometry_spe
 
     # Laser offset is expressed in the moving foam-mechanism frame.
     laser_origin_platform = foam_origin_platform + R_foam@platform_geometry_spec.laser_origin_offset_foam_mechanism_m
-    laser_direction_platform = R_foam@np.array([0.0, 0.0, 1.0], dtype=np.float64)
+    laser_direction_platform = R_foam@np.array([1.0, 0.0, 0.0], dtype=np.float64)
     laser_direction_platform /= np.linalg.norm(laser_direction_platform)
 
     return laser_origin_platform, laser_direction_platform
@@ -180,7 +182,7 @@ def _refineUsingAlternatingRayFit(
         U, _, Vt = np.linalg.svd(camera_centered.T@platform_centered)
         R_new = Vt.T@U.T
 
-        # Both coordinate sets use +y up, so do not allow a reflection.
+        # Camera and platform frames are both right-handed, so do not allow a reflection.
         if np.linalg.det(R_new) < 0.0:
             Vt[-1] *= -1.0
             R_new = Vt.T@U.T
@@ -206,7 +208,7 @@ def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec
 
     for sample_index, sample in enumerate(samples):
         try:
-            # Samples are already stored using +y up.
+            # Samples are stored directly in raw OpenCV camera coordinates.
             position_camera_m = np.asarray(sample["position_camera_m"], dtype=np.float64)
             pan_deg = float(sample["pan_deg"])
             tilt_deg = float(sample["tilt_deg"])
@@ -228,19 +230,18 @@ def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec
     if np.linalg.matrix_rank(positions_camera_m - np.mean(positions_camera_m, axis=0)) < 2:
         raise ValueError("Calibration target positions are degenerate; collect samples spread across different directions/positions")
 
-    if np.any(directions_platform[:, 2] <= 1e-6):
-        raise ValueError("Calibration currently requires all laser rays to point into +z; avoid exactly sideways/backward samples")
+    if np.any(directions_platform[:, 0] <= 1e-6):
+        raise ValueError("Calibration currently requires all laser rays to point into +x/forward; avoid exactly sideways/backward samples")
 
     initial_solutions = []
 
-    # OpenCV PnP expects +y down. Convert both y-up coordinate sets only for this
-    # initial estimate, then convert its R/t back to the y-up convention.
-    positions_camera_opencv = (Y_DOWN_FROM_Y_UP@positions_camera_m.T).T
-    directions_platform_opencv = (Y_DOWN_FROM_Y_UP@directions_platform.T).T
-    image_points = directions_platform_opencv[:, :2]/directions_platform_opencv[:, 2, None]
+    # PnP uses a virtual OpenCV-like frame whose optical axis is forward. Convert
+    # platform FLU ray directions into that frame for initialization only.
+    directions_pnp = (OPENCV_LIKE_FROM_PLATFORM@directions_platform.T).T
+    image_points = directions_pnp[:, :2]/directions_pnp[:, 2, None]
 
     solution_count, rotation_vectors, translation_vectors, _ = cv2.solvePnPGeneric(
-        positions_camera_opencv,
+        positions_camera_m,
         image_points,
         np.eye(3, dtype=np.float64),
         np.zeros((1, 5), dtype=np.float64),
@@ -249,15 +250,18 @@ def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec
 
     if solution_count:
         for rotation_vector, translation_vector in zip(rotation_vectors, translation_vectors):
-            R_opencv, _ = cv2.Rodrigues(rotation_vector)
-            t_opencv = translation_vector.reshape(3)
+            R_pnp, _ = cv2.Rodrigues(rotation_vector)
+            t_pnp = translation_vector.reshape(3)
 
-            R_y_up = Y_DOWN_FROM_Y_UP@R_opencv@Y_DOWN_FROM_Y_UP
-            t_y_up = Y_DOWN_FROM_Y_UP@t_opencv
-            initial_solutions.append((R_y_up, t_y_up))
+            # p_pnp = M @ p_platform, so convert the PnP transform back to FLU.
+            initial_solutions.append((
+                OPENCV_LIKE_FROM_PLATFORM.T@R_pnp,
+                OPENCV_LIKE_FROM_PLATFORM.T@t_pnp,
+            ))
 
-    # Neutral fallback for approximately aligned camera/platform poses.
-    initial_solutions.append((np.eye(3, dtype=np.float64), np.zeros(3, dtype=np.float64)))
+    # Neutral physical-alignment fallback: camera and platform face the same way,
+    # but their coordinate axes differ (OpenCV vs FLU).
+    initial_solutions.append((OPENCV_LIKE_FROM_PLATFORM.T.copy(), np.zeros(3, dtype=np.float64)))
 
     best_R = None
     best_t = None
