@@ -1,4 +1,3 @@
-
 from src.primary.tracking import Track, TrackStatus, SingleObjectTracker
 import numpy as np
 import time
@@ -602,6 +601,11 @@ class Platform:
         """
         Convert platform-frame object position to pan/tilt angles.
 
+        Platform frame is FLU:
+            +x = forward
+            +y = left
+            +z = up
+
         Returns:
             success, servo_angles, flight_time
 
@@ -626,17 +630,17 @@ class Platform:
         foam_origin_forward = self.platform_geometry_spec.foam_mechanism_origin_offset_m
         R_foam_forward = self.platform_geometry_spec.rotation_platform_from_foam_mechanism_at_forward
 
-        # Foam-mechanism +z is the foam exit direction. R_foam_forward captures
-        # any fixed angular offset at the nominal forward pan/tilt pose.
-        foam_direction_forward = R_foam_forward@np.array([0.0, 0.0, 1.0])
+        # Foam-mechanism +x is the foam exit direction in its FLU frame.
+        # R_foam_forward captures any fixed angular offset at nominal forward pan/tilt.
+        foam_direction_forward = R_foam_forward@np.array([1.0, 0.0, 0.0])
 
         v0 = float(FOAM_PROTRUSION_SPEED)
         g = float(GRAVITY)
 
         # Initial guess assumes the foam exits from the platform origin.
         # The iterations below correct this using the actual moving foam-exit position.
-        platform_yaw_rad = np.arctan2(position[0], position[2])
-        platform_theta_rad = np.arctan2(position[1], np.hypot(position[0], position[2]))
+        platform_yaw_rad = np.arctan2(position[1], position[0])
+        platform_theta_rad = np.arctan2(position[2], np.hypot(position[0], position[1]))
 
         for _ in range(MAX_AIM_SOLVE_ITERATIONS):
 
@@ -646,25 +650,25 @@ class Platform:
 
             # Re-express the object relative to where the foam actually exits.
             relative_position = position - foam_origin_platform
-            x, y, z = relative_position
+            forward, left, up = relative_position
 
-            if z <= MIN_FORWARD_RANGE:
+            if forward <= MIN_FORWARD_RANGE:
                 return fail()
 
             # 1. Horizontal direction required from the current foam-exit position.
-            target_yaw_rad = np.arctan2(x, z)
+            target_yaw_rad = np.arctan2(left, forward)
 
             # 2. Vertical direction required after accounting for gravity.
-            r = np.hypot(x, z)
+            r = np.hypot(forward, left)
             if r <= 1e-9:
                 return fail()
 
             A = g*r*r/(2.0*v0*v0)
 
             if A <= 1e-12:
-                tan_theta = y/r
+                tan_theta = up/r
             else:
-                discriminant = r*r - 4.0*A*(A + y)
+                discriminant = r*r - 4.0*A*(A + up)
 
                 # Allow tiny numerical roundoff.
                 if discriminant < -1e-9:
@@ -677,33 +681,32 @@ class Platform:
 
             target_theta_rad = np.arctan(tan_theta)
 
-            # 3. Convert the required exit direction into pan/tilt joint angles,
+            # 3. Convert required exit direction into pan/tilt joint angles,
             # compensating for fixed foam-mechanism rotation at the forward pose.
             axis_x, axis_y, axis_z = foam_direction_forward
-            axis_yz = np.hypot(axis_y, axis_z)
+            axis_xz = np.hypot(axis_x, axis_z)
 
-            if axis_yz <= 1e-9:
+            if axis_xz <= 1e-9:
                 return fail()
 
-            target_y = np.sin(target_theta_rad)
-            if abs(target_y) > axis_yz + 1e-9:
+            target_z = np.sin(target_theta_rad)
+            if abs(target_z) > axis_xz + 1e-9:
                 return fail()
 
-            foam_theta_offset_rad = np.arctan2(axis_y, axis_z)
-
+            foam_theta_offset_rad = np.arctan2(axis_z, axis_x)
             new_platform_theta_rad = (
-                np.arcsin(np.clip(target_y/axis_yz, -1.0, 1.0))
+                np.arcsin(np.clip(target_z/axis_xz, -1.0, 1.0))
                 - foam_theta_offset_rad
             )
 
-            # After applying tilt, find the remaining horizontal angular offset
-            # of the foam mechanism and compensate for it with pan.
-            rotated_axis_z = (
-                -np.sin(new_platform_theta_rad)*axis_y
-                + np.cos(new_platform_theta_rad)*axis_z
+            # After applying elevation, find the remaining horizontal angular offset
+            # of the foam mechanism and compensate for it with yaw.
+            rotated_axis_x = (
+                np.cos(new_platform_theta_rad)*axis_x
+                - np.sin(new_platform_theta_rad)*axis_z
             )
 
-            foam_yaw_offset_rad = np.arctan2(axis_x, rotated_axis_z)
+            foam_yaw_offset_rad = np.arctan2(axis_y, rotated_axis_x)
             new_platform_yaw_rad = target_yaw_rad - foam_yaw_offset_rad
             new_platform_yaw_rad = (new_platform_yaw_rad + np.pi)%(2.0*np.pi) - np.pi
 
@@ -723,21 +726,21 @@ class Platform:
         foam_origin_platform = R_joint@foam_origin_forward
         relative_position = position - foam_origin_platform
 
-        x, y, z = relative_position
+        forward, left, up = relative_position
 
-        if z <= MIN_FORWARD_RANGE:
+        if forward <= MIN_FORWARD_RANGE:
             return fail()
 
-        r = np.hypot(x, z)
+        r = np.hypot(forward, left)
         if r <= 1e-9:
             return fail()
 
         A = g*r*r/(2.0*v0*v0)
 
         if A <= 1e-12:
-            tan_theta = y/r
+            tan_theta = up/r
         else:
-            discriminant = r*r - 4.0*A*(A + y)
+            discriminant = r*r - 4.0*A*(A + up)
 
             if discriminant < -1e-9:
                 return fail()
@@ -757,7 +760,7 @@ class Platform:
         if not np.isfinite(flight_time) or flight_time <= 0.0:
             return fail()
 
-        # 5. Convert platform pan/tilt angles into servo commands.
+        # 5. Convert platform yaw/elevation angles into servo commands.
         platform_yaw_deg = np.rad2deg(platform_yaw_rad)
         platform_theta_deg = np.rad2deg(platform_theta_rad)
 
@@ -859,4 +862,4 @@ class Platform:
 
         normalized_error = (current_intercept_prediction - planned_intercept_prediction) / tolerances
         return np.linalg.norm(normalized_error) <= 1.0
- 
+        
