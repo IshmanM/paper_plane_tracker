@@ -21,7 +21,7 @@ class PlatformGeometrySpec:
             rotation_platform_from_foam_mechanism_at_forward, dtype=float
         ).copy()
 
-        # Dart exit -> laser origin, expressed in the foam-mechanism FLU frame.
+        # Dart exit -> laser origin, expressed in the foam-mechanism FLU frame. (Laser used in calibration)
         self.laser_origin_offset_foam_mechanism_m = (
             np.zeros(3, dtype=float)
             if laser_origin_offset_foam_mechanism_m is None
@@ -48,7 +48,7 @@ PLATFORM_GEOMETRY_SPECS = {
         foam_mechanism_origin_offset_m=np.array([
             0.0,  # forward
             0.0,  # left
-            0.0,  # up
+            0.0525,  # up
         ]),
         rotation_platform_from_foam_mechanism_at_forward=np.eye(3),
         laser_origin_offset_foam_mechanism_m=np.zeros(3),  # coaxial laser
