@@ -77,6 +77,9 @@ def estimateObjectPlatformPosition(world_position: np.ndarray, camera_to_platfor
     if p_C.shape != (3,) or not np.all(np.isfinite(p_C)):
         raise ValueError(f"world_position must be a finite shape-(3,) array, got {p_C.shape}")
 
+    # Vision/OpenCV (+y down) -> camera-relative robot convention (+y up).
+    p_C[1] *= -1.0
+
     return camera_to_platform_calibration.transformPosition(p_C)
 
 
