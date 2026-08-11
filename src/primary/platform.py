@@ -7,7 +7,9 @@ import src.primary.config as config
 from src.primary.comm_buffer import CommBuffer
 from src.primary.plan import Plan, PlanType
 from src.primary.platform_mode import PlatformMode
-
+from src.primary.geometry import rotationPlatformFromPanTilt
+from src.primary.platform_geometry_spec import PlatformGeometrySpecId, PlatformGeometrySpec, PLATFORM_GEOMETRY_SPECS
+from src.primary.camera_to_platform_calibration import CameraToPlatformCalibration
 
 
 SERVO_SETTLING_TIME = 0.1 # seconds
@@ -32,15 +34,14 @@ TRIGGER_DELAY = 0.1 # seconds
 
 GRAVITY = 9.81  # m/s^2
 
+# Increase as needed.
+MAX_AIM_SOLVE_ITERATIONS = 5
+
 # Tune experimentally.
-DART_PROTRUSION_SPEED = 12.0  # m/s
+FOAM_PROTRUSION_SPEED = 12.0  # m/s
 
 # Do not aim at objects effectively behind / on top of platform.
 MIN_FORWARD_RANGE = 0.02  # m
-
-# Position of the dart protrusion relative to the platform origin.
-# Keep zero initially unless I carefully measure the geometry.
-PLATFORM_PROTRUSION_OFFSET = np.array([0.0, 0.0, 0.0], dtype=float)
 
 # Usually False for a turret. High arc is slower and less direct.
 USE_HIGH_ARC = False
@@ -91,7 +92,9 @@ SUBSEQUENT_INTERCEPT_PLAN_COST_WEIGHTS = {
 class Platform:
     def __init__(
         self,
-        comm_buffer: CommBuffer
+        comm_buffer: CommBuffer,
+        platform_geometry_spec_id: PlatformGeometrySpecId,
+        camera_to_platform_calibration: CameraToPlatformCalibration
     ):
         self.mode = PlatformMode.OFF
         self.active_plan = self._make_off_plan(now=time.perf_counter())
@@ -105,6 +108,9 @@ class Platform:
             triggering_halted=self.triggering_halted
         )
 
+        self.platform_geometry_spec = PLATFORM_GEOMETRY_SPECS[platform_geometry_spec_id]
+
+        self.camera_to_platform_calibration = camera_to_platform_calibration
         
         # extra Todos:
         # - if adding ACKs from the rpi: eg. self.last_ack_cmd_id, self.last_ack_time. <-- should use the buffer
@@ -362,7 +368,7 @@ class Platform:
         (False, None) otherwise
 
         Important timing meaning:
-        intercept_time = when object and projectile meet
+        intercept_time = when object and foam meet
         trigger_time      = when platform must trigger/release
         expected_ready_time = when pan/tilt is expected to be aimed and settled
 
@@ -397,7 +403,7 @@ class Platform:
         (False, None) otherwise
 
         Important timing meaning:
-        intercept_time = when object and projectile meet
+        intercept_time = when object and foam meet
         trigger_time      = when platform must trigger/release
         expected_ready_time = when pan/tilt is expected to be aimed and settled
 
@@ -539,10 +545,10 @@ class Platform:
                 
 
             # 2. Transform object position into platform frame.
-            object_position_platform = estimateObjectPlatformPosition(object_position_world)
+            object_position_platform = estimateObjectPlatformPosition(object_position_world, self.camera_to_platform_calibration)
 
-            # 3. Use platform-frame point to compute servo raw pan/tilt angles and projectile flight time
-            angles_valid, q_raw, projectile_flight_time = self._object_position_to_servo_angles_and_flight_time(object_position_platform)
+            # 3. Use platform-frame point to compute servo raw pan/tilt angles and foam flight time
+            angles_valid, q_raw, foam_flight_time = self._object_position_to_servo_angles_and_flight_time(object_position_platform)
             if not angles_valid:
                 continue
 
@@ -550,7 +556,7 @@ class Platform:
             # print("_make_best_valid_intercept_plan_from_candidates c") # FOR DEBUG ONLY
 
             # 4. Convert intercept time to trigger time.
-            trigger_time = intercept_time - projectile_flight_time - TRIGGER_DELAY
+            trigger_time = intercept_time - foam_flight_time - TRIGGER_DELAY
             if trigger_time < now and not self._close_to_trigger_time(now, trigger_time=trigger_time):
                 continue
 
@@ -592,14 +598,13 @@ class Platform:
         
         return best_plan is not None, best_plan   
 
-
     def _object_position_to_servo_angles_and_flight_time(self, position: np.ndarray) -> tuple[bool, np.ndarray | None, float | None]:
         """
         Convert platform-frame object position to pan/tilt angles.
-        
+
         Returns:
-            success, servo_angles, projectile_flight_time
-        
+            success, servo_angles, flight_time
+
         success = False means this object position is not aimable/reachable.
         """
 
@@ -610,104 +615,172 @@ class Platform:
         if position.shape != (3,) or not np.all(np.isfinite(position)):
             return fail()
 
-        # print("made it to _object_position_to_servo_angles_and_flight_time A") # FOR DEBUG ONLY
+        # This currently uses a lightweight fixed-point iteration to account for the
+        # fact that the foam-mechanism origin moves as pan/tilt change.
+        #
+        # TODO: If the platform geometry becomes more complicated, consider replacing
+        # this with a proper numerical IK solve over pan, tilt, and flight time.
+        # That would directly solve the full foam-motion equations while naturally
+        # accounting for moving origins, fixed mechanism rotation, and joint limits.
 
-        protrusion_offset = np.asarray(PLATFORM_PROTRUSION_OFFSET, dtype=float).reshape(-1).copy()
-        if protrusion_offset.shape != (3,):
-            raise ValueError("Invalid protrusion_offset ndarray shape")
-        
-        position = position - protrusion_offset
+        foam_origin_forward = self.platform_geometry_spec.foam_mechanism_origin_offset_m
+        R_foam_forward = self.platform_geometry_spec.rotation_platform_from_foam_mechanism_at_forward
 
-        x, y, z = position[0], position[1], position[2] # ToDo: orientation TBD...
+        # Foam-mechanism +z is the foam exit direction. R_foam_forward captures
+        # any fixed angular offset at the nominal forward pan/tilt pose.
+        foam_direction_forward = R_foam_forward@np.array([0.0, 0.0, 1.0])
+
+        v0 = float(FOAM_PROTRUSION_SPEED)
+        g = float(GRAVITY)
+
+        # Initial guess assumes the foam exits from the platform origin.
+        # The iterations below correct this using the actual moving foam-exit position.
+        platform_yaw_rad = np.arctan2(position[0], position[2])
+        platform_theta_rad = np.arctan2(position[1], np.hypot(position[0], position[2]))
+
+        for _ in range(MAX_AIM_SOLVE_ITERATIONS):
+
+            # Pan/tilt rotates the physical foam-exit offset about the platform origin.
+            R_joint = rotationPlatformFromPanTilt(platform_yaw_rad, platform_theta_rad)
+            foam_origin_platform = R_joint@foam_origin_forward
+
+            # Re-express the object relative to where the foam actually exits.
+            relative_position = position - foam_origin_platform
+            x, y, z = relative_position
+
+            if z <= MIN_FORWARD_RANGE:
+                return fail()
+
+            # 1. Horizontal direction required from the current foam-exit position.
+            target_yaw_rad = np.arctan2(x, z)
+
+            # 2. Vertical direction required after accounting for gravity.
+            r = np.hypot(x, z)
+            if r <= 1e-9:
+                return fail()
+
+            A = g*r*r/(2.0*v0*v0)
+
+            if A <= 1e-12:
+                tan_theta = y/r
+            else:
+                discriminant = r*r - 4.0*A*(A + y)
+
+                # Allow tiny numerical roundoff.
+                if discriminant < -1e-9:
+                    return fail()
+
+                sqrt_disc = np.sqrt(max(discriminant, 0.0))
+                tan_theta_low = (r - sqrt_disc)/(2.0*A)
+                tan_theta_high = (r + sqrt_disc)/(2.0*A)
+                tan_theta = tan_theta_high if USE_HIGH_ARC else tan_theta_low
+
+            target_theta_rad = np.arctan(tan_theta)
+
+            # 3. Convert the required exit direction into pan/tilt joint angles,
+            # compensating for fixed foam-mechanism rotation at the forward pose.
+            axis_x, axis_y, axis_z = foam_direction_forward
+            axis_yz = np.hypot(axis_y, axis_z)
+
+            if axis_yz <= 1e-9:
+                return fail()
+
+            target_y = np.sin(target_theta_rad)
+            if abs(target_y) > axis_yz + 1e-9:
+                return fail()
+
+            foam_theta_offset_rad = np.arctan2(axis_y, axis_z)
+
+            new_platform_theta_rad = (
+                np.arcsin(np.clip(target_y/axis_yz, -1.0, 1.0))
+                - foam_theta_offset_rad
+            )
+
+            # After applying tilt, find the remaining horizontal angular offset
+            # of the foam mechanism and compensate for it with pan.
+            rotated_axis_z = (
+                -np.sin(new_platform_theta_rad)*axis_y
+                + np.cos(new_platform_theta_rad)*axis_z
+            )
+
+            foam_yaw_offset_rad = np.arctan2(axis_x, rotated_axis_z)
+            new_platform_yaw_rad = target_yaw_rad - foam_yaw_offset_rad
+            new_platform_yaw_rad = (new_platform_yaw_rad + np.pi)%(2.0*np.pi) - np.pi
+
+            # The new angles change the foam-exit position, so repeat until the
+            # resulting correction becomes negligible.
+            yaw_change = (new_platform_yaw_rad - platform_yaw_rad + np.pi)%(2.0*np.pi) - np.pi
+            theta_change = new_platform_theta_rad - platform_theta_rad
+
+            platform_yaw_rad = new_platform_yaw_rad
+            platform_theta_rad = new_platform_theta_rad
+
+            if np.hypot(yaw_change, theta_change) < 1e-6:
+                break
+
+        # 4. Recalculate distance and flight time from the final foam-exit position.
+        R_joint = rotationPlatformFromPanTilt(platform_yaw_rad, platform_theta_rad)
+        foam_origin_platform = R_joint@foam_origin_forward
+        relative_position = position - foam_origin_platform
+
+        x, y, z = relative_position
 
         if z <= MIN_FORWARD_RANGE:
             return fail()
 
-        # print("made it to _object_position_to_servo_angles_and_flight_time B") # FOR DEBUG ONLY
-
-
-        # 1. Pan angle
-
-        platform_yaw_rad = np.arctan2(x, z)
-        platform_yaw_deg = np.rad2deg(platform_yaw_rad)
-
-        pan_angle = (
-            config.FORWARD_SERVO_ANGLES[config.SERVO_IDX["pan"]]
-            + config.SERVO_SIGNS[config.SERVO_IDX["pan"]] * platform_yaw_deg
-            + config.SERVO_BIASES[config.SERVO_IDX["pan"]]
-        )
-
-        # 2. Ballistic tilt angle
-        # Projectile equation:
-        # y = r tan(theta) - g r^2 / (2 v0^2 cos^2(theta))
-        # Let u = tan(theta):
-        # A u^2 - r u + (A + y) = 0
-        # where: A = g r^2 / (2 v0^2)
-
         r = np.hypot(x, z)
-        if r <= 1e-9: # sanity
+        if r <= 1e-9:
             return fail()
-        
-        v0 = float(DART_PROTRUSION_SPEED)
-        g = float(GRAVITY)
-        tan_theta = None
 
         A = g*r*r/(2.0*v0*v0)
-        
+
         if A <= 1e-12:
             tan_theta = y/r
         else:
             discriminant = r*r - 4.0*A*(A + y)
-            # Allow tiny numerical roundoff.
+
             if discriminant < -1e-9:
                 return fail()
-            discriminant = max(discriminant, 0.0)
-            sqrt_disc = np.sqrt(discriminant)
 
-            tan_theta_low = (r - sqrt_disc) / (2.0 * A)
-            tan_theta_high = (r + sqrt_disc) / (2.0 * A)
-
+            sqrt_disc = np.sqrt(max(discriminant, 0.0))
+            tan_theta_low = (r - sqrt_disc)/(2.0*A)
+            tan_theta_high = (r + sqrt_disc)/(2.0*A)
             tan_theta = tan_theta_high if USE_HIGH_ARC else tan_theta_low
 
-        platform_theta_rad = np.arctan(tan_theta)
-        platform_theta_deg = np.rad2deg(platform_theta_rad) 
+        foam_theta_rad = np.arctan(tan_theta)
+        cos_theta = np.cos(foam_theta_rad)
 
-        cos_theta = np.cos(platform_theta_rad)
         if cos_theta <= 1e-9:
             return fail()
-        
-        # print("made it to _object_position_to_servo_angles_and_flight_time C") # FOR DEBUG ONLY
 
-        
-        projectile_flight_time = r / (v0 * cos_theta)
-        if not np.isfinite(projectile_flight_time) or projectile_flight_time <= 0.0:
+        flight_time = r/(v0*cos_theta)
+        if not np.isfinite(flight_time) or flight_time <= 0.0:
             return fail()
-        
-        # print("made it to _object_position_to_servo_angles_and_flight_time D") # FOR DEBUG ONLY
 
+        # 5. Convert platform pan/tilt angles into servo commands.
+        platform_yaw_deg = np.rad2deg(platform_yaw_rad)
+        platform_theta_deg = np.rad2deg(platform_theta_rad)
+
+        pan_angle = (
+            config.FORWARD_SERVO_ANGLES[config.SERVO_IDX["pan"]]
+            + config.SERVO_SIGNS[config.SERVO_IDX["pan"]]*platform_yaw_deg
+        )
 
         tilt_angle = (
             config.FORWARD_SERVO_ANGLES[config.SERVO_IDX["tilt"]]
-            + config.SERVO_SIGNS[config.SERVO_IDX["tilt"]]  * platform_theta_deg
-            + config.SERVO_BIASES[config.SERVO_IDX["tilt"]]
-        ) 
-  
-        # 3. Build servo command
+            + config.SERVO_SIGNS[config.SERVO_IDX["tilt"]]*platform_theta_deg
+        )
 
         servo_angles = np.asarray(config.DEFAULT_SERVO_ANGLES, dtype=float).copy()
         servo_angles[config.SERVO_IDX["pan"]] = pan_angle
-        servo_angles[config.SERVO_IDX["tilt"]] = tilt_angle 
+        servo_angles[config.SERVO_IDX["tilt"]] = tilt_angle
 
         if not np.all(np.isfinite(servo_angles)):
             return fail()
 
-        # print("made it to _object_position_to_servo_angles_and_flight_time E") # FOR DEBUG ONLY
-
-
-        # 4. Limit check        
-
-        min_angles = np.asarray(config.MIN_SERVO_ANGLES, dtype=float).copy()
-        max_angles = np.asarray(config.MAX_SERVO_ANGLES, dtype=float).copy()
+        # 6. Reject solutions outside the usable servo range.
+        min_angles = np.asarray(config.MIN_SERVO_ANGLES, dtype=float)
+        max_angles = np.asarray(config.MAX_SERVO_ANGLES, dtype=float)
 
         outside_limits = (servo_angles < min_angles) | (servo_angles > max_angles)
         if np.any(outside_limits):
@@ -723,9 +796,7 @@ class Platform:
             # print(f"platform_theta_deg= {platform_theta_deg:.2f}") # FOR DEBUG ONLY
             return fail()
 
-
-        # print("made it to _object_position_to_servo_angles_and_flight_time F") # FOR DEBUG ONLY
-        return True, servo_angles, projectile_flight_time
+        return True, servo_angles, flight_time
 
 
     def _estimate_servo_rotation_time(self, q_from: np.ndarray, q_to: np.ndarray):

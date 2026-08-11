@@ -7,8 +7,7 @@ import cv2
 import src.primary.config as config
 
 
-IMAGE_DIRECTORY = Path("images/camera_calibration")
-
+IMAGE_DIRECTORY = Path(f"images/camera_calibration/{config.CAMERA_CALIBRATION_NAME}")
 WINDOW_NAME = "Camera calibration capture"
 DEFAULT_PHOTO_COUNT = 25
 DEFAULT_INTERVAL_S = 2.0

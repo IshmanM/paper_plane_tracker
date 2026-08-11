@@ -3,6 +3,7 @@ import numpy as np
 import os
 import threading
 from src.primary.camera_calibration import CameraCalibration
+from src.primary.camera_to_platform_calibration import CameraToPlatformCalibration
 from src.primary.tracking import TrackStatus, SingleObjectTracker, drawTrack
 from src.primary.detection import detectSingleObject, drawDetection
 from src.primary.object_vision_spec import ObjectVisionSpecId
@@ -11,6 +12,8 @@ from datetime import datetime
 import time
 from src.primary.comm_buffer import CommBuffer, cmd_thread_main
 from src.primary.platform import Platform
+from src.primary.platform_geometry_spec import PlatformGeometrySpecId
+
 
 from src.comm.link import UdpLink
 from src.comm.network_config import(
@@ -26,10 +29,14 @@ from src.comm.network_config import(
 if __name__ == "__main__": 
     object_vision_spec_id = ObjectVisionSpecId.TENNIS_BALL_DEFAULT
     # object_vision_spec_id = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
-
+    
+    platform_geometry_spec_id = PlatformGeometrySpecId.PLATFORM_1
+    
     camera_calibration = CameraCalibration(config.CAMERA_CALIBRATION_PATH, config.FRAME_W, config.FRAME_H)
     if (camera_calibration.image_width_px, camera_calibration.image_height_px) != (config.FRAME_W, config.FRAME_H):
         raise ValueError(f"Camera calibration resolution {camera_calibration.image_width_px}x{camera_calibration.image_height_px} does not match configured frame resolution {config.FRAME_W}x{config.FRAME_H}")
+
+    camera_to_platform_calibration = CameraToPlatformCalibration(config.CAMERA_TO_PLATFORM_CALIBRATION_PATH)
 
     cap = cv2.VideoCapture(config.CAMERA_INDEX, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, config.FRAME_W)
@@ -54,7 +61,7 @@ if __name__ == "__main__":
     )
 
     comm_buffer = CommBuffer()
-    platform = Platform(comm_buffer=comm_buffer)
+    platform = Platform(comm_buffer=comm_buffer, platform_geometry_spec_id=platform_geometry_spec_id, camera_to_platform_calibration=camera_to_platform_calibration)
 
     link = UdpLink(
         local_ip=PRIMARY_IP,

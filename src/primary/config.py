@@ -33,6 +33,8 @@ FPS = 60
 CAMERA_CALIBRATION_NAME = "asus_laptop_webcam"
 CAMERA_CALIBRATION_PATH = Path(f"src/primary/calibration_data/camera/{CAMERA_CALIBRATION_NAME}_results.json")
 
+CAMERA_TO_PLATFORM_CALIBRATION_PATH = Path("src/primary/calibration_data/camera_to_platform/results.json")
+
 CAMERA_INDEX = 0
 CAMERA_AUTO_EXPOSURE = False
 CAMERA_EXPOSURE = -4.5 #originally -6.0
@@ -75,12 +77,12 @@ MAX_SERVO_SPEEDS = np.zeros(NUM_SERVOS, dtype=float)
 MAX_SERVO_SPEEDS[SERVO_IDX["pan"]] = 120.0 # degrees/s
 MAX_SERVO_SPEEDS[SERVO_IDX["tilt"]] = 90.0 # degrees/s
 
-# Calibration biases after testing. <--Todo: maybe remove. this might be duplicate of the trim offset oon the endpoint side.
-SERVO_BIASES = np.zeros(NUM_SERVOS, dtype=float)
-SERVO_BIASES[SERVO_IDX["pan"]] = 0.0 # degrees
-SERVO_BIASES[SERVO_IDX["tilt"]] = 0.0 # degrees
+# # Calibration biases after testing. <--Todo: maybe remove. this might be duplicate of the trim offset oon the endpoint side.
+# SERVO_BIASES = np.zeros(NUM_SERVOS, dtype=float)
+# SERVO_BIASES[SERVO_IDX["pan"]] = 0.0 # degrees
+# SERVO_BIASES[SERVO_IDX["tilt"]] = 0.0 # degrees
 
-# Sign depends on your physical servo mounting.
+# Sign depends on physical servo mounting.
 SERVO_SIGNS = np.zeros(NUM_SERVOS, dtype=float)
 SERVO_SIGNS[SERVO_IDX["pan"]] = -1.0 # If aiming right makes the servo move left, flip to -1.0.
 SERVO_SIGNS[SERVO_IDX["tilt"]] = -1.0 # If aiming up makes the servo move down, flip to -1.0.
