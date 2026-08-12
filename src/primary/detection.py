@@ -302,7 +302,28 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         x1, y1 = max(0, x - padding), max(0, y - padding)
         x2, y2 = min(frame.shape[1], x + w + padding), min(frame.shape[0], y + h + padding)
 
-        gray_roi = cv2.GaussianBlur(gray_frame[y1:y2, x1:x2], (5, 5), 0)
+        gray_roi = gray_frame[y1:y2, x1:x2]
+
+        # A malformed/noisy candidate should never crash the entire live detector.
+        if gray_roi.size == 0 or gray_roi.shape[0] < 2 or gray_roi.shape[1] < 2:
+            if debug is not None:
+                failure_frame = frame.copy()
+                cv2.putText(failure_frame, f"REJECTED: invalid ROI {gray_roi.shape}", (10, 25),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+                debug.addStage(f"Candidate {candidate_index} rejected - invalid ROI", failure_frame)
+            continue
+
+        # Make the ROI contiguous before passing it into OpenCV's native code.
+        gray_roi = np.ascontiguousarray(gray_roi)
+
+        if gray_roi.size == 0 or gray_roi.shape[0] < 2 or gray_roi.shape[1] < 2:
+            print(
+                f"Invalid sphere ROI: shape={gray_roi.shape}, "
+                f"bbox=({x},{y},{w},{h}), roi=({x1},{y1},{x2},{y2}), frame={gray_frame.shape}"
+            )
+            continue
+
+        gray_roi = cv2.GaussianBlur(np.ascontiguousarray(gray_roi), (5, 5), 0)
         edges = cv2.Canny(gray_roi, 50, 150)
 
         seed_roi = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
