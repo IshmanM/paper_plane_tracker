@@ -22,9 +22,13 @@ class ColorSpec:
 COLOR_SPECS = {
     ColorId.TENNIS_GREEN: ColorSpec(
         hsv_ranges=[
-            (
-                np.array([27, 35, 80], dtype=np.uint8),
-                np.array([38, 255, 255], dtype=np.uint8),
+            # (
+            #     np.array([27, 35, 80], dtype=np.uint8),
+            #     np.array([38, 255, 255], dtype=np.uint8),
+            # ),
+             (
+                np.array([25, 5, 80], dtype=np.uint8),
+                np.array([40, 255, 255], dtype=np.uint8),
             ),
         ],
         draw_bgr=(0, 255, 0),

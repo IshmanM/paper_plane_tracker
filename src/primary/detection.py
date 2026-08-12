@@ -65,6 +65,8 @@ def detectSingleObject(frame: np.ndarray, object_vision_spec_id: ObjectVisionSpe
 
     if object_vision_spec.object_type == ObjectType.TENNIS_BALL:
         return detectTennisBall(frame, object_vision_spec, camera_calibration)
+    elif object_vision_spec.object_type == ObjectType.ARUCO_MARKER:
+        return detectArucoMarker(frame, object_vision_spec, camera_calibration)
     elif object_vision_spec.object_type == ObjectType.PAPER_PLANE_SHAPES:
         return detectPaperPlaneShapes(frame, object_vision_spec, camera_calibration)
 
@@ -82,6 +84,59 @@ def detectTennisBall(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, ca
     return True, detection, measurement
 
 
+def detectArucoMarker(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration) -> tuple[bool, Detection, Measurement]:
+    aruco_spec = object_vision_spec.aruco_marker
+
+    dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, aruco_spec.dictionary_name))
+    parameters = cv2.aruco.DetectorParameters()
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+
+    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+
+    corners, ids, rejected = detector.detectMarkers(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY))
+
+    if ids is None:
+        return failedDetectionResult()
+
+    ids = ids.flatten()
+    matching_indices = np.where(ids == aruco_spec.marker_id)[0]
+
+    if len(matching_indices) == 0:
+        return failedDetectionResult()
+
+    marker_corners = np.asarray(corners[matching_indices[0]], dtype=np.float64).reshape(4, 2)
+    # top_left, top_right, bottom_right, bottom_left = marker_corners
+
+    min_u, max_u = np.min(marker_corners[:, 0]), np.max(marker_corners[:, 0])
+    min_v, max_v = np.min(marker_corners[:, 1]), np.max(marker_corners[:, 1])
+    detection = Detection(u=(max_u + min_u)/2.0, v=(max_v + min_v)/2.0, px_w=max_u - min_u, px_h=max_v - min_v,)
+
+    half_side = aruco_spec.marker_length_m/2.0
+
+    object_points = np.array([
+        [-half_side,  half_side, 0.0],  # top-left
+        [ half_side,  half_side, 0.0],  # top-right
+        [ half_side, -half_side, 0.0],  # bottom-right
+        [-half_side, -half_side, 0.0],  # bottom-left
+    ], dtype=np.float64)
+
+    success, rot_vector, trans_vector = cv2.solvePnP(
+        objectPoints=object_points,
+        imagePoints=marker_corners,
+        cameraMatrix=camera_calibration.camera_matrix,
+        distCoeffs=camera_calibration.distortion_coefficients,
+        flags=cv2.SOLVEPNP_IPPE_SQUARE,
+    )
+
+    if not success:
+        return failedDetectionResult(detection)
+
+    trans_vector = trans_vector.reshape(3)
+    measurement = Measurement(x=float(trans_vector[0]), y=float(trans_vector[1]), z=float(trans_vector[2]),)
+
+    return True, detection, measurement
+
+
 def detectPaperPlaneShapes(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration) -> tuple[bool, Detection, Measurement]:
     detection = findSingleObjectUsingBestShapeGroup(frame, object_vision_spec,)
 
@@ -91,13 +146,14 @@ def detectPaperPlaneShapes(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     measurement = createMeasurementUsingShapeGroup(detection, object_vision_spec, camera_calibration)
 
     if measurement.x is None:
-        return False, detection, measurement
+        return failedDetectionResult(detection)
 
     return True, detection, measurement
 
 
-def failedDetectionResult() -> tuple[bool, Detection, Measurement]:
-    detection = Detection(None, None, None, None, [],)
+def failedDetectionResult(detection: Detection | None = None) -> tuple[bool, Detection, Measurement]:
+    if detection is None:
+        detection = Detection(None, None, None, None, [],)
     measurement = Measurement(None, None, None, None, None, None,)
     return False, detection, measurement
 

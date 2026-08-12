@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import cv2
 
 from src.primary.color import ColorId
 
@@ -14,12 +15,15 @@ OBJECT_VISION_MODEL_FORMAT_VERSION = 1
 class ObjectType(Enum):
     TENNIS_BALL = auto()
     PAPER_PLANE_SHAPES = auto()
+    ARUCO_MARKER = auto()
 
 
 class ObjectVisionSpecId(Enum):
     # ObjectType selects the detection algorithm; ObjectVisionSpecId selects one concrete model/configuration.
     TENNIS_BALL_DEFAULT = auto()
+    ARUCO_MARKER_1 = auto()
     PAPER_PLANE_SHAPES_1 = auto()
+    
 
 
 class ShapeMarkerSpec:
@@ -91,27 +95,68 @@ class RigidPlaneSpec:
         self.shape_markers = shape_markers if shape_markers is not None else []
 
 
+class ArucoMarkerSpec:
+    def __init__(self, marker_id: int, marker_length_m: float, dictionary_name: str):
+        """
+        Defines one physical ArUco marker.
+
+        marker_length_m is the physical side length of the marker's outer square.
+        The marker center should be treated as the detected object's position, which
+        is convenient when the calibration laser is aimed at the marker center.
+
+        dictionary_name should match an OpenCV predefined dictionary name, e.g.:
+            "DICT_4X4_50"
+            "DICT_5X5_100"
+            "DICT_6X6_250"
+        """
+        if not isinstance(dictionary_name, str) or not dictionary_name:
+            raise ValueError("dictionary_name must be a non-empty string")
+        if not hasattr(cv2.aruco, dictionary_name):
+            raise ValueError(f"Unknown OpenCV ArUco dictionary: {dictionary_name}")
+
+        dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dictionary_name))
+
+        if marker_id < 0 or marker_id >= len(dictionary.bytesList):
+            raise ValueError(
+                f"marker_id must be in [0, {len(dictionary.bytesList) - 1}] "
+                f"for {dictionary_name}"
+            )
+        if not np.isfinite(marker_length_m) or marker_length_m <= 0.0:
+            raise ValueError("marker_length_m must be finite and > 0")
+
+        self.marker_id = int(marker_id)
+        self.marker_length_m = float(marker_length_m)
+        self.dictionary_name = dictionary_name
+
+
 class ObjectVisionSpec:
     def __init__(
         self,
         object_type: ObjectType,
-        color_ids: list[ColorId],
-        minimum_contour_area_px: float,
+        color_ids: list[ColorId] | None = None,
+        minimum_contour_area_px: float | None = None,
         polygon_epsilon_ratio: float = 0.03,
         shape_group_distance_factor: float = 3.0,
         rigid_planes: list[RigidPlaneSpec] | None = None,
+        aruco_marker: ArucoMarkerSpec | None = None,
         width=None, height=None, length=None,
     ):
         self.object_type = object_type
-        self.color_ids = color_ids
+        self.color_ids = color_ids if color_ids is not None else []
         self.minimum_contour_area_px = minimum_contour_area_px
         self.polygon_epsilon_ratio = polygon_epsilon_ratio
         self.shape_group_distance_factor = shape_group_distance_factor
         self.rigid_planes = rigid_planes if rigid_planes is not None else []
+        self.aruco_marker = aruco_marker
 
         self.width = width # m
         self.height = height # m
         self.length = length # m
+
+        if object_type == ObjectType.ARUCO_MARKER and aruco_marker is None:
+            raise ValueError("ARUCO_MARKER requires aruco_marker")
+        if object_type != ObjectType.ARUCO_MARKER and aruco_marker is not None:
+            raise ValueError("aruco_marker is only valid for ARUCO_MARKER")
 
     @property
     def shape_markers(self) -> list[ShapeMarkerSpec]:
@@ -130,6 +175,15 @@ def objectVisionSpecToDict(object_vision_spec: ObjectVisionSpec) -> dict:
         "width": object_vision_spec.width,
         "height": object_vision_spec.height,
         "length": object_vision_spec.length,
+        "aruco_marker": (
+            None
+            if object_vision_spec.aruco_marker is None
+            else {
+                "marker_id": object_vision_spec.aruco_marker.marker_id,
+                "marker_length_m": object_vision_spec.aruco_marker.marker_length_m,
+                "dictionary_name": object_vision_spec.aruco_marker.dictionary_name,
+            }
+        ),
         "rigid_planes": [
             {
                 "rotation_object_from_plane": rigid_plane.rotation_object_from_plane.tolist(),
@@ -171,14 +225,30 @@ def objectVisionSpecFromDict(data: dict) -> ObjectVisionSpec:
             shape_markers=shape_markers,
         ))
 
+    aruco_data = data.get("aruco_marker")
+    aruco_marker = (
+        None
+        if aruco_data is None
+        else ArucoMarkerSpec(
+            marker_id=int(aruco_data["marker_id"]),
+            marker_length_m=float(aruco_data["marker_length_m"]),
+            dictionary_name=aruco_data["dictionary_name"],
+        )
+    )
+
+    minimum_contour_area_px = data.get("minimum_contour_area_px")
+
     return ObjectVisionSpec(
         object_type=ObjectType[data["object_type"]],
         color_ids=[ColorId[color_name] for color_name in data.get("color_ids", [])],
-        minimum_contour_area_px=float(data["minimum_contour_area_px"]),
+        minimum_contour_area_px=None if minimum_contour_area_px is None else float(minimum_contour_area_px),
         polygon_epsilon_ratio=float(data.get("polygon_epsilon_ratio", 0.03)),
         shape_group_distance_factor=float(data.get("shape_group_distance_factor", 3.0)),
         rigid_planes=rigid_planes,
-        width=data.get("width"), height=data.get("height"), length=data.get("length"),
+        aruco_marker=aruco_marker,
+        width=data.get("width"),
+        height=data.get("height"),
+        length=data.get("length"),
     )
 
 
@@ -199,8 +269,17 @@ OBJECT_VISION_SPECS = {
     ObjectVisionSpecId.TENNIS_BALL_DEFAULT: ObjectVisionSpec(
         object_type=ObjectType.TENNIS_BALL,
         color_ids=[ColorId.TENNIS_GREEN],
-        minimum_contour_area_px=100.0,
+        minimum_contour_area_px=75.0,
         width=0.0635, height=0.0635, length=0.0635,
+    ),
+
+    ObjectVisionSpecId.ARUCO_MARKER_1: ObjectVisionSpec(
+        object_type=ObjectType.ARUCO_MARKER,
+        aruco_marker=ArucoMarkerSpec(
+            marker_id=0,
+            marker_length_m=0.10, # TODO: replace with exact printed marker side length
+            dictionary_name="DICT_4X4_50",
+        ),
     ),
 
     ObjectVisionSpecId.PAPER_PLANE_SHAPES_1: ObjectVisionSpec(
