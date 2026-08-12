@@ -121,10 +121,31 @@ def main() -> None:
     print(f"Camera: {actual_width}x{actual_height} at reported {actual_fps:.1f} FPS")
     print(f"ObjectVisionSpecId: {object_vision_spec_id.name}")
     print(f"ObjectType: {object_vision_spec.object_type.name}")
-    print("Green dot = detection center. Press Q or Esc to quit.")
+    print("Green dot = detection center.")
+    print("P = pause/resume; Q or Esc = quit.")
+
+    paused = False
+    last_display_frame = None
 
     try:
         while True:
+            # While paused, keep showing the last processed frame without reading
+            # the camera or running detection.
+            if paused:
+                paused_frame = last_display_frame.copy()
+                cv2.putText(paused_frame, "PAUSED", (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+                cv2.imshow(WINDOW_NAME, paused_frame)
+
+                key = cv2.waitKey(30) & 0xFF
+
+                if key in (ord("q"), 27):
+                    break
+                elif key == ord("p"):
+                    paused = False
+                    previous_loop_start_s = None
+
+                continue
+
             loop_start_s = time.perf_counter()
 
             if previous_loop_start_s is not None:
@@ -185,16 +206,18 @@ def main() -> None:
                 (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2, cv2.LINE_AA,
             )
 
+            last_display_frame = frame.copy()
             cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(1) & 0xFF
 
             if key in (ord("q"), 27):
                 break
+            elif key == ord("p"):
+                paused = True
 
     finally:
         camera.release()
         cv2.destroyAllWindows()
-
 
 if __name__ == "__main__":
     main()
