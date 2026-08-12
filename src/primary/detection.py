@@ -441,16 +441,16 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
                 debug.addStage(f"Candidate {candidate_index} rejected - angular coverage", failure_frame)
             continue
 
-        # Step 11: Require consistency with the original HSV candidate.
-        seed_radius = seed_size/2.0
+        
+        # Step 11: Require the refined circle to remain reasonably consistent
+        # with the rough size and center estimated from the HSV candidate.
+        seed_radius = np.sqrt(seed_area/np.pi)
         center_displacement = np.hypot(circle_u - center_u, circle_v - center_v)
 
         if radius < 0.70*seed_radius or radius > 1.40*seed_radius:
             if debug is not None:
                 failure_frame = frame.copy()
-
                 cv2.circle(failure_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 0, 255), 2)
-                cv2.circle(failure_frame, (int(round(center_u)), int(round(center_v))), int(round(seed_radius)), (0, 255, 255), 1)
 
                 cv2.putText(failure_frame, f"REJECTED: radius {radius:.1f}px", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
@@ -485,19 +485,54 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
             continue
 
-        # Step 12: Score candidates that passed the complete refinement process.
+        # Step 12: Score candidates that passed every geometric validation check.
         final_point_radii = np.hypot(inlier_points[:, 0] - circle_u, inlier_points[:, 1] - circle_v)
         mean_residual = np.mean(np.abs(final_point_radii - radius))
+
         coverage_score = covered_angle_bins/NUM_ANGLE_BINS
         support_score = len(inlier_points)/NUM_RAYS
         residual_score = 1.0/(1.0 + mean_residual/max(radius, 1.0))
         hsv_fill_ratio = min(1.0, seed_area/(np.pi*radius*radius))
 
-        final_score = 0.40*coverage_score + 0.30*support_score + 0.20*residual_score + 0.10*hsv_fill_ratio
+        final_score = (
+            0.40*coverage_score +
+            0.30*support_score +
+            0.20*residual_score +
+            0.10*hsv_fill_ratio
+        )
+
+        # Reaching this point means the candidate passed every rejection gate.
+        if debug is not None:
+            passed_frame = frame.copy()
+
+            for point_u, point_v in inlier_points:
+                cv2.circle(passed_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
+
+            cv2.circle(
+                passed_frame,
+                (int(round(circle_u)), int(round(circle_v))),
+                int(round(radius)),
+                (0, 255, 0), 2,
+            )
+
+            cv2.putText(passed_frame, f"PASSED candidate {candidate_index}", (10, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(passed_frame, f"score: {final_score:.3f}", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+            cv2.putText(
+                passed_frame,
+                f"boundary={len(boundary_points)} | inliers={len(inlier_points)} | coverage={covered_angle_bins}/{NUM_ANGLE_BINS}",
+                (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2, cv2.LINE_AA,
+            )
+
+            debug.addStage(f"Candidate {candidate_index} passed", passed_frame)
 
         if final_score > best_final_score:
             best_final_score = final_score
-            best_result = (float(circle_u), float(circle_v), float(radius), inlier_points, covered_angle_bins, float(final_score))
+            best_result = (
+                float(circle_u), float(circle_v), float(radius),
+                inlier_points, covered_angle_bins, float(final_score),
+            )
 
     if best_result is None:
         return None

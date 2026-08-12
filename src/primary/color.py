@@ -19,6 +19,7 @@ class ColorSpec:
         self.draw_bgr = draw_bgr
 
 
+# keep the SRICT spec here, margins will be added by detection functions for looser spec
 COLOR_SPECS = {
     ColorId.TENNIS_GREEN: ColorSpec(
         hsv_ranges=[
@@ -26,8 +27,9 @@ COLOR_SPECS = {
             #     np.array([27, 35, 80], dtype=np.uint8),
             #     np.array([38, 255, 255], dtype=np.uint8),
             # ),
-             (
-                np.array([25, 25, 80], dtype=np.uint8),
+              
+            (
+                np.array([25, 30, 80], dtype=np.uint8),
                 np.array([40, 255, 255], dtype=np.uint8),
             ),
         ],
