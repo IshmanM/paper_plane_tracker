@@ -83,6 +83,7 @@ def detectSingleObject(frame: np.ndarray, object_vision_spec_id: ObjectVisionSpe
 
 def detectTennisBall(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration) -> tuple[bool, Detection, Measurement]:
     detection = findSingleObjectSphere(frame, object_vision_spec,)
+    # detection = findSingleObjectUsingLargestColorBlob(frame, object_vision_spec,)
 
     if detection is None:
         return failedDetectionResult()
@@ -179,13 +180,17 @@ def drawDetection(frame: np.ndarray, detection: Detection,) -> None:
     cv2.circle(frame, (int(round(detection.u)), int(round(detection.v))), radius=5, color=(0, 255, 0), thickness=-1,)
 
     for shape in detection.shapes:
-        vertices_px = shape.vertices_px.astype(np.int32)
         color_spec = COLOR_SPECS[shape.color_id]
-        cv2.polylines(frame, [vertices_px.reshape(-1, 1, 2)], isClosed=True, color=color_spec.draw_bgr, thickness=1,)
+
+        if shape.ellipse_px is not None:
+            cv2.ellipse(frame, shape.ellipse_px, color_spec.draw_bgr, 2, cv2.LINE_AA)
+            continue
+
+        vertices_px = shape.vertices_px.astype(np.int32)
+        cv2.polylines(frame, [vertices_px.reshape(-1, 1, 2)], isClosed=True, color=color_spec.draw_bgr, thickness=1)
 
         for vertex_u, vertex_v in vertices_px:
-            cv2.circle(frame, (int(vertex_u), int(vertex_v)), radius=4, color=color_spec.draw_bgr, thickness=-1,)
-
+            cv2.circle(frame, (int(vertex_u), int(vertex_v)), radius=4, color=color_spec.draw_bgr, thickness=-1)
 
 def drawModelOrigin(frame: np.ndarray, measurement: Measurement, camera_calibration: CameraCalibration) -> None:
     if measurement.x is None or measurement.y is None or measurement.z is None or measurement.z <= 0.0:
@@ -202,44 +207,239 @@ def drawModelOrigin(frame: np.ndarray, measurement: Measurement, camera_calibrat
     cv2.putText(frame, "model origin", (int(origin_u) + 8, int(origin_v) - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
-
-
-
 def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, debug: DetectionDebug | None = None) -> Detection | None:
+    if not object_vision_spec.color_ids:
+        raise ValueError("Sphere detection requires at least one color_id")
+    if object_vision_spec.minimum_contour_area_px is None:
+        raise ValueError("Sphere detection requires minimum_contour_area_px")
 
-    #
-    #
-    #
-    raise NotImplementedError
+    # Step 1: Build an HSV mask for the sphere's configured colors.
+    # HSV is only used to obtain a rough sphere location; the final boundary
+    # will be refined later using grayscale image edges.
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+
+    for color_id in object_vision_spec.color_ids:
+        color_spec = COLOR_SPECS[color_id]
+        for lower_hsv, upper_hsv in color_spec.hsv_ranges:
+            mask = cv2.bitwise_or(mask, cv2.inRange(hsv_frame, lower_hsv, upper_hsv))
+
+    if debug is not None:
+        debug.stages.clear()
+        debug.addStage("Original", frame)
+        debug.addStage("HSV seed mask", mask)
+
+    # Step 2: Find sufficiently large HSV blobs and select the largest one as
+    # the rough sphere candidate.
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours = [contour for contour in contours if cv2.contourArea(contour) >= object_vision_spec.minimum_contour_area_px]
+
+    if not contours:
+        return None
+
+    seed_contour = max(contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(seed_contour)
+    moments = cv2.moments(seed_contour)
+
+    if moments["m00"] == 0:
+        return None
+
+    # Step 3: Estimate the rough sphere center and size from the HSV blob.
+    center_u = moments["m10"]/moments["m00"]
+    center_v = moments["m01"]/moments["m00"]
+    seed_size = max(w, h)
+
+    # Step 4: Create a tight ROI around the HSV candidate.
+    # Restricting subsequent edge processing to this region reduces computation
+    # and prevents distant background edges from influencing the sphere boundary.
+    padding = max(8, int(0.35*seed_size))
+    x1, y1 = max(0, x - padding), max(0, y - padding)
+    x2, y2 = min(frame.shape[1], x + w + padding), min(frame.shape[0], y + h + padding)
+
+    seed_mask = np.zeros(mask.shape, dtype=np.uint8)
+    cv2.drawContours(seed_mask, [seed_contour], -1, 255, -1)
+
+    if debug is not None:
+        roi_frame = frame.copy()
+        cv2.drawContours(roi_frame, [seed_contour], -1, (0, 255, 255), 1)
+        cv2.rectangle(roi_frame, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
+        debug.addStage("HSV seed + ROI", roi_frame)
+
+    # Step 5: Detect grayscale edges inside the ROI.
+    # These edges provide image information independent of HSV and can therefore
+    # recover sphere boundary regions that were poorly segmented by color.
+    gray_roi = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+    gray_roi = cv2.GaussianBlur(gray_roi, (5, 5), 0)
+    edges = cv2.Canny(gray_roi, 50, 150)
+    seed_roi = seed_mask[y1:y2, x1:x2]
+
+    if debug is not None:
+        debug.addStage("Canny ROI", edges)
+
+    # Step 6: Generate radial sample locations around the rough sphere center.
+    # All rays and radii are evaluated as NumPy arrays instead of Python loops,
+    # which keeps this stage fast enough for live detection.
+    center_roi_u, center_roi_v = center_u - x1, center_v - y1
+    num_rays = 120
+    max_radius = max(1, int(seed_size))
+
+    angles = np.linspace(0.0, 2.0*np.pi, num_rays, endpoint=False)
+    radii = np.arange(1, max_radius + 1)
+    radius_grid = np.broadcast_to(radii, (num_rays, len(radii)))
+
+    sample_u = np.rint(center_roi_u + np.cos(angles)[:, None]*radii).astype(np.int32)
+    sample_v = np.rint(center_roi_v + np.sin(angles)[:, None]*radii).astype(np.int32)
+
+    valid = (
+        (sample_u >= 0) & (sample_u < seed_roi.shape[1]) &
+        (sample_v >= 0) & (sample_v < seed_roi.shape[0])
+    )
+
+    # Clip coordinates only for safe array indexing. The valid mask still ensures
+    # that samples outside the ROI cannot participate in boundary selection.
+    safe_u = np.clip(sample_u, 0, seed_roi.shape[1] - 1)
+    safe_v = np.clip(sample_v, 0, seed_roi.shape[0] - 1)
+
+    # Step 7: Find where the HSV seed ends along every radial direction.
+    # This gives an expected sphere-boundary radius for each ray.
+    seed_hits = (seed_roi[safe_v, safe_u] != 0) & valid
+    seed_hit_radii = np.where(seed_hits, radius_grid, 0)
+    expected_radii = seed_hit_radii.max(axis=1)
+
+    # Step 8: Search for a grayscale edge only near each HSV-estimated boundary.
+    # This refines the HSV boundary while preventing a ray from continuing far
+    # enough to select unrelated edges such as fingers or background objects.
+    search_before = 3
+    search_after = np.maximum(5, (0.20*expected_radii).astype(np.int32))
+
+    edge_hits = (edges[safe_v, safe_u] != 0) & valid
+    search_band = (
+        (radius_grid >= (expected_radii - search_before)[:, None]) &
+        (radius_grid <= (expected_radii + search_after)[:, None]) &
+        (expected_radii[:, None] > 0)
+    )
+
+    candidate_edges = edge_hits & search_band
+    rays_with_edge = candidate_edges.any(axis=1)
+    first_edge_indices = np.argmax(candidate_edges, axis=1)
+
+    ray_indices = np.flatnonzero(rays_with_edge)
+    edge_indices = first_edge_indices[rays_with_edge]
+
+    boundary_points = np.column_stack((
+        sample_u[ray_indices, edge_indices] + x1,
+        sample_v[ray_indices, edge_indices] + y1,
+    )).astype(np.float64)
+
+    if len(boundary_points) < 20:
+        return None
+
+    # Step 9: Fit a circle to the recovered boundary points.
+    # A sphere projects approximately as a circle, so the fit is constrained to
+    # one radius rather than allowing an arbitrary ellipse.
+    A = np.column_stack((2*boundary_points[:, 0], 2*boundary_points[:, 1], np.ones(len(boundary_points))))
+    b = boundary_points[:, 0]**2 + boundary_points[:, 1]**2
+    circle_u, circle_v, c = np.linalg.lstsq(A, b, rcond=None)[0]
+    radius = np.sqrt(max(0.0, c + circle_u**2 + circle_v**2))
+
+    if radius <= 0.0:
+        return None
+
+    # Step 10: Remove boundary points that disagree strongly with the first fit.
+    # This rejects occasional unrelated edges that happened to fall inside the
+    # permitted search band.
+    point_radii = np.hypot(boundary_points[:, 0] - circle_u, boundary_points[:, 1] - circle_v)
+    residuals = np.abs(point_radii - radius)
+    residual_limit = max(2.0, 2.5*np.median(residuals))
+    inlier_points = boundary_points[residuals <= residual_limit]
+
+    if len(inlier_points) < 20:
+        return None
+
+    # Refit the circle using only the accepted boundary points.
+    A = np.column_stack((2*inlier_points[:, 0], 2*inlier_points[:, 1], np.ones(len(inlier_points))))
+    b = inlier_points[:, 0]**2 + inlier_points[:, 1]**2
+    circle_u, circle_v, c = np.linalg.lstsq(A, b, rcond=None)[0]
+    radius = np.sqrt(max(0.0, c + circle_u**2 + circle_v**2))
+
+    # Step 11: Verify that the refined circle remains reasonably close in size
+    # to the original HSV candidate.
+    seed_radius = seed_size/2.0
+
+    if radius < 0.70*seed_radius or radius > 1.40*seed_radius:
+        return None
+
+    diameter = 2.0*radius
+
+    # Step 12: Store the circle using ShapeDetection's ellipse representation.
+    # Equal ellipse diameters represent a circle.
+    ellipse_px = (
+        (float(circle_u), float(circle_v)),
+        (float(diameter), float(diameter)),
+        0.0,
+    )
+
+    shape = ShapeDetection(
+        vertices_px=None,
+        color_id=object_vision_spec.color_ids[0],
+        num_sides=0,
+        ellipse_px=ellipse_px,
+    )
+
+    # Step 13: Build the final Detection from the refined circle rather than the
+    # original HSV blob.
+    detection = Detection(
+        u=float(circle_u), v=float(circle_v),
+        px_w=float(diameter), px_h=float(diameter),
+        shapes=[shape],
+    )
+
+    if debug is not None:
+        boundary_frame = frame.copy()
+
+        for point_u, point_v in boundary_points:
+            cv2.circle(boundary_frame, (int(round(point_u)), int(round(point_v))), 2, (100, 100, 100), -1)
+
+        for point_u, point_v in inlier_points:
+            cv2.circle(boundary_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
+
+        debug.addStage("Boundary points", boundary_frame)
+
+        circle_frame = frame.copy()
+        cv2.circle(circle_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 2)
+        cv2.circle(circle_frame, (int(round(circle_u)), int(round(circle_v))), 3, (0, 255, 0), -1)
+        debug.addStage("Fitted circle", circle_frame)
+
+    return detection
 
 
-# # Tennis-ball path: threshold configured colors, clean the mask, and use the largest valid blob.
-# def findSingleObjectUsingLargestColorBlob(frame: np.ndarray, object_vision_spec: ObjectVisionSpec) -> Detection | None:
-#     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-#     combined_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8,)
+# Tennis-ball path: threshold configured colors, clean the mask, and use the largest valid blob.
+def findSingleObjectUsingLargestColorBlob(frame: np.ndarray, object_vision_spec: ObjectVisionSpec) -> Detection | None:
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    combined_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8,)
 
-#     for color_id in object_vision_spec.color_ids:
-#         color_spec = COLOR_SPECS[color_id]
-#         for lower_hsv, upper_hsv in color_spec.hsv_ranges:
-#             color_mask = cv2.inRange(hsv_frame, lower_hsv, upper_hsv,)
-#             combined_mask = cv2.bitwise_or(combined_mask, color_mask,)
+    for color_id in object_vision_spec.color_ids:
+        color_spec = COLOR_SPECS[color_id]
+        for lower_hsv, upper_hsv in color_spec.hsv_ranges:
+            color_mask = cv2.inRange(hsv_frame, lower_hsv, upper_hsv,)
+            combined_mask = cv2.bitwise_or(combined_mask, color_mask,)
 
-#     combined_mask = cv2.medianBlur(combined_mask, 5)
-#     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-#     combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
-#     combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+    combined_mask = cv2.medianBlur(combined_mask, 5)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
 
-#     contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-#     if not contours:
-#         return None
+    if not contours:
+        return None
 
-#     largest_contour = max(contours, key=cv2.contourArea)
-#     if cv2.contourArea(largest_contour) < object_vision_spec.minimum_contour_area_px:
-#         return None
+    largest_contour = max(contours, key=cv2.contourArea)
+    if cv2.contourArea(largest_contour) < object_vision_spec.minimum_contour_area_px:
+        return None
 
-#     u, v, px_w, px_h = cv2.boundingRect(largest_contour)
-#     return Detection(u + px_w/2.0, v + px_h/2.0, px_w, px_h,)
+    u, v, px_w, px_h = cv2.boundingRect(largest_contour)
+    return Detection(u + px_w/2.0, v + px_h/2.0, px_w, px_h,)
 
 
 # Refine an accepted polygon by fitting its straight edges and intersecting neighboring lines.
