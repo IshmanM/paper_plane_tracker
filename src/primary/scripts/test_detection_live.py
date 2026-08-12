@@ -1,6 +1,7 @@
 import argparse
 import time
 from collections import deque
+from pathlib import Path
 
 import cv2
 
@@ -11,9 +12,11 @@ from src.primary.detection import detectSingleObject, drawDetection, drawModelOr
 
 
 WINDOW_NAME = "Live detection test"
+
 DEFAULT_CAMERA_INDEX = config.CAMERA_INDEX
 DEFAULT_CAMERA_FPS = config.FPS
 DEFAULT_TIMING_WINDOW_FRAMES = 120
+DEFAULT_REFERENCE_DIRECTORY = Path("images/primary_detection_references")
 
 
 def chooseObjectVisionSpecId() -> ObjectVisionSpecId:
@@ -43,6 +46,16 @@ def chooseObjectVisionSpecId() -> ObjectVisionSpecId:
         print("Enter one of the listed numbers or ObjectVisionSpecId names.")
 
 
+def saveReferenceFrame(frame, reference_directory: Path) -> None:
+    reference_directory.mkdir(parents=True, exist_ok=True)
+    output_path = reference_directory/"reference_1.png"
+
+    if not cv2.imwrite(str(output_path), frame):
+        raise RuntimeError(f"Could not save reference image: {output_path}")
+
+    print(f"Saved unprocessed reference frame: {output_path.resolve()}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run live object detection and measure its speed.")
     parser.add_argument("--camera", type=int, default=DEFAULT_CAMERA_INDEX,
@@ -53,6 +66,8 @@ def main() -> None:
                         help=f"Frames used for rolling timing averages. Default: {DEFAULT_TIMING_WINDOW_FRAMES}")
     parser.add_argument("--spec", choices=[spec_id.name for spec_id in OBJECT_VISION_SPECS],
                         help="Registered ObjectVisionSpecId. If omitted, you will be required to select one.")
+    parser.add_argument("--reference-dir", type=Path, default=DEFAULT_REFERENCE_DIRECTORY,
+                        help=f"Base reference-image directory. Default: {DEFAULT_REFERENCE_DIRECTORY}")
     args = parser.parse_args()
 
     if args.camera_fps < 1:
@@ -62,6 +77,7 @@ def main() -> None:
 
     object_vision_spec_id = ObjectVisionSpecId[args.spec] if args.spec is not None else chooseObjectVisionSpecId()
     object_vision_spec = OBJECT_VISION_SPECS[object_vision_spec_id]
+    reference_directory = args.reference_dir/object_vision_spec_id.name.lower()
 
     camera_calibration = CameraCalibration(config.CAMERA_CALIBRATION_PATH, config.FRAME_W, config.FRAME_H)
 
@@ -118,19 +134,20 @@ def main() -> None:
     loop_periods_s = deque(maxlen=args.timing_window)
     previous_loop_start_s = None
 
+    paused = False
+    last_display_frame = None
+    last_raw_frame = None
+
     print(f"Camera: {actual_width}x{actual_height} at reported {actual_fps:.1f} FPS")
     print(f"ObjectVisionSpecId: {object_vision_spec_id.name}")
     print(f"ObjectType: {object_vision_spec.object_type.name}")
-    print("Green dot = detection center.")
-    print("P = pause/resume; Q or Esc = quit.")
-
-    paused = False
-    last_display_frame = None
+    print(f"Reference directory: {reference_directory.resolve()}")
+    print("P = pause/resume | S = save unprocessed reference frame | Q/Esc = quit")
 
     try:
         while True:
-            # While paused, keep showing the last processed frame without reading
-            # the camera or running detection.
+            # While paused, keep displaying the last processed frame. The matching
+            # unprocessed camera frame is retained separately and can still be saved with S.
             if paused:
                 paused_frame = last_display_frame.copy()
                 cv2.putText(paused_frame, "PAUSED", (10, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
@@ -143,6 +160,8 @@ def main() -> None:
                 elif key == ord("p"):
                     paused = False
                     previous_loop_start_s = None
+                elif key == ord("s") and last_raw_frame is not None:
+                    saveReferenceFrame(last_raw_frame, reference_directory)
 
                 continue
 
@@ -165,8 +184,10 @@ def main() -> None:
                     f"but config expects {config.FRAME_W}x{config.FRAME_H}."
                 )
 
-            # Time the complete registered detection pipeline, including conversion
-            # from image-space Detection to the corresponding camera-space Measurement.
+            # Preserve the untouched camera image before detection results, boxes,
+            # measurements, or other debug information are drawn onto the display frame.
+            raw_frame = frame.copy()
+
             detection_start_s = time.perf_counter()
             detection_success, detection, measurement = detectSingleObject(
                 frame, object_vision_spec_id, camera_calibration
@@ -175,8 +196,6 @@ def main() -> None:
 
             drawDetection(frame, detection)
 
-            # Paper-plane PnP measurements have a meaningful model-frame origin that
-            # may differ from the Detection bounding-box center.
             if object_vision_spec.object_type == ObjectType.PAPER_PLANE_SHAPES and measurement.x is not None:
                 drawModelOrigin(frame, measurement, camera_calibration)
 
@@ -201,12 +220,13 @@ def main() -> None:
             else:
                 measurement_text = "Measurement: unavailable"
 
-            cv2.putText(
-                frame, measurement_text,
-                (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2, cv2.LINE_AA,
-            )
+            cv2.putText(frame, measurement_text, (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 255, 0), 2, cv2.LINE_AA)
 
+            # These two frames correspond to the same camera capture: one untouched
+            # for later static analysis and one containing the live detection overlay.
+            last_raw_frame = raw_frame
             last_display_frame = frame.copy()
+
             cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(1) & 0xFF
 
@@ -214,10 +234,13 @@ def main() -> None:
                 break
             elif key == ord("p"):
                 paused = True
+            elif key == ord("s"):
+                saveReferenceFrame(last_raw_frame, reference_directory)
 
     finally:
         camera.release()
         cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
