@@ -13,13 +13,21 @@ from src.primary.color import COLOR_SPECS, ColorId
 class ShapeDetection:
     def __init__(
         self,
-        vertices_px: list[list[float]] | np.ndarray,
+        vertices_px: list[list[float]] | np.ndarray | None = None,
         color_id: ColorId | None = None,
         num_sides: int = 3,
+        ellipse_px: tuple[tuple[float, float], tuple[float, float], float] | None = None,
     ):
-        self.vertices_px = np.asarray(vertices_px, dtype=np.float64)
+        if vertices_px is None and ellipse_px is None:
+            raise ValueError("ShapeDetection requires vertices_px or ellipse_px")
+
+        if vertices_px is not None and ellipse_px is not None:
+            raise ValueError("ShapeDetection cannot have both vertices_px and ellipse_px")
+
+        self.vertices_px = None if vertices_px is None else np.asarray(vertices_px, dtype=np.float64)
         self.color_id = color_id
-        self.num_sides = num_sides
+        self.num_sides = 0 if ellipse_px is not None else num_sides
+        self.ellipse_px = ellipse_px
 
 
 class Detection:
@@ -74,7 +82,7 @@ def detectSingleObject(frame: np.ndarray, object_vision_spec_id: ObjectVisionSpe
 
 
 def detectTennisBall(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration) -> tuple[bool, Detection, Measurement]:
-    detection = findSingleObjectUsingLargestColorBlob(frame, object_vision_spec,)
+    detection = findSingleObjectSphere(frame, object_vision_spec,)
 
     if detection is None:
         return failedDetectionResult()
@@ -195,33 +203,43 @@ def drawModelOrigin(frame: np.ndarray, measurement: Measurement, camera_calibrat
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
 
-# Tennis-ball path: threshold configured colors, clean the mask, and use the largest valid blob.
-def findSingleObjectUsingLargestColorBlob(frame: np.ndarray, object_vision_spec: ObjectVisionSpec) -> Detection | None:
-    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    combined_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8,)
 
-    for color_id in object_vision_spec.color_ids:
-        color_spec = COLOR_SPECS[color_id]
-        for lower_hsv, upper_hsv in color_spec.hsv_ranges:
-            color_mask = cv2.inRange(hsv_frame, lower_hsv, upper_hsv,)
-            combined_mask = cv2.bitwise_or(combined_mask, color_mask,)
 
-    combined_mask = cv2.medianBlur(combined_mask, 5)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
-    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, debug: DetectionDebug | None = None) -> Detection | None:
 
-    contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    #
+    #
+    #
+    raise NotImplementedError
 
-    if not contours:
-        return None
 
-    largest_contour = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(largest_contour) < object_vision_spec.minimum_contour_area_px:
-        return None
+# # Tennis-ball path: threshold configured colors, clean the mask, and use the largest valid blob.
+# def findSingleObjectUsingLargestColorBlob(frame: np.ndarray, object_vision_spec: ObjectVisionSpec) -> Detection | None:
+#     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+#     combined_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8,)
 
-    u, v, px_w, px_h = cv2.boundingRect(largest_contour)
-    return Detection(u + px_w/2.0, v + px_h/2.0, px_w, px_h,)
+#     for color_id in object_vision_spec.color_ids:
+#         color_spec = COLOR_SPECS[color_id]
+#         for lower_hsv, upper_hsv in color_spec.hsv_ranges:
+#             color_mask = cv2.inRange(hsv_frame, lower_hsv, upper_hsv,)
+#             combined_mask = cv2.bitwise_or(combined_mask, color_mask,)
+
+#     combined_mask = cv2.medianBlur(combined_mask, 5)
+#     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+#     combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel)
+#     combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel)
+
+#     contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+#     if not contours:
+#         return None
+
+#     largest_contour = max(contours, key=cv2.contourArea)
+#     if cv2.contourArea(largest_contour) < object_vision_spec.minimum_contour_area_px:
+#         return None
+
+#     u, v, px_w, px_h = cv2.boundingRect(largest_contour)
+#     return Detection(u + px_w/2.0, v + px_h/2.0, px_w, px_h,)
 
 
 # Refine an accepted polygon by fitting its straight edges and intersecting neighboring lines.

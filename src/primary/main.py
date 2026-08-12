@@ -27,8 +27,8 @@ from src.comm.network_config import(
 
 
 if __name__ == "__main__": 
-    # object_vision_spec_id = ObjectVisionSpecId.TENNIS_BALL_DEFAULT
-    object_vision_spec_id = ObjectVisionSpecId.ARUCO_MARKER_1
+    object_vision_spec_id = ObjectVisionSpecId.TENNIS_BALL_DEFAULT
+    # object_vision_spec_id = ObjectVisionSpecId.ARUCO_MARKER_1
     # object_vision_spec_id = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
     
     platform_geometry_spec_id = PlatformGeometrySpecId.PLATFORM_1
@@ -84,7 +84,7 @@ if __name__ == "__main__":
     )
     cmd_thread.start()
 
-    os.makedirs("screenshots", exist_ok=True)
+    # os.makedirs("images/primary_main_screenshots", exist_ok=True)
 
     last_detection_px_w = 0
     last_detection_px_h = 0
