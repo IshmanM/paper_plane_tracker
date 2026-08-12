@@ -221,8 +221,6 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     MIN_BOUNDARY_POINTS = 20
 
     # Step 1: Build an HSV mask containing rough sphere candidates.
-    # HSV is used for localization and approximate geometry, while grayscale edges
-    # are used later to refine the actual sphere boundary.
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     mask = np.zeros(frame.shape[:2], dtype=np.uint8)
 
@@ -231,96 +229,62 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         for lower_hsv, upper_hsv in color_spec.hsv_ranges:
             mask = cv2.bitwise_or(mask, cv2.inRange(hsv_frame, lower_hsv, upper_hsv))
 
-    # Step 2: Compute the grayscale edge image once for the entire frame.
-    # All shortlisted candidates reuse this result instead of separately running
-    # grayscale conversion, Gaussian blur, and Canny on each ROI.
-    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    edges_frame = cv2.Canny(cv2.GaussianBlur(gray_frame, (5, 5), 0), 50, 150)
-
     if debug is not None:
         debug.stages.clear()
         debug.addStage("Original", frame)
         debug.addStage("HSV seed mask", mask)
-        debug.addStage("Full-frame Canny", edges_frame)
 
-    # Step 3: Find HSV blobs and cheaply rank how sphere-like each one is.
-    # Small blobs are rejected. The area contribution saturates so a very large
-    # matching object does not automatically beat a smaller spherical candidate.
+    # Step 2: Find sufficiently large HSV blobs across the frame.
+    # Candidate selection is based primarily on area so tiny circular-looking
+    # noise cannot prevent a real sphere from reaching geometric refinement.
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    candidates = []
-
-    for contour in contours:
-        area = cv2.contourArea(contour)
-
-        if area < object_vision_spec.minimum_contour_area_px:
-            continue
-
-        perimeter = cv2.arcLength(contour, True)
-
-        if perimeter <= 0.0:
-            continue
-
-        x, y, w, h = cv2.boundingRect(contour)
-
-        if w == 0 or h == 0:
-            continue
-
-        circularity = np.clip(4.0*np.pi*area/(perimeter*perimeter), 0.0, 1.0)
-        aspect_ratio = min(w, h)/max(w, h)
-        area_score = min(1.0, area/(4.0*object_vision_spec.minimum_contour_area_px))
-        hsv_score = circularity*aspect_ratio*area_score
-
-        candidates.append((hsv_score, contour, area))
+    candidates = [(cv2.contourArea(contour), contour) for contour in contours]
+    candidates = [candidate for candidate in candidates if candidate[0] >= object_vision_spec.minimum_contour_area_px]
 
     if not candidates:
         return None
 
-    # Step 4: Refine only the strongest few HSV candidates to keep runtime bounded.
     candidates.sort(key=lambda candidate: candidate[0], reverse=True)
     candidates = candidates[:MAX_SPHERE_CANDIDATES]
 
     if debug is not None:
         candidate_frame = frame.copy()
 
-        for candidate_index, (hsv_score, contour, _) in enumerate(candidates, start=1):
+        for candidate_index, (area, contour) in enumerate(candidates, start=1):
             x, y, w, h = cv2.boundingRect(contour)
             cv2.rectangle(candidate_frame, (x, y), (x + w, y + h), (0, 255, 255), 1)
-            cv2.putText(candidate_frame, f"{candidate_index}: {hsv_score:.3f}", (x, max(15, y - 5)),
+            cv2.putText(candidate_frame, f"{candidate_index}: area={area:.0f}", (x, max(15, y - 5)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
         debug.addStage("HSV candidates", candidate_frame)
 
+    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     angles = np.linspace(0.0, 2.0*np.pi, NUM_RAYS, endpoint=False)
     directions_u, directions_v = np.cos(angles)[:, None], np.sin(angles)[:, None]
 
     best_result = None
     best_final_score = -np.inf
 
-    # Step 5: Refine each shortlisted candidate independently.
-    for candidate_index, (hsv_score, seed_contour, seed_area) in enumerate(candidates, start=1):
+    # Step 3: Refine each shortlisted HSV candidate independently.
+    for candidate_index, (seed_area, seed_contour) in enumerate(candidates, start=1):
         x, y, w, h = cv2.boundingRect(seed_contour)
         moments = cv2.moments(seed_contour)
 
         if moments["m00"] == 0:
-            if debug is not None:
-                failure_frame = frame.copy()
-                cv2.drawContours(failure_frame, [seed_contour], -1, (0, 0, 255), 2)
-                cv2.putText(failure_frame, "REJECTED: zero contour moment", (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-                debug.addStage(f"Candidate {candidate_index} rejected - contour moment", failure_frame)
             continue
 
         center_u = moments["m10"]/moments["m00"]
         center_v = moments["m01"]/moments["m00"]
         seed_size = max(w, h)
 
-        # Step 6: Create a tight ROI and a filled version of this candidate contour.
-        # Only small ROI arrays are created inside the candidate loop.
+        # Step 4: Create a tight ROI and run edge detection only inside that ROI.
         padding = max(8, int(0.35*seed_size))
         x1, y1 = max(0, x - padding), max(0, y - padding)
         x2, y2 = min(frame.shape[1], x + w + padding), min(frame.shape[0], y + h + padding)
 
-        edges = edges_frame[y1:y2, x1:x2]
+        gray_roi = cv2.GaussianBlur(gray_frame[y1:y2, x1:x2], (5, 5), 0)
+        edges = cv2.Canny(gray_roi, 50, 150)
+
         seed_roi = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
         contour_roi = seed_contour - np.array([[[x1, y1]]], dtype=seed_contour.dtype)
         cv2.drawContours(seed_roi, [contour_roi], -1, 255, -1)
@@ -329,13 +293,10 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
             roi_frame = frame.copy()
             cv2.drawContours(roi_frame, [seed_contour], -1, (0, 255, 255), 1)
             cv2.rectangle(roi_frame, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
-            cv2.putText(roi_frame, f"Candidate {candidate_index} | HSV score: {hsv_score:.3f}", (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2, cv2.LINE_AA)
             debug.addStage(f"Candidate {candidate_index} ROI", roi_frame)
             debug.addStage(f"Candidate {candidate_index} Canny", edges)
 
-        # Step 7: Generate radial samples around the HSV-estimated center using
-        # vectorized NumPy operations instead of Python pixel loops.
+        # Step 5: Generate radial samples around the rough HSV center.
         center_roi_u, center_roi_v = center_u - x1, center_v - y1
         radii = np.arange(1, max(1, int(seed_size)) + 1)
         radius_grid = np.broadcast_to(radii, (NUM_RAYS, len(radii)))
@@ -351,12 +312,12 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         safe_u = np.clip(sample_u, 0, seed_roi.shape[1] - 1)
         safe_v = np.clip(sample_v, 0, seed_roi.shape[0] - 1)
 
-        # Step 8: Find the outermost HSV-supported radius along each direction.
-        # Internal HSV gaps caused by seams, highlights, or shadows are allowed.
+        # Step 6: Estimate the sphere boundary from the outermost HSV-supported
+        # point along each ray. Internal HSV gaps are allowed.
         seed_hits = (seed_roi[safe_v, safe_u] != 0) & valid
         expected_radii = np.where(seed_hits, radius_grid, 0).max(axis=1)
 
-        # Step 9: Search for grayscale edges only near the approximate HSV boundary.
+        # Step 7: Search only near each HSV-estimated boundary for a grayscale edge.
         search_before = 3
         search_after = np.maximum(5, (0.20*expected_radii).astype(np.int32))
 
@@ -374,10 +335,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         if num_rays_with_edge < MIN_BOUNDARY_POINTS:
             if debug is not None:
                 failure_frame = frame.copy()
-                cv2.drawContours(failure_frame, [seed_contour], -1, (0, 0, 255), 2)
                 cv2.putText(failure_frame, f"REJECTED: boundary rays {num_rays_with_edge}/{NUM_RAYS}", (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-                cv2.putText(failure_frame, f"Requires at least {MIN_BOUNDARY_POINTS}", (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
                 debug.addStage(f"Candidate {candidate_index} rejected - boundary points", failure_frame)
             continue
@@ -399,7 +357,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
             debug.addStage(f"Candidate {candidate_index} boundary points", boundary_frame)
 
-        # Step 10: Fit an initial circle to the recovered boundary points.
+        # Step 8: Fit an initial circle.
         A = np.column_stack((2*boundary_points[:, 0], 2*boundary_points[:, 1], np.ones(len(boundary_points))))
         b = boundary_points[:, 0]**2 + boundary_points[:, 1]**2
         circle_u, circle_v, c = np.linalg.lstsq(A, b, rcond=None)[0]
@@ -408,7 +366,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         if radius <= 0.0:
             continue
 
-        # Step 11: Remove inconsistent boundary points and refit the circle.
+        # Step 9: Reject inconsistent boundary points and refit the circle.
         point_radii = np.hypot(boundary_points[:, 0] - circle_u, boundary_points[:, 1] - circle_v)
         residuals = np.abs(point_radii - radius)
         residual_limit = max(2.0, 2.5*np.median(residuals))
@@ -430,7 +388,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         if radius <= 0.0:
             continue
 
-        # Step 12: Require boundary evidence around most of the fitted circle.
+        # Step 10: Require boundary support around most of the circle.
         point_angles = np.arctan2(inlier_points[:, 1] - circle_v, inlier_points[:, 0] - circle_u)
         angle_bins = (((point_angles + np.pi)/(2.0*np.pi))*NUM_ANGLE_BINS).astype(np.int32) % NUM_ANGLE_BINS
         covered_angle_bins = len(np.unique(angle_bins))
@@ -441,32 +399,20 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
                 cv2.circle(failure_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 0, 255), 2)
                 cv2.putText(failure_frame, f"REJECTED: angular coverage {covered_angle_bins}/{NUM_ANGLE_BINS}", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-                cv2.putText(failure_frame, f"Requires at least {MIN_COVERED_ANGLE_BINS}/{NUM_ANGLE_BINS}", (10, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
                 debug.addStage(f"Candidate {candidate_index} rejected - angular coverage", failure_frame)
             continue
 
-        # Step 13: Check that the refined circle remains consistent with the HSV seed.
+        # Step 11: Require the refined circle to stay reasonably consistent with
+        # the original HSV candidate.
         seed_radius = seed_size/2.0
         center_displacement = np.hypot(circle_u - center_u, circle_v - center_v)
 
         if radius < 0.70*seed_radius or radius > 1.40*seed_radius:
-            if debug is not None:
-                failure_frame = frame.copy()
-                cv2.putText(failure_frame, f"REJECTED: radius {radius:.1f}px vs HSV {seed_radius:.1f}px", (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-                debug.addStage(f"Candidate {candidate_index} rejected - radius", failure_frame)
             continue
-
         if center_displacement > 0.40*radius:
-            if debug is not None:
-                failure_frame = frame.copy()
-                cv2.putText(failure_frame, f"REJECTED: center shift {center_displacement:.1f}px", (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-                debug.addStage(f"Candidate {candidate_index} rejected - center shift", failure_frame)
             continue
 
-        # Step 14: Score candidates that survived all geometric checks.
+        # Step 12: Score only candidates that passed all geometric validation.
         final_point_radii = np.hypot(inlier_points[:, 0] - circle_u, inlier_points[:, 1] - circle_v)
         mean_residual = np.mean(np.abs(final_point_radii - radius))
         coverage_score = covered_angle_bins/NUM_ANGLE_BINS
@@ -474,20 +420,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         residual_score = 1.0/(1.0 + mean_residual/max(radius, 1.0))
         hsv_fill_ratio = min(1.0, seed_area/(np.pi*radius*radius))
 
-        final_score = (
-            0.40*coverage_score +
-            0.25*support_score +
-            0.20*residual_score +
-            0.10*hsv_fill_ratio +
-            0.05*hsv_score
-        )
-
-        if debug is not None:
-            success_frame = frame.copy()
-            cv2.circle(success_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 2)
-            cv2.putText(success_frame, f"PASSED candidate {candidate_index} | score {final_score:.3f}", (10, 25),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
-            debug.addStage(f"Candidate {candidate_index} passed", success_frame)
+        final_score = 0.40*coverage_score + 0.30*support_score + 0.20*residual_score + 0.10*hsv_fill_ratio
 
         if final_score > best_final_score:
             best_final_score = final_score
@@ -496,7 +429,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     if best_result is None:
         return None
 
-    # Step 15: Build the final Detection using the best refined circle.
+    # Step 13: Build the final Detection from the best validated sphere candidate.
     circle_u, circle_v, radius, inlier_points, covered_angle_bins, final_score = best_result
     diameter = 2.0*radius
     ellipse_px = ((circle_u, circle_v), (diameter, diameter), 0.0)
@@ -509,7 +442,6 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         for point_u, point_v in inlier_points:
             cv2.circle(final_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
         cv2.circle(final_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 2)
-        cv2.circle(final_frame, (int(round(circle_u)), int(round(circle_v))), 3, (0, 255, 0), -1)
         cv2.putText(final_frame, f"score={final_score:.3f} | coverage={covered_angle_bins}/{NUM_ANGLE_BINS}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
         debug.addStage("Selected sphere", final_frame)
