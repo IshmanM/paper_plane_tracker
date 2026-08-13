@@ -219,6 +219,8 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     NUM_ANGLE_BINS = 12
     MIN_COVERED_ANGLE_BINS = 6
     MIN_BOUNDARY_POINTS = 20
+    LAB_CHROMA_GRADIENT_GAIN = 2.0
+    MIN_LAB_EDGE_STRENGTH = 35.0
 
     # Step 1: Build an HSV mask containing rough sphere candidates.
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
@@ -297,70 +299,56 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         center_v = moments["m01"]/moments["m00"]
         seed_size = max(w, h)
 
-        # Step 4: Create a tight ROI and enhance local color contrast before Canny.
-        # The intent is to make the tennis ball stand out from its immediate
-        # background using LAB chroma difference, rather than merely rejecting the
-        # candidate using a scalar contrast score.
+        # Step 4: Create a tight ROI and compute a combined LAB edge-strength image.
+        # A 3x3 blur preserves small/far-away sphere boundaries better than the old
+        # 5x5 grayscale blur. L contributes brightness edges while a/b add color edges.
         padding = max(8, int(0.35*seed_size))
         x1, y1 = max(0, x - padding), max(0, y - padding)
         x2, y2 = min(frame.shape[1], x + w + padding), min(frame.shape[0], y + h + padding)
 
-        gray_roi = gray_frame[y1:y2, x1:x2]
         color_roi = frame[y1:y2, x1:x2]
 
         # A malformed/noisy candidate should never crash the entire live detector.
-        if gray_roi.size == 0 or gray_roi.shape[0] < 2 or gray_roi.shape[1] < 2:
+        if color_roi.size == 0 or color_roi.shape[0] < 2 or color_roi.shape[1] < 2:
             if debug is not None:
                 failure_frame = frame.copy()
-                cv2.putText(failure_frame, f"REJECTED: invalid ROI {gray_roi.shape}", (10, 25),
+                cv2.putText(failure_frame, f"REJECTED: invalid ROI {color_roi.shape}", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
                 debug.addStage(f"Candidate {candidate_index} rejected - invalid ROI", failure_frame)
             continue
 
-        gray_roi = np.ascontiguousarray(gray_roi)
         color_roi = np.ascontiguousarray(color_roi)
+        lab_roi = cv2.cvtColor(color_roi, cv2.COLOR_BGR2LAB)
+        l_roi, a_roi, b_roi = cv2.split(lab_roi)
+
+        l_roi = cv2.GaussianBlur(l_roi, (3, 3), 0).astype(np.float32)
+        a_roi = cv2.GaussianBlur(a_roi, (3, 3), 0).astype(np.float32)
+        b_roi = cv2.GaussianBlur(b_roi, (3, 3), 0).astype(np.float32)
+
+        grad_lu = cv2.Sobel(l_roi, cv2.CV_32F, 1, 0, ksize=3)
+        grad_lv = cv2.Sobel(l_roi, cv2.CV_32F, 0, 1, ksize=3)
+        grad_au = cv2.Sobel(a_roi, cv2.CV_32F, 1, 0, ksize=3)
+        grad_av = cv2.Sobel(a_roi, cv2.CV_32F, 0, 1, ksize=3)
+        grad_bu = cv2.Sobel(b_roi, cv2.CV_32F, 1, 0, ksize=3)
+        grad_bv = cv2.Sobel(b_roi, cv2.CV_32F, 0, 1, ksize=3)
+
+        lab_edge_strength = np.sqrt(
+            grad_lu*grad_lu + grad_lv*grad_lv +
+            LAB_CHROMA_GRADIENT_GAIN*(grad_au*grad_au + grad_av*grad_av + grad_bu*grad_bu + grad_bv*grad_bv)
+        )
 
         seed_roi = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
         contour_roi = seed_contour - np.array([[[x1, y1]]], dtype=seed_contour.dtype)
         cv2.drawContours(seed_roi, [contour_roi], -1, 255, -1)
-
-        # Estimate the local background color from a thin ring immediately outside
-        # the HSV candidate. The LAB a/b channels capture color difference while
-        # being less tied to brightness than plain grayscale.
-        kernel = np.ones((3, 3), dtype=np.uint8)
-        outer_mask = cv2.dilate(seed_roi, kernel, iterations=2)
-        outer_ring = cv2.bitwise_and(outer_mask, cv2.bitwise_not(seed_roi))
-
-        lab_roi = cv2.cvtColor(color_roi, cv2.COLOR_BGR2LAB).astype(np.float32)
-        outer_pixels = lab_roi[outer_ring != 0]
-
-        # Build a contrast-enhanced scalar image for Canny. Each pixel stores its
-        # LAB chroma distance from the local surrounding background color.
-        if len(outer_pixels):
-            background_color = np.median(outer_pixels, axis=0)
-            da = lab_roi[:, :, 1] - background_color[1]
-            db = lab_roi[:, :, 2] - background_color[2]
-            contrast_roi = np.sqrt(da*da + db*db)
-        else:
-            # Fallback: if the outer ring is unavailable, revert to grayscale so
-            # the detector still functions rather than failing outright.
-            contrast_roi = gray_roi.astype(np.float32)
-
-        if np.max(contrast_roi) > np.min(contrast_roi):
-            contrast_roi = cv2.normalize(contrast_roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        else:
-            contrast_roi = np.zeros_like(gray_roi, dtype=np.uint8)
-
-        canny_source = cv2.GaussianBlur(np.ascontiguousarray(contrast_roi), (5, 5), 0)
-        edges = cv2.Canny(canny_source, 50, 150)
 
         if debug is not None:
             roi_frame = frame.copy()
             cv2.drawContours(roi_frame, [seed_contour], -1, (0, 255, 255), 1)
             cv2.rectangle(roi_frame, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
             debug.addStage(f"Candidate {candidate_index} ROI", roi_frame)
-            debug.addStage(f"Candidate {candidate_index} LAB contrast ROI", contrast_roi)
-            debug.addStage(f"Candidate {candidate_index} Canny", edges)
+
+            edge_strength_debug = cv2.normalize(lab_edge_strength, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            debug.addStage(f"Candidate {candidate_index} LAB edge strength", edge_strength_debug)
 
         # Step 5: Generate radial samples around the candidate center.
         center_roi_u, center_roi_v = center_u - x1, center_v - y1
@@ -382,19 +370,25 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         seed_hits = (seed_roi[safe_v, safe_u] != 0) & valid
         expected_radii = np.where(seed_hits, radius_grid, 0).max(axis=1)
 
-        # Step 7: Refine that approximate HSV boundary using nearby grayscale edges.
+        # Step 7: Refine the approximate HSV boundary using the strongest nearby
+        # combined LAB gradient on each ray. Using the strongest gradient avoids the
+        # inward-radius bias that can occur when a thick binary edge band is sampled
+        # by simply taking its first pixel.
         search_before = 3
         search_after = np.maximum(5, (0.20*expected_radii).astype(np.int32))
 
-        edge_hits = (edges[safe_v, safe_u] != 0) & valid
         search_band = (
             (radius_grid >= (expected_radii - search_before)[:, None]) &
             (radius_grid <= (expected_radii + search_after)[:, None]) &
-            (expected_radii[:, None] > 0)
+            (expected_radii[:, None] > 0) &
+            valid
         )
 
-        candidate_edges = edge_hits & search_band
-        rays_with_edge = candidate_edges.any(axis=1)
+        sampled_edge_strength = lab_edge_strength[safe_v, safe_u]
+        candidate_strength = np.where(search_band, sampled_edge_strength, 0.0)
+        best_edge_indices = np.argmax(candidate_strength, axis=1)
+        best_edge_strengths = candidate_strength[np.arange(NUM_RAYS), best_edge_indices]
+        rays_with_edge = best_edge_strengths >= MIN_LAB_EDGE_STRENGTH
         num_rays_with_edge = np.count_nonzero(rays_with_edge)
 
         if num_rays_with_edge < MIN_BOUNDARY_POINTS:
@@ -405,9 +399,8 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
                 debug.addStage(f"Candidate {candidate_index} rejected - boundary points", failure_frame)
             continue
 
-        first_edge_indices = np.argmax(candidate_edges, axis=1)
         ray_indices = np.flatnonzero(rays_with_edge)
-        edge_indices = first_edge_indices[rays_with_edge]
+        edge_indices = best_edge_indices[rays_with_edge]
 
         boundary_points = np.column_stack((
             sample_u[ray_indices, edge_indices] + x1,
@@ -554,7 +547,12 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
             for point_u, point_v in inlier_points:
                 cv2.circle(passed_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
 
-            cv2.circle(passed_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 1,)
+            cv2.circle(
+                passed_frame,
+                (int(round(circle_u)), int(round(circle_v))),
+                int(round(radius)),
+                (0, 255, 0), 2,
+            )
 
             cv2.putText(passed_frame, f"PASSED candidate {candidate_index}", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
@@ -592,7 +590,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         for point_u, point_v in inlier_points:
             cv2.circle(success_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
 
-        cv2.circle(success_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), thickness=1)
+        cv2.circle(success_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 2)
 
         cv2.putText(success_frame, f"PASSED candidate {candidate_index}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
