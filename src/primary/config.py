@@ -36,7 +36,7 @@ CAMERA_CALIBRATION_PATH = Path(f"src/primary/calibration_data/camera/{CAMERA_CAL
 CAMERA_TO_PLATFORM_CALIBRATION_PATH = Path("src/primary/calibration_data/camera_to_platform/results.json")
 
 CAMERA_INDEX = 0
-CAMERA_AUTO_EXPOSURE = False
+CAMERA_AUTO_EXPOSURE = True
 CAMERA_EXPOSURE = -5.5 #originally -6.0
 CAMERA_GAIN = 0.0
 CAMERA_AUTO_WHITE_BALANCE = False
