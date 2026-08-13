@@ -216,9 +216,9 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         raise ValueError("Sphere detection requires minimum_contour_area_px")
 
     MAX_SPHERE_CANDIDATES = 2
-    NUM_RAYS = 120  # TODO: Try reducing to 90 later for additional speed if accuracy remains stable.
+    NUM_RAYS = 120  # originally 120. TODO: tune for speed vs. accuracy
     NUM_ANGLE_BINS = 12
-    MIN_COVERED_ANGLE_BINS = 7
+    MIN_COVERED_ANGLE_BINS = 8
     MIN_BOUNDARY_POINTS = 20
     LAB_CHROMA_GRADIENT_GAIN = 2.0
     MIN_LAB_EDGE_STRENGTH = 35.0
