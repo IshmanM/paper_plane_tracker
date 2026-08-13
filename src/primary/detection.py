@@ -297,12 +297,16 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         center_v = moments["m01"]/moments["m00"]
         seed_size = max(w, h)
 
-        # Step 4: Create a tight ROI and run Gaussian blur + Canny only there.
+        # Step 4: Create a tight ROI and enhance local color contrast before Canny.
+        # The intent is to make the tennis ball stand out from its immediate
+        # background using LAB chroma difference, rather than merely rejecting the
+        # candidate using a scalar contrast score.
         padding = max(8, int(0.35*seed_size))
         x1, y1 = max(0, x - padding), max(0, y - padding)
         x2, y2 = min(frame.shape[1], x + w + padding), min(frame.shape[0], y + h + padding)
 
         gray_roi = gray_frame[y1:y2, x1:x2]
+        color_roi = frame[y1:y2, x1:x2]
 
         # A malformed/noisy candidate should never crash the entire live detector.
         if gray_roi.size == 0 or gray_roi.shape[0] < 2 or gray_roi.shape[1] < 2:
@@ -313,28 +317,49 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
                 debug.addStage(f"Candidate {candidate_index} rejected - invalid ROI", failure_frame)
             continue
 
-        # Make the ROI contiguous before passing it into OpenCV's native code.
         gray_roi = np.ascontiguousarray(gray_roi)
-
-        if gray_roi.size == 0 or gray_roi.shape[0] < 2 or gray_roi.shape[1] < 2:
-            print(
-                f"Invalid sphere ROI: shape={gray_roi.shape}, "
-                f"bbox=({x},{y},{w},{h}), roi=({x1},{y1},{x2},{y2}), frame={gray_frame.shape}"
-            )
-            continue
-
-        gray_roi = cv2.GaussianBlur(np.ascontiguousarray(gray_roi), (5, 5), 0)
-        edges = cv2.Canny(gray_roi, 50, 150)
+        color_roi = np.ascontiguousarray(color_roi)
 
         seed_roi = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
         contour_roi = seed_contour - np.array([[[x1, y1]]], dtype=seed_contour.dtype)
         cv2.drawContours(seed_roi, [contour_roi], -1, 255, -1)
+
+        # Estimate the local background color from a thin ring immediately outside
+        # the HSV candidate. The LAB a/b channels capture color difference while
+        # being less tied to brightness than plain grayscale.
+        kernel = np.ones((3, 3), dtype=np.uint8)
+        outer_mask = cv2.dilate(seed_roi, kernel, iterations=2)
+        outer_ring = cv2.bitwise_and(outer_mask, cv2.bitwise_not(seed_roi))
+
+        lab_roi = cv2.cvtColor(color_roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+        outer_pixels = lab_roi[outer_ring != 0]
+
+        # Build a contrast-enhanced scalar image for Canny. Each pixel stores its
+        # LAB chroma distance from the local surrounding background color.
+        if len(outer_pixels):
+            background_color = np.median(outer_pixels, axis=0)
+            da = lab_roi[:, :, 1] - background_color[1]
+            db = lab_roi[:, :, 2] - background_color[2]
+            contrast_roi = np.sqrt(da*da + db*db)
+        else:
+            # Fallback: if the outer ring is unavailable, revert to grayscale so
+            # the detector still functions rather than failing outright.
+            contrast_roi = gray_roi.astype(np.float32)
+
+        if np.max(contrast_roi) > np.min(contrast_roi):
+            contrast_roi = cv2.normalize(contrast_roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        else:
+            contrast_roi = np.zeros_like(gray_roi, dtype=np.uint8)
+
+        canny_source = cv2.GaussianBlur(np.ascontiguousarray(contrast_roi), (5, 5), 0)
+        edges = cv2.Canny(canny_source, 50, 150)
 
         if debug is not None:
             roi_frame = frame.copy()
             cv2.drawContours(roi_frame, [seed_contour], -1, (0, 255, 255), 1)
             cv2.rectangle(roi_frame, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
             debug.addStage(f"Candidate {candidate_index} ROI", roi_frame)
+            debug.addStage(f"Candidate {candidate_index} LAB contrast ROI", contrast_roi)
             debug.addStage(f"Candidate {candidate_index} Canny", edges)
 
         # Step 5: Generate radial samples around the candidate center.
@@ -529,12 +554,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
             for point_u, point_v in inlier_points:
                 cv2.circle(passed_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
 
-            cv2.circle(
-                passed_frame,
-                (int(round(circle_u)), int(round(circle_v))),
-                int(round(radius)),
-                (0, 255, 0), 2,
-            )
+            cv2.circle(passed_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 1,)
 
             cv2.putText(passed_frame, f"PASSED candidate {candidate_index}", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
@@ -572,7 +592,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         for point_u, point_v in inlier_points:
             cv2.circle(success_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
 
-        cv2.circle(success_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 2)
+        cv2.circle(success_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), thickness=1)
 
         cv2.putText(success_frame, f"PASSED candidate {candidate_index}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
@@ -828,7 +848,7 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
                     shape_points = np.round(vertices_px).astype(np.int32).reshape(-1, 1, 2)
                     cv2.polylines(candidate_debug_frame, [shape_points], True, draw_bgr, 1)
                     cv2.circle(candidate_debug_frame, tuple(center_px), 4, draw_bgr, -1)
-                    cv2.putText(candidate_debug_frame, f"S{shape_index}: {color_name}, N={num_sides}", (int(center_px[0]) + 5, int(center_px[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_bgr, 2, cv2.LINE_AA)
+                    cv2.putText(candidate_debug_frame, f"S{shape_index}: {color_name}, N={num_sides}", (int(center_px[0]) + 5, int(center_px[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_bgr, 1, cv2.LINE_AA)
 
     if debug is not None:
         debug.addStage("Combined raw mask", combined_raw_mask)

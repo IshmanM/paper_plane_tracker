@@ -29,8 +29,8 @@ COLOR_SPECS = {
             # ),
               
             (
-                np.array([25, 50, 80], dtype=np.uint8),
-                np.array([40, 255, 255], dtype=np.uint8),
+                np.array([27, 75, 80], dtype=np.uint8),
+                np.array([38, 255, 255], dtype=np.uint8),
             ),
         ],
         draw_bgr=(0, 255, 0),
