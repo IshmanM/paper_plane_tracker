@@ -16,12 +16,12 @@ WINDOW_NAME = "Live detection test"
 DEFAULT_OBJECT_VISION_SPEC_ID = ObjectVisionSpecId.TENNIS_BALL_DEFAULT
 DEFAULT_TIMING_WINDOW_FRAMES = 120
 POSITION_AVERAGING_WINDOW_FRAMES = 60
+DISPLAY_SCALES = (1.0, 1.5, 2.0)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run live object detection and display current and averaged measurements.")
-    parser.add_argument("--spec", default=DEFAULT_OBJECT_VISION_SPEC_ID.name,
-                        choices=[spec_id.name for spec_id in OBJECT_VISION_SPECS],
+    parser.add_argument("--spec", default=DEFAULT_OBJECT_VISION_SPEC_ID.name, choices=[spec_id.name for spec_id in OBJECT_VISION_SPECS],
                         help=f"Registered ObjectVisionSpecId. Default: {DEFAULT_OBJECT_VISION_SPEC_ID.name}")
     parser.add_argument("--timing-window", type=int, default=DEFAULT_TIMING_WINDOW_FRAMES,
                         help=f"Frames used for rolling timing average. Default: {DEFAULT_TIMING_WINDOW_FRAMES}")
@@ -64,12 +64,10 @@ def main() -> None:
 
     actual_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
     actual_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
     if (actual_width, actual_height) != (config.FRAME_W, config.FRAME_H):
         camera.release()
-        raise ValueError(
-            f"Camera produced {actual_width}x{actual_height}, "
-            f"but config expects {config.FRAME_W}x{config.FRAME_H}"
-        )
+        raise ValueError(f"Camera produced {actual_width}x{actual_height}, but config expects {config.FRAME_W}x{config.FRAME_H}")
 
     detection_times_s = deque(maxlen=args.timing_window)
     loop_periods_s = deque(maxlen=args.timing_window)
@@ -77,19 +75,39 @@ def main() -> None:
 
     previous_loop_start_s = None
     paused = False
+    display_scale_index = 0
+
     last_display_frame = None
     last_raw_frame = None
 
+    timing_text = ""
+    current_text = ""
+    average_text = ""
+
+    def drawDisplayText(image: np.ndarray, text: str, position: tuple[int, int], color: tuple[int, int, int], display_scale: float) -> None:
+        font_scale = 0.52*display_scale
+        thickness = max(1, round(display_scale))
+        pos = (round(position[0]*display_scale), round(position[1]*display_scale))
+
+        # Black outline keeps the HUD readable over both bright and dark backgrounds.
+        cv2.putText(image, text, pos, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(image, text, pos, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv2.LINE_AA)
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, config.FRAME_W, config.FRAME_H)
+
     print(f"ObjectVisionSpecId: {object_vision_spec_id.name}")
     print(f"Position average: last {POSITION_AVERAGING_WINDOW_FRAMES} valid measurements")
-    print("P: pause/resume | S: save raw frame | Q/Esc: quit")
+    print("Tab: display size | P: pause/resume | S: save raw frame | Q/Esc: quit")
 
     try:
         while True:
             if not paused:
                 loop_start_s = time.perf_counter()
+
                 if previous_loop_start_s is not None:
                     loop_periods_s.append(loop_start_s - previous_loop_start_s)
+
                 previous_loop_start_s = loop_start_s
 
                 success, raw_frame = camera.read()
@@ -113,6 +131,7 @@ def main() -> None:
 
                 if valid_measurement:
                     position = np.array([measurement.x, measurement.y, measurement.z], dtype=np.float64)
+
                     if np.all(np.isfinite(position)):
                         measurement_buffer.append(position)
 
@@ -121,10 +140,15 @@ def main() -> None:
                 detector_rate_hz = 1.0/average_detection_s if average_detection_s > 0.0 else 0.0
                 live_fps = 1.0/(sum(loop_periods_s)/len(loop_periods_s)) if loop_periods_s else 0.0
 
-                if valid_measurement:
-                    current_text = f"Current: x={measurement.x:.3f} m | y={measurement.y:.3f} m | z={measurement.z:.3f} m"
-                else:
-                    current_text = "Current: unavailable"
+                timing_text = (
+                    f"Detection: {average_detection_s*1000.0:.2f} ms | "
+                    f"rate: {detector_rate_hz:.1f} Hz | loop: {live_fps:.1f} FPS"
+                )
+
+                current_text = (
+                    f"Current: x={measurement.x:.3f} m | y={measurement.y:.3f} m | z={measurement.z:.3f} m"
+                    if valid_measurement else "Current: unavailable"
+                )
 
                 if average_position is not None:
                     average_text = (
@@ -134,35 +158,70 @@ def main() -> None:
                 else:
                     average_text = f"Avg 0/{POSITION_AVERAGING_WINDOW_FRAMES}: unavailable"
 
-                cv2.putText(frame, f"Detection: {average_detection_s*1000.0:.2f} ms | rate: {detector_rate_hz:.1f} Hz | loop: {live_fps:.1f} FPS",
-                            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 1, cv2.LINE_AA)
-                cv2.putText(frame, current_text, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 0), 1, cv2.LINE_AA)
-                cv2.putText(frame, average_text, (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 255, 255), 1, cv2.LINE_AA)
+                # Viewing-only flip. Detection and measurement use the original,
+                # unflipped camera frame just like in main.py.
+                frame = cv2.flip(frame, 1)
 
+                # Store the native-resolution visualization without HUD text. HUD is
+                # rendered after display scaling so the text itself stays sharp.
                 last_display_frame = frame.copy()
-            else:
-                if last_display_frame is None:
-                    continue
-                frame = last_display_frame.copy()
-                cv2.putText(frame, "PAUSED", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 0, 255), 2, cv2.LINE_AA)
 
-            cv2.imshow(WINDOW_NAME, frame)
+            elif last_display_frame is None:
+                continue
+
+            # DISPLAY ONLY: this resizing does not affect detection, measurement,
+            # calibration, or the configured camera resolution.
+            display_scale = DISPLAY_SCALES[display_scale_index]
+            display_frame = cv2.resize(
+                last_display_frame, None,
+                fx=display_scale, fy=display_scale,
+                interpolation=cv2.INTER_LINEAR,
+            )
+
+            # Draw text after resizing so it isn't blurred by image scaling.
+            drawDisplayText(display_frame, timing_text, (10, 25), (0, 255, 0), display_scale)
+            drawDisplayText(display_frame, current_text, (10, 50), (0, 255, 0), display_scale)
+            drawDisplayText(display_frame, average_text, (10, 75), (255, 255, 0), display_scale)
+
+            if paused:
+                drawDisplayText(display_frame, "PAUSED", (10, 100), (0, 0, 255), display_scale)
+
+            cv2.imshow(WINDOW_NAME, display_frame)
             key = cv2.waitKey(1) & 0xFF
 
             if key in (ord("q"), 27):
                 break
+
+            elif key == 9:  # Tab
+                display_scale_index = (display_scale_index + 1) % len(DISPLAY_SCALES)
+                display_scale = DISPLAY_SCALES[display_scale_index]
+
+                cv2.resizeWindow(
+                    WINDOW_NAME,
+                    round(config.FRAME_W*display_scale),
+                    round(config.FRAME_H*display_scale),
+                )
+
+                print(f"Display scale: {display_scale:.1f}x")
+
             elif key == ord("p"):
                 paused = not paused
+
                 if not paused:
                     previous_loop_start_s = None
                     loop_periods_s.clear()
+
                 print("Paused" if paused else "Resumed")
+
             elif key == ord("s") and last_raw_frame is not None:
                 save_path = Path("images")/"primary_detection_references"/object_vision_spec_id.name.lower()/"reference_1.png"
                 save_path.parent.mkdir(parents=True, exist_ok=True)
+
                 if not cv2.imwrite(str(save_path), last_raw_frame):
                     raise RuntimeError(f"Could not save image: {save_path}")
+
                 print(f"Saved {save_path}")
+
     finally:
         camera.release()
         cv2.destroyAllWindows()
