@@ -216,7 +216,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         raise ValueError("Sphere detection requires minimum_contour_area_px")
 
     MAX_SPHERE_CANDIDATES = 2
-    NUM_RAYS = 120
+    NUM_RAYS = 120  # TODO: Try reducing to 90 later for additional speed if accuracy remains stable.
     NUM_ANGLE_BINS = 12
     MIN_COVERED_ANGLE_BINS = 7
     MIN_BOUNDARY_POINTS = 20
@@ -225,31 +225,24 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     MAX_CENTER_SHIFT_FACTOR = 0.40
     MIN_MAX_CENTER_SHIFT_PX = 2.5
 
-    # Global yellow-green hotspot stage.
     GLOBAL_BLUR_KERNEL = (5, 5)
     HOTSPOT_PERCENTILE = 98.5
     MIN_HOTSPOT_RESPONSE = 8.0
     MIN_HOTSPOT_AREA_PX = 6
     HOTSPOT_PADDING_FACTOR = 0.35
 
-    # Inside each hotspot ROI, loosen the ColorSpec HSV range only for rough
-    # acquisition. From that point onward, use the same seed -> tight ROI ->
-    # LAB-gradient radial refinement as the HSV-dominated version.
     LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 40, 15], dtype=np.int16)
 
-    # Step 1: Get the target LAB chroma direction directly from ColorSpec, then build
-    # a continuous full-frame LAB response along that direction.
+    # Step 1: Get the target LAB chroma direction directly from ColorSpec.
     lab_direction = np.zeros(2, dtype=np.float32)
 
     for color_id in object_vision_spec.color_ids:
         color_spec = COLOR_SPECS[color_id]
-
         if color_spec.lab_value is None:
             raise ValueError(f"Sphere detection requires ColorSpec.lab_value for {color_id}")
 
         direction = color_spec.lab_value[1:3].astype(np.float32) - 128.0
         direction_norm = np.linalg.norm(direction)
-
         if direction_norm > 0.0:
             lab_direction += direction/direction_norm
 
@@ -260,11 +253,15 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     lab_direction /= lab_direction_norm
     lab_a_direction, lab_b_direction = float(lab_direction[0]), float(lab_direction[1])
 
-    blurred_frame = cv2.GaussianBlur(frame, GLOBAL_BLUR_KERNEL, 0)
+    blurred_frame = frame
+
+    # ----- OPTIONAL GLOBAL 5x5 BLUR START: comment/uncomment freely -----
+    blurred_frame = cv2.GaussianBlur(blurred_frame, GLOBAL_BLUR_KERNEL, 0)
+    # ----- OPTIONAL GLOBAL 5x5 BLUR END ---------------------------------
+
     lab_frame = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2LAB)
     _, a_u8, b_u8 = cv2.split(lab_frame)
-    a = a_u8.astype(np.float32) - 128.0
-    b = b_u8.astype(np.float32) - 128.0
+    a, b = a_u8.astype(np.float32) - 128.0, b_u8.astype(np.float32) - 128.0
 
     lab_color_response = a*lab_a_direction + b*lab_b_direction
     positive_response = np.maximum(lab_color_response, 0.0)
@@ -272,9 +269,12 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     hotspot_mask = (positive_response >= hotspot_threshold).astype(np.uint8)*255
 
     hotspot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+
+    # ----- OPTIONAL LAB HOTSPOT CLEANUP START: comment/uncomment freely -----
     hotspot_mask = cv2.morphologyEx(hotspot_mask, cv2.MORPH_CLOSE, hotspot_kernel)
     hotspot_mask = cv2.erode(hotspot_mask, hotspot_kernel, iterations=1)
     hotspot_mask = cv2.dilate(hotspot_mask, hotspot_kernel, iterations=1)
+    # ----- OPTIONAL LAB HOTSPOT CLEANUP END ---------------------------------
 
     if debug is not None:
         debug.stages.clear()
@@ -283,7 +283,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         debug.addStage("LAB color response from ColorSpec LAB", response_debug)
         debug.addStage("LAB hotspot mask", hotspot_mask)
 
-    # Step 2: Convert the brightest response regions into padded candidate ROIs.
+    # Step 2: Convert the strongest LAB-response regions into candidate ROIs.
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(hotspot_mask, connectivity=8)
     response_sums = np.bincount(labels.ravel(), weights=positive_response.ravel(), minlength=num_labels)
     candidates = []
@@ -293,23 +293,18 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         if area < MIN_HOTSPOT_AREA_PX:
             continue
 
-        x = int(stats[label, cv2.CC_STAT_LEFT])
-        y = int(stats[label, cv2.CC_STAT_TOP])
-        w = int(stats[label, cv2.CC_STAT_WIDTH])
-        h = int(stats[label, cv2.CC_STAT_HEIGHT])
-
+        x, y = int(stats[label, cv2.CC_STAT_LEFT]), int(stats[label, cv2.CC_STAT_TOP])
+        w, h = int(stats[label, cv2.CC_STAT_WIDTH]), int(stats[label, cv2.CC_STAT_HEIGHT])
         mean_response = float(response_sums[label]/max(area, 1))
-        candidate_score = mean_response*(area**0.10)
-        candidates.append((candidate_score, area, x, y, w, h, mean_response))
+        candidates.append((mean_response*(area**0.10), area, x, y, w, h, mean_response))
 
     if not candidates:
         return None
 
     candidates.sort(key=lambda candidate: candidate[0], reverse=True)
 
-    # Keep up to MAX_SPHERE_CANDIDATES spatially distinct hotspots. A close tennis
-    # ball can produce multiple bright LAB regions separated by its white seam/glare;
-    # those should count as one physical candidate rather than competing separately.
+    # Keep spatially distinct hotspots. Separate bright regions caused by the white
+    # tennis-ball seam/glare should count as one physical candidate.
     selected_candidates = []
 
     for candidate in candidates:
@@ -319,9 +314,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         for selected_candidate in selected_candidates:
             _, _, selected_x, selected_y, selected_w, selected_h, _ = selected_candidate
-            selected_center_x = selected_x + 0.5*selected_w
-            selected_center_y = selected_y + 0.5*selected_h
-
+            selected_center_x, selected_center_y = selected_x + 0.5*selected_w, selected_y + 0.5*selected_h
             center_distance = np.hypot(center_x - selected_center_x, center_y - selected_center_y)
             duplicate_distance = 0.75*max(w, h, selected_w, selected_h)
 
@@ -331,7 +324,6 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         if not duplicate:
             selected_candidates.append(candidate)
-
         if len(selected_candidates) >= MAX_SPHERE_CANDIDATES:
             break
 
@@ -344,24 +336,17 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
             cv2.putText(candidate_frame, f"{candidate_index}: area={area} resp={mean_response:.1f} score={score:.1f}",
                         (x, max(15, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1, cv2.LINE_AA)
         debug.addStage("LAB hotspot candidates", candidate_frame)
+
     angles = np.linspace(0.0, 2.0*np.pi, NUM_RAYS, endpoint=False)
     directions_u, directions_v = np.cos(angles)[:, None], np.sin(angles)[:, None]
+    best_result, best_final_score = None, -np.inf
 
-    best_result = None
-    best_final_score = -np.inf
-
-    # Step 3: Inside the LAB hotspot ROI, acquire the rough seed exactly like the
-    # HSV-dominated detector: make the HSV mask, take the largest valid connected
-    # component, extract its exact contour, then hand that contour to the unchanged
-    # tight-ROI LAB-gradient refinement below. No morphology or LAB enhancement is
-    # applied before choosing the HSV seed.
+    # Step 3: Inside each LAB hotspot ROI, use loose HSV for rough acquisition.
     for candidate_index, (_, _, hot_x, hot_y, hot_w, hot_h, _) in enumerate(candidates, start=1):
         hotspot_size = max(hot_w, hot_h)
         padding = max(8, int(HOTSPOT_PADDING_FACTOR*hotspot_size))
-        hot_x1 = max(0, hot_x - padding)
-        hot_y1 = max(0, hot_y - padding)
-        hot_x2 = min(frame.shape[1], hot_x + hot_w + padding)
-        hot_y2 = min(frame.shape[0], hot_y + hot_h + padding)
+        hot_x1, hot_y1 = max(0, hot_x - padding), max(0, hot_y - padding)
+        hot_x2, hot_y2 = min(frame.shape[1], hot_x + hot_w + padding), min(frame.shape[0], hot_y + hot_h + padding)
 
         roi_frame = np.ascontiguousarray(frame[hot_y1:hot_y2, hot_x1:hot_x2])
         if roi_frame.size == 0 or roi_frame.shape[0] < 2 or roi_frame.shape[1] < 2:
@@ -372,11 +357,8 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         for color_id in object_vision_spec.color_ids:
             color_spec = COLOR_SPECS[color_id]
-
             for lower_hsv, upper_hsv in color_spec.hsv_ranges:
-                loose_lower_hsv = np.clip(
-                    lower_hsv.astype(np.int16) - LOOSE_HSV_LOWER_SUBTRACTION, 0, 255
-                ).astype(np.uint8)
+                loose_lower_hsv = np.clip(lower_hsv.astype(np.int16) - LOOSE_HSV_LOWER_SUBTRACTION, 0, 255).astype(np.uint8)
                 seed_mask = cv2.bitwise_or(seed_mask, cv2.inRange(roi_hsv, loose_lower_hsv, upper_hsv))
 
         num_seed_labels, seed_labels, seed_stats, _ = cv2.connectedComponentsWithStats(seed_mask, connectivity=8)
@@ -387,11 +369,8 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
             if seed_area < object_vision_spec.minimum_contour_area_px:
                 continue
 
-            sx = int(seed_stats[seed_label, cv2.CC_STAT_LEFT])
-            sy = int(seed_stats[seed_label, cv2.CC_STAT_TOP])
-            sw = int(seed_stats[seed_label, cv2.CC_STAT_WIDTH])
-            sh = int(seed_stats[seed_label, cv2.CC_STAT_HEIGHT])
-
+            sx, sy = int(seed_stats[seed_label, cv2.CC_STAT_LEFT]), int(seed_stats[seed_label, cv2.CC_STAT_TOP])
+            sw, sh = int(seed_stats[seed_label, cv2.CC_STAT_WIDTH]), int(seed_stats[seed_label, cv2.CC_STAT_HEIGHT])
             if best_seed is None or seed_area > best_seed[0]:
                 best_seed = (seed_area, seed_label, sx, sy, sw, sh)
 
@@ -400,80 +379,63 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
                 debug.addStage(f"Candidate {candidate_index} loose HSV seed mask", seed_mask)
             continue
 
-        seed_area, seed_label, sx, sy, sw, sh = best_seed
-        component_mask = (seed_labels[sy:sy + sh, sx:sx + sw] == seed_label).astype(np.uint8)*255
-        local_contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        if not local_contours:
-            continue
-
-        seed_contour = max(local_contours, key=cv2.contourArea)
-        seed_contour = seed_contour + np.array([[[hot_x1 + sx, hot_y1 + sy]]], dtype=seed_contour.dtype)
-
+        _, seed_label, sx, sy, sw, sh = best_seed
         x, y, w, h = hot_x1 + sx, hot_y1 + sy, sw, sh
 
+        # Contour extraction is visualization-only, so skip it entirely when debug=None.
         if debug is not None:
-            seed_debug = frame.copy()
-            cv2.rectangle(seed_debug, (hot_x1, hot_y1), (hot_x2 - 1, hot_y2 - 1), (255, 255, 255), 1)
-            cv2.drawContours(seed_debug, [seed_contour], -1, (0, 255, 255), 1)
+            component_mask = (seed_labels[sy:sy + sh, sx:sx + sw] == seed_label).astype(np.uint8)*255
+            local_contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+            if local_contours:
+                seed_contour = max(local_contours, key=cv2.contourArea) + np.array([[[hot_x1 + sx, hot_y1 + sy]]], dtype=np.int32)
+                seed_debug = frame.copy()
+                cv2.rectangle(seed_debug, (hot_x1, hot_y1), (hot_x2 - 1, hot_y2 - 1), (255, 255, 255), 1)
+                cv2.drawContours(seed_debug, [seed_contour], -1, (0, 255, 255), 1)
+                debug.addStage(f"Candidate {candidate_index} selected HSV seed", seed_debug)
+
             debug.addStage(f"Candidate {candidate_index} loose HSV seed mask", seed_mask)
-            debug.addStage(f"Candidate {candidate_index} selected HSV seed", seed_debug)
 
-        # Use all loose-HSV pixels inside the hotspot ROI for the rough center and
-        # radial seed. This preserves separated ball regions when glare/white seams
-        # split the HSV mask into multiple connected components.
+        # Use all loose-HSV pixels in the hotspot ROI so regions separated by the
+        # tennis-ball seam/glare can contribute to the rough center and radial seed.
         seed_moments = cv2.moments(seed_mask, binaryImage=True)
-
         if seed_moments["m00"] == 0:
             continue
 
         center_u = hot_x1 + seed_moments["m10"]/seed_moments["m00"]
         center_v = hot_y1 + seed_moments["m01"]/seed_moments["m00"]
 
-        # The LAB hotspot defines the one and only working ROI. Do not recrop around
-        # the fragmented HSV component, because that can shift/shrink the refinement
-        # ROI toward one side of a close ball.
+        # The LAB hotspot remains the working ROI so a fragmented HSV component
+        # cannot shrink or shift the refinement ROI toward one side of the ball.
         x1, y1, x2, y2 = hot_x1, hot_y1, hot_x2, hot_y2
         color_roi = roi_frame
-
-        # Use the larger of the HSV seed and LAB hotspot extents as the radial reach.
-        # The hotspot size prevents a partial HSV seed from artificially shrinking the
-        # maximum radius available to the LAB-gradient refinement.
         seed_size = max(w, h, hot_w, hot_h)
-        seed_area = float(np.count_nonzero(seed_mask))
 
+        # Step 4: Compute LAB-gradient strength. Blur all three LAB channels in one
+        # call and compute x/y Sobel gradients on the full 3-channel image.
         lab_roi = cv2.cvtColor(color_roi, cv2.COLOR_BGR2LAB)
-        l_roi, a_roi, b_roi = cv2.split(lab_roi)
 
-        l_roi = cv2.GaussianBlur(l_roi, (3, 3), 0).astype(np.float32)
-        a_roi = cv2.GaussianBlur(a_roi, (3, 3), 0).astype(np.float32)
-        b_roi = cv2.GaussianBlur(b_roi, (3, 3), 0).astype(np.float32)
+        # ----- OPTIONAL ROI LAB 3x3 BLUR START: comment/uncomment freely -----
+        lab_roi = cv2.GaussianBlur(lab_roi, (3, 3), 0)
+        # ----- OPTIONAL ROI LAB 3x3 BLUR END ---------------------------------
 
-        grad_lu = cv2.Sobel(l_roi, cv2.CV_32F, 1, 0, ksize=3)
-        grad_lv = cv2.Sobel(l_roi, cv2.CV_32F, 0, 1, ksize=3)
-        grad_au = cv2.Sobel(a_roi, cv2.CV_32F, 1, 0, ksize=3)
-        grad_av = cv2.Sobel(a_roi, cv2.CV_32F, 0, 1, ksize=3)
-        grad_bu = cv2.Sobel(b_roi, cv2.CV_32F, 1, 0, ksize=3)
-        grad_bv = cv2.Sobel(b_roi, cv2.CV_32F, 0, 1, ksize=3)
+        lab_roi = lab_roi.astype(np.float32)
+        grad_u = cv2.Sobel(lab_roi, cv2.CV_32F, 1, 0, ksize=3)
+        grad_v = cv2.Sobel(lab_roi, cv2.CV_32F, 0, 1, ksize=3)
 
         lab_edge_strength = np.sqrt(
-            grad_lu*grad_lu + grad_lv*grad_lv +
-            LAB_CHROMA_GRADIENT_GAIN*(grad_au*grad_au + grad_av*grad_av + grad_bu*grad_bu + grad_bv*grad_bv)
+            grad_u[:, :, 0]**2 + grad_v[:, :, 0]**2 +
+            LAB_CHROMA_GRADIENT_GAIN*(grad_u[:, :, 1]**2 + grad_v[:, :, 1]**2 + grad_u[:, :, 2]**2 + grad_v[:, :, 2]**2)
         )
 
-        # Keep the complete loose-HSV mask as the radial seed instead of filling only
-        # the largest connected component. This lets both sides of a seam/glare split
-        # contribute expected radii while the LAB gradient finds the actual boundary.
         seed_roi = seed_mask.copy()
 
         if debug is not None:
-            roi_frame = frame.copy()
-            cv2.drawContours(roi_frame, [seed_contour], -1, (0, 255, 255), 1)
-            cv2.rectangle(roi_frame, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
-            debug.addStage(f"Candidate {candidate_index} ROI", roi_frame)
-
-            edge_strength_debug = cv2.normalize(lab_edge_strength, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-            debug.addStage(f"Candidate {candidate_index} LAB edge strength", edge_strength_debug)
+            roi_debug = frame.copy()
+            cv2.rectangle(roi_debug, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
+            debug.addStage(f"Candidate {candidate_index} ROI", roi_debug)
+            debug.addStage(f"Candidate {candidate_index} LAB edge strength",
+                           cv2.normalize(lab_edge_strength, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8))
 
         # Step 5: Generate radial samples around the candidate center.
         center_roi_u, center_roi_v = center_u - x1, center_v - y1
@@ -482,11 +444,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         sample_u = np.rint(center_roi_u + directions_u*radii).astype(np.int32)
         sample_v = np.rint(center_roi_v + directions_v*radii).astype(np.int32)
-
-        valid = (
-            (sample_u >= 0) & (sample_u < seed_roi.shape[1]) &
-            (sample_v >= 0) & (sample_v < seed_roi.shape[0])
-        )
+        valid = (sample_u >= 0) & (sample_u < seed_roi.shape[1]) & (sample_v >= 0) & (sample_v < seed_roi.shape[0])
 
         safe_u = np.clip(sample_u, 0, seed_roi.shape[1] - 1)
         safe_v = np.clip(sample_v, 0, seed_roi.shape[0] - 1)
@@ -495,18 +453,13 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         seed_hits = (seed_roi[safe_v, safe_u] != 0) & valid
         expected_radii = np.where(seed_hits, radius_grid, 0).max(axis=1)
 
-        # Step 7: Refine the approximate HSV boundary using the strongest nearby
-        # combined LAB gradient on each ray. Using the strongest gradient avoids the
-        # inward-radius bias that can occur when a thick binary edge band is sampled
-        # by simply taking its first pixel.
+        # Step 7: Find the strongest nearby LAB gradient on each ray.
         search_before = 3
         search_after = np.maximum(5, (0.20*expected_radii).astype(np.int32))
-
         search_band = (
             (radius_grid >= (expected_radii - search_before)[:, None]) &
             (radius_grid <= (expected_radii + search_after)[:, None]) &
-            (expected_radii[:, None] > 0) &
-            valid
+            (expected_radii[:, None] > 0) & valid
         )
 
         sampled_edge_strength = lab_edge_strength[safe_v, safe_u]
@@ -526,11 +479,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         ray_indices = np.flatnonzero(rays_with_edge)
         edge_indices = best_edge_indices[rays_with_edge]
-
-        boundary_points = np.column_stack((
-            sample_u[ray_indices, edge_indices] + x1,
-            sample_v[ray_indices, edge_indices] + y1,
-        )).astype(np.float64)
+        boundary_points = np.column_stack((sample_u[ray_indices, edge_indices] + x1, sample_v[ray_indices, edge_indices] + y1)).astype(np.float64)
 
         if debug is not None:
             boundary_frame = frame.copy()
@@ -542,8 +491,8 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         # Step 8: Fit the initial circle.
         A = np.column_stack((2*boundary_points[:, 0], 2*boundary_points[:, 1], np.ones(len(boundary_points))))
-        b = boundary_points[:, 0]**2 + boundary_points[:, 1]**2
-        circle_u, circle_v, c = np.linalg.lstsq(A, b, rcond=None)[0]
+        b_fit = boundary_points[:, 0]**2 + boundary_points[:, 1]**2
+        circle_u, circle_v, c = np.linalg.lstsq(A, b_fit, rcond=None)[0]
         radius = np.sqrt(max(0.0, c + circle_u**2 + circle_v**2))
 
         if radius <= 0.0:
@@ -563,24 +512,20 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         if len(inlier_points) < MIN_BOUNDARY_POINTS:
             if debug is not None:
                 failure_frame = frame.copy()
-
                 for point_u, point_v in boundary_points:
                     cv2.circle(failure_frame, (int(round(point_u)), int(round(point_v))), 2, (100, 100, 100), -1)
-
                 for point_u, point_v in inlier_points:
                     cv2.circle(failure_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
-
                 cv2.putText(failure_frame, f"REJECTED: circle inliers {len(inlier_points)}/{len(boundary_points)}", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
                 cv2.putText(failure_frame, f"Residual limit: {residual_limit:.2f}px", (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
                 debug.addStage(f"Candidate {candidate_index} rejected - circle inliers", failure_frame)
-
             continue
 
         A = np.column_stack((2*inlier_points[:, 0], 2*inlier_points[:, 1], np.ones(len(inlier_points))))
-        b = inlier_points[:, 0]**2 + inlier_points[:, 1]**2
-        circle_u, circle_v, c = np.linalg.lstsq(A, b, rcond=None)[0]
+        b_fit = inlier_points[:, 0]**2 + inlier_points[:, 1]**2
+        circle_u, circle_v, c = np.linalg.lstsq(A, b_fit, rcond=None)[0]
         radius = np.sqrt(max(0.0, c + circle_u**2 + circle_v**2))
 
         if radius <= 0.0:
@@ -605,111 +550,71 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
                 debug.addStage(f"Candidate {candidate_index} rejected - angular coverage", failure_frame)
             continue
 
-        
-        # Step 11: Require the refined circle to remain reasonably consistent
-        # with the rough size and center estimated from the HSV candidate.
+        # Step 11: Keep the refined circle consistent with the rough HSV center.
         center_displacement = np.hypot(circle_u - center_u, circle_v - center_v)
         max_center_displacement = max(MIN_MAX_CENTER_SHIFT_PX, MAX_CENTER_SHIFT_FACTOR*radius)
 
         if center_displacement > max_center_displacement:
             if debug is not None:
                 failure_frame = frame.copy()
-
                 cv2.circle(failure_frame, (int(round(center_u)), int(round(center_v))), 4, (0, 255, 255), -1)
                 cv2.circle(failure_frame, (int(round(circle_u)), int(round(circle_v))), 4, (0, 0, 255), -1)
-                cv2.line(
-                    failure_frame,
-                    (int(round(center_u)), int(round(center_v))),
-                    (int(round(circle_u)), int(round(circle_v))),
-                    (0, 0, 255), 1,
-                )
-
+                cv2.line(failure_frame, (int(round(center_u)), int(round(center_v))),
+                         (int(round(circle_u)), int(round(circle_v))), (0, 0, 255), 1)
                 cv2.putText(failure_frame, f"REJECTED: center shift {center_displacement:.1f}px", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
                 cv2.putText(failure_frame, f"Maximum: {max_center_displacement:.1f}px", (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-
                 debug.addStage(f"Candidate {candidate_index} rejected - center shift", failure_frame)
-
             continue
 
         # Step 12: Score candidates that passed every geometric validation check.
         final_point_radii = np.hypot(inlier_points[:, 0] - circle_u, inlier_points[:, 1] - circle_v)
         mean_residual = np.mean(np.abs(final_point_radii - radius))
-
         coverage_score = covered_angle_bins/NUM_ANGLE_BINS
         support_score = len(inlier_points)/NUM_RAYS
         residual_score = 1.0/(1.0 + mean_residual/max(radius, 1.0))
+        final_score = 0.40*coverage_score + 0.30*support_score + 0.20*residual_score
 
-        final_score = (
-            0.40*coverage_score +
-            0.30*support_score +
-            0.20*residual_score 
-        )
-
-        # Reaching this point means the candidate passed every rejection gate.
         if debug is not None:
             passed_frame = frame.copy()
-
             for point_u, point_v in inlier_points:
                 cv2.circle(passed_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
-
-            cv2.circle(
-                passed_frame,
-                (int(round(circle_u)), int(round(circle_v))),
-                int(round(radius)),
-                (0, 255, 0), 1,
-            )
-
+            cv2.circle(passed_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 1)
             cv2.putText(passed_frame, f"PASSED candidate {candidate_index}", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
             cv2.putText(passed_frame, f"score: {final_score:.3f}", (10, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(
-                passed_frame,
-                f"boundary={len(boundary_points)} | inliers={len(inlier_points)} | coverage={covered_angle_bins}/{NUM_ANGLE_BINS}",
-                (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2, cv2.LINE_AA,
-            )
-
+            cv2.putText(passed_frame, f"boundary={len(boundary_points)} | inliers={len(inlier_points)} | coverage={covered_angle_bins}/{NUM_ANGLE_BINS}",
+                        (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2, cv2.LINE_AA)
             debug.addStage(f"Candidate {candidate_index} passed", passed_frame)
 
         if final_score > best_final_score:
             best_final_score = final_score
-            best_result = (
-                candidate_index,
-                float(circle_u), float(circle_v), float(radius),
-                inlier_points, covered_angle_bins, float(final_score),
-            )
+            best_result = candidate_index, float(circle_u), float(circle_v), float(radius), inlier_points, covered_angle_bins, float(final_score)
 
     if best_result is None:
         return None
 
-    # Step 13: Build the final Detection from the best validated sphere candidate.
+    # Step 13: Build the Detection from the best validated sphere candidate.
     best_candidate_index, circle_u, circle_v, radius, inlier_points, covered_angle_bins, final_score = best_result
     diameter = 2.0*radius
-    ellipse_px = ((circle_u, circle_v), (diameter, diameter), 0.0)
-
     color_id = object_vision_spec.color_ids[0] if object_vision_spec.color_ids else None
-    shape = ShapeDetection(vertices_px=None, color_id=color_id, num_sides=0, ellipse_px=ellipse_px)
+    shape = ShapeDetection(vertices_px=None, color_id=color_id, num_sides=0, ellipse_px=((circle_u, circle_v), (diameter, diameter), 0.0))
     detection = Detection(u=circle_u, v=circle_v, px_w=diameter, px_h=diameter, shapes=[shape])
 
     if debug is not None:
         success_frame = frame.copy()
-
         for point_u, point_v in inlier_points:
             cv2.circle(success_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
-
         cv2.circle(success_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 1)
-
         cv2.putText(success_frame, f"BEST candidate {best_candidate_index}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.putText(success_frame, f"inliers={len(inlier_points)} | coverage={covered_angle_bins}/{NUM_ANGLE_BINS}", (10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
-
         debug.addStage(f"Best candidate {best_candidate_index}", success_frame)
 
     return detection
-
 
 
 # Tennis-ball path: threshold configured colors, clean the mask, and use the largest valid blob.
