@@ -226,16 +226,10 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     MIN_MAX_CENTER_SHIFT_PX = 2.5
 
     GLOBAL_BLUR_KERNEL = (5, 5)
+    HOTSPOT_PERCENTILE = 98.5
+    MIN_HOTSPOT_RESPONSE_FACTOR = 0.30
     MIN_HOTSPOT_AREA_PX = 6
     HOTSPOT_PADDING_FACTOR = 0.35
-
-    # Experimental LAB candidate selection:
-    # - direction similarity ignores chroma magnitude, so dim/desaturated versions
-    #   of the same green can still score highly;
-    # - the separate chroma-strength gate prevents nearly gray pixels from having
-    #   an unstable/meaningless chroma direction.
-    MIN_CHROMA_STRENGTH_FACTOR = 0.10  # TODO: tune; 0.10 ~= 8 LAB chroma units for the current tennis green.
-    MIN_LAB_DIRECTION_SIMILARITY = 0.85  # TODO: tune; 1.0 = exact configured chroma direction.
 
     LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 40, 15], dtype=np.int16)
 
@@ -244,7 +238,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     MIN_SECONDARY_SEED_AREA_FACTOR = 0.15
     MAX_SECONDARY_SEED_DISTANCE_FACTOR = 1.25
 
-    # Step 1: Get the target LAB chroma direction and reference chroma magnitude
+    # Step 1: Get the target LAB chroma direction and reference chroma strength
     # directly from ColorSpec.
     lab_direction = np.zeros(2, dtype=np.float32)
     reference_chroma_strengths = []
@@ -268,7 +262,6 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     lab_direction /= lab_direction_norm
     lab_a_direction, lab_b_direction = float(lab_direction[0]), float(lab_direction[1])
     reference_chroma_strength = float(np.mean(reference_chroma_strengths))
-    minimum_chroma_strength = MIN_CHROMA_STRENGTH_FACTOR*reference_chroma_strength
 
     blurred_frame = frame
 
@@ -280,25 +273,15 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     _, a_u8, b_u8 = cv2.split(lab_frame)
     a, b = a_u8.astype(np.float32) - 128.0, b_u8.astype(np.float32) - 128.0
 
-    # EXPERIMENT: compare chroma DIRECTION rather than raw projection magnitude.
-    # The result is approximately cosine similarity in LAB a-b space:
-    #   +1 = same chroma direction as configured tennis green
-    #    0 = unrelated/perpendicular direction
-    #   -1 = opposite chroma direction
-    chroma_strength = np.hypot(a, b)
-    lab_color_response = (a*lab_a_direction + b*lab_b_direction)/(chroma_strength + 1e-6)
-
-    # Pixels with very little chroma have an unreliable direction, so they are
-    # excluded separately rather than being penalized inside the similarity value.
-    chroma_valid = chroma_strength >= minimum_chroma_strength
-    hotspot_mask = (
-        chroma_valid &
-        (lab_color_response >= MIN_LAB_DIRECTION_SIMILARITY)
-    ).astype(np.uint8)*255
-
-    # Candidate ranking uses normalized direction similarity too; chroma magnitude
-    # does not get reintroduced here.
+    lab_color_response = a*lab_a_direction + b*lab_b_direction
     positive_response = np.maximum(lab_color_response, 0.0)
+
+    # Require LAB response to be both exceptional within the frame and sufficiently
+    # strong in absolute terms relative to the configured target chroma.
+    minimum_hotspot_response = MIN_HOTSPOT_RESPONSE_FACTOR*reference_chroma_strength
+    percentile_hotspot_response = float(np.percentile(positive_response, HOTSPOT_PERCENTILE))
+    hotspot_threshold = max(minimum_hotspot_response, percentile_hotspot_response)
+    hotspot_mask = (positive_response >= hotspot_threshold).astype(np.uint8)*255
 
     hotspot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
@@ -311,16 +294,8 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     if debug is not None:
         debug.stages.clear()
         debug.addStage("Original", frame)
-
-        # Black = opposite target direction, gray = unrelated, white = same direction.
-        response_debug = np.clip(127.5*(lab_color_response + 1.0), 0, 255).astype(np.uint8)
-        debug.addStage("LAB chroma direction similarity", response_debug)
-
-        # Separate diagnostic showing chroma magnitude. This lets us distinguish
-        # "wrong color" from "correct direction but too little chroma".
-        chroma_debug = cv2.normalize(chroma_strength, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-        debug.addStage("LAB chroma strength", chroma_debug)
-
+        response_debug = np.clip(128.0 + 4.0*lab_color_response, 0, 255).astype(np.uint8)
+        debug.addStage("LAB color response from ColorSpec LAB", response_debug)
         debug.addStage("LAB hotspot mask", hotspot_mask)
 
     # Step 2: Convert the strongest LAB-response regions into candidate ROIs.
@@ -373,7 +348,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         for candidate_index, (score, area, x, y, w, h, mean_response) in enumerate(candidates, start=1):
             cv2.rectangle(candidate_frame, (x, y), (x + w, y + h), (0, 255, 255), 1)
-            cv2.putText(candidate_frame, f"{candidate_index}: area={area} sim={mean_response:.2f} score={score:.2f}",
+            cv2.putText(candidate_frame, f"{candidate_index}: area={area} resp={mean_response:.1f} score={score:.1f}",
                         (x, max(15, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 255), 1, cv2.LINE_AA)
 
         debug.addStage("LAB hotspot candidates", candidate_frame)
@@ -408,7 +383,6 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         for seed_label in range(1, num_seed_labels):
             seed_area = int(seed_stats[seed_label, cv2.CC_STAT_AREA])
-
             if seed_area < object_vision_spec.minimum_contour_area_px:
                 continue
 
@@ -625,6 +599,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
             continue
 
         if debug is not None:
+            # Diagnostic 1: HSV expected boundary vs LAB-selected peaks.
             comparison_frame = frame.copy()
 
             for ray_index in np.flatnonzero(expected_radii > 0):
@@ -641,6 +616,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
             debug.addStage(f"Candidate {candidate_index} HSV vs LAB", comparison_frame)
 
+            # Diagnostic 2: Initial least-squares fit using every LAB boundary point.
             initial_fit_frame = frame.copy()
 
             for point_u, point_v in boundary_points:
@@ -655,6 +631,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
             debug.addStage(f"Candidate {candidate_index} initial circle fit", initial_fit_frame)
 
+            # Diagnostic 3: Show only which LAB points survive residual filtering.
             rejection_frame = frame.copy()
 
             for point_u, point_v in inlier_points:
@@ -669,6 +646,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
             debug.addStage(f"Candidate {candidate_index} circle point rejection", rejection_frame)
 
+            # Diagnostic 4: Final circle using only retained LAB points.
             final_fit_frame = frame.copy()
 
             for point_u, point_v in inlier_points:
