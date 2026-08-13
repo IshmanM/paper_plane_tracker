@@ -630,7 +630,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     # Inside each hotspot ROI, loosen the ColorSpec HSV range only for rough
     # acquisition. From that point onward, use the same seed -> tight ROI ->
     # LAB-gradient radial refinement as the HSV-dominated version.
-    LOOSE_HSV_LOWER_SUBTRACTION = np.array([7, 17, 20], dtype=np.int16)
+    LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 50, 15], dtype=np.int16)
 
     # Step 1: Derive the target LAB chroma direction from the HSV range(s) already
     # stored in ColorSpec, then build a continuous full-frame LAB response along that
@@ -1009,25 +1009,8 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         
         # Step 11: Require the refined circle to remain reasonably consistent
         # with the rough size and center estimated from the HSV candidate.
-        seed_radius = np.sqrt(seed_area/np.pi)
         center_displacement = np.hypot(circle_u - center_u, circle_v - center_v)
         max_center_displacement = max(MIN_MAX_CENTER_SHIFT_PX, MAX_CENTER_SHIFT_FACTOR*radius)
-
-        if radius < 0.70*seed_radius or radius > 1.40*seed_radius:
-            if debug is not None:
-                failure_frame = frame.copy()
-                cv2.circle(failure_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 0, 255), 1)
-
-                cv2.putText(failure_frame, f"REJECTED: radius {radius:.1f}px", (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-                cv2.putText(failure_frame, f"HSV seed radius: {seed_radius:.1f}px", (10, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-                cv2.putText(failure_frame, f"Allowed: {0.70*seed_radius:.1f}-{1.40*seed_radius:.1f}px", (10, 75),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-
-                debug.addStage(f"Candidate {candidate_index} rejected - radius", failure_frame)
-
-            continue
 
         if center_displacement > max_center_displacement:
             if debug is not None:
@@ -1058,13 +1041,11 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         coverage_score = covered_angle_bins/NUM_ANGLE_BINS
         support_score = len(inlier_points)/NUM_RAYS
         residual_score = 1.0/(1.0 + mean_residual/max(radius, 1.0))
-        hsv_fill_ratio = min(1.0, seed_area/(np.pi*radius*radius))
 
         final_score = (
             0.40*coverage_score +
             0.30*support_score +
-            0.20*residual_score +
-            0.10*hsv_fill_ratio
+            0.20*residual_score 
         )
 
         # Reaching this point means the candidate passed every rejection gate.
