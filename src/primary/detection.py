@@ -318,8 +318,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
     candidates.sort(key=lambda candidate: candidate[0], reverse=True)
 
-    # Keep spatially distinct hotspots. Separate bright regions caused by the white
-    # tennis-ball seam/glare should count as one physical candidate.
+    # Keep spatially distinct hotspots.
     selected_candidates = []
 
     for candidate in candidates:
@@ -384,7 +383,6 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         for seed_label in range(1, num_seed_labels):
             seed_area = int(seed_stats[seed_label, cv2.CC_STAT_AREA])
-
             if seed_area < object_vision_spec.minimum_contour_area_px:
                 continue
 
@@ -402,7 +400,6 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         seed_area, seed_label, sx, sy, sw, sh = best_seed
         x, y, w, h = hot_x1 + sx, hot_y1 + sy, sw, sh
 
-        # Contour extraction is visualization-only, so skip it when debug=None.
         if debug is not None:
             component_mask = (seed_labels[sy:sy + sh, sx:sx + sw] == seed_label).astype(np.uint8)*255
             local_contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -417,8 +414,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
             debug.addStage(f"Candidate {candidate_index} loose HSV seed mask - raw", seed_mask)
 
         # Step 4: Keep the primary HSV component plus only substantial nearby
-        # components. This preserves seam/glare-separated ball regions without
-        # allowing tiny HSV speckles to distort the radial boundary estimate.
+        # components so small HSV speckles do not distort radial geometry.
         seed_center_x, seed_center_y = sx + 0.5*sw, sy + 0.5*sh
         min_secondary_area = MIN_SECONDARY_SEED_AREA_FACTOR*seed_area
         max_secondary_distance_sq = (MAX_SECONDARY_SEED_DISTANCE_FACTOR*max(sw, sh))**2
@@ -453,8 +449,6 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         center_u = hot_x1 + seed_moments["m10"]/seed_moments["m00"]
         center_v = hot_y1 + seed_moments["m01"]/seed_moments["m00"]
 
-        # The LAB hotspot remains the working ROI so a fragmented HSV component
-        # cannot shrink or shift refinement toward one side of the sphere.
         x1, y1, x2, y2 = hot_x1, hot_y1, hot_x2, hot_y2
         color_roi = roi_frame
         seed_size = max(w, h, hot_w, hot_h)
@@ -503,15 +497,12 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         seed_hits = (seed_roi[safe_v, safe_u] != 0) & valid
         expected_radii = np.where(seed_hits, radius_grid, 0).max(axis=1)
 
-        # Keep the HSV boundary points for diagnostic comparison with the LAB peaks.
         hsv_expected_points = np.column_stack((
             center_u + directions_u[:, 0]*expected_radii,
             center_v + directions_v[:, 0]*expected_radii,
         ))
 
-        # Step 8: Refine each HSV estimate with the strongest nearby LAB gradient.
-        # This is the original LAB peak-selection approach: there is no artificial
-        # inward/outward offset and no walking across the finite-width Sobel band.
+        # Step 8: Refine each HSV estimate using the strongest nearby LAB gradient.
         search_before = 3
         search_after = np.maximum(5, (0.20*expected_radii).astype(np.int32))
         search_band = (
@@ -537,7 +528,6 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         ray_indices = np.flatnonzero(rays_with_edge)
         edge_indices = best_edge_indices[rays_with_edge]
-
         boundary_points = np.column_stack((
             sample_u[ray_indices, edge_indices] + x1,
             sample_v[ray_indices, edge_indices] + y1,
@@ -553,13 +543,13 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
             debug.addStage(f"Candidate {candidate_index} boundary points", boundary_frame)
 
-        # Step 9: Fit the initial circle.
+        # Step 9: Fit the initial circle to all selected LAB boundary points.
         A = np.column_stack((2*boundary_points[:, 0], 2*boundary_points[:, 1], np.ones(len(boundary_points))))
         b_fit = boundary_points[:, 0]**2 + boundary_points[:, 1]**2
-        circle_u, circle_v, c = np.linalg.lstsq(A, b_fit, rcond=None)[0]
-        radius = np.sqrt(max(0.0, c + circle_u**2 + circle_v**2))
+        initial_circle_u, initial_circle_v, c = np.linalg.lstsq(A, b_fit, rcond=None)[0]
+        initial_radius = np.sqrt(max(0.0, c + initial_circle_u**2 + initial_circle_v**2))
 
-        if radius <= 0.0:
+        if initial_radius <= 0.0:
             if debug is not None:
                 failure_frame = frame.copy()
                 cv2.putText(failure_frame, "REJECTED: invalid initial circle radius", (10, 25),
@@ -567,22 +557,25 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
                 debug.addStage(f"Candidate {candidate_index} rejected - initial circle", failure_frame)
             continue
 
-        # Step 10: Remove inconsistent boundary points and refit.
-        point_radii = np.hypot(boundary_points[:, 0] - circle_u, boundary_points[:, 1] - circle_v)
-        residuals = np.abs(point_radii - radius)
+        # Step 10: Remove LAB points inconsistent with the initial circle.
+        point_radii = np.hypot(boundary_points[:, 0] - initial_circle_u, boundary_points[:, 1] - initial_circle_v)
+        residuals = np.abs(point_radii - initial_radius)
         residual_limit = max(2.0, 2.5*np.median(residuals))
-        inlier_points = boundary_points[residuals <= residual_limit]
+        inlier_mask = residuals <= residual_limit
+        inlier_points = boundary_points[inlier_mask]
+        rejected_points = boundary_points[~inlier_mask]
 
         if len(inlier_points) < MIN_BOUNDARY_POINTS:
             if debug is not None:
                 failure_frame = frame.copy()
 
-                for point_u, point_v in boundary_points:
-                    cv2.circle(failure_frame, (int(round(point_u)), int(round(point_v))), 2, (100, 100, 100), -1)
-
+                for point_u, point_v in rejected_points:
+                    cv2.circle(failure_frame, (int(round(point_u)), int(round(point_v))), 2, (0, 0, 255), -1)
                 for point_u, point_v in inlier_points:
                     cv2.circle(failure_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
 
+                cv2.circle(failure_frame, (int(round(initial_circle_u)), int(round(initial_circle_v))),
+                           int(round(initial_radius)), (255, 0, 0), 1)
                 cv2.putText(failure_frame, f"REJECTED: circle inliers {len(inlier_points)}/{len(boundary_points)}", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
                 cv2.putText(failure_frame, f"Residual limit: {residual_limit:.2f}px", (10, 50),
@@ -591,6 +584,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
             continue
 
+        # Refit using only retained LAB boundary points.
         A = np.column_stack((2*inlier_points[:, 0], 2*inlier_points[:, 1], np.ones(len(inlier_points))))
         b_fit = inlier_points[:, 0]**2 + inlier_points[:, 1]**2
         circle_u, circle_v, c = np.linalg.lstsq(A, b_fit, rcond=None)[0]
@@ -604,29 +598,69 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
                 debug.addStage(f"Candidate {candidate_index} rejected - refined circle", failure_frame)
             continue
 
-        # Diagnostic: compare the HSV-predicted boundary, selected LAB gradient
-        # peaks, and the final circle fitted to the LAB points.
         if debug is not None:
+            # Diagnostic 1: HSV expected boundary vs LAB-selected peaks.
             comparison_frame = frame.copy()
 
-            # Cyan = outermost loose-HSV pixel along each radial ray.
             for ray_index in np.flatnonzero(expected_radii > 0):
                 point_u, point_v = hsv_expected_points[ray_index]
-                cv2.circle(comparison_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 255, 0), -1)
+                cv2.circle(comparison_frame, (int(round(point_u)), int(round(point_v))), 1, (255, 255, 0), -1)
 
-            # Magenta = strongest valid LAB gradient selected near the HSV boundary.
             for point_u, point_v in boundary_points:
-                cv2.circle(comparison_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
+                cv2.circle(comparison_frame, (int(round(point_u)), int(round(point_v))), 1, (255, 0, 255), -1)
 
-            # Green = final circle after residual rejection and refitting.
-            cv2.circle(comparison_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 1)
-
-            cv2.putText(comparison_frame, "Cyan=HSV | Magenta=LAB peak | Green=refit", (10, 25),
+            cv2.putText(comparison_frame, "Cyan=HSV | Magenta=LAB peak", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(comparison_frame, "Cyan=HSV | Magenta=LAB peak | Green=refit", (10, 25),
+            cv2.putText(comparison_frame, "Cyan=HSV | Magenta=LAB peak", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
 
-            debug.addStage(f"Candidate {candidate_index} HSV vs LAB vs fit", comparison_frame)
+            debug.addStage(f"Candidate {candidate_index} HSV vs LAB", comparison_frame)
+
+            # Diagnostic 2: Initial least-squares fit using every LAB boundary point.
+            initial_fit_frame = frame.copy()
+
+            for point_u, point_v in boundary_points:
+                cv2.circle(initial_fit_frame, (int(round(point_u)), int(round(point_v))), 1, (180, 180, 180), -1)
+
+            cv2.circle(initial_fit_frame, (int(round(initial_circle_u)), int(round(initial_circle_v))),
+                       int(round(initial_radius)), (255, 0, 0), 1)
+
+            text = f"Initial fit: r={initial_radius:.2f}px | points={len(boundary_points)}"
+            cv2.putText(initial_fit_frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(initial_fit_frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+
+            debug.addStage(f"Candidate {candidate_index} initial circle fit", initial_fit_frame)
+
+            # Diagnostic 3: Show only which LAB points survive residual filtering.
+            rejection_frame = frame.copy()
+
+            for point_u, point_v in inlier_points:
+                cv2.circle(rejection_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
+
+            for point_u, point_v in rejected_points:
+                cv2.circle(rejection_frame, (int(round(point_u)), int(round(point_v))), 2, (0, 0, 255), -1)
+
+            text = f"Magenta=inlier | Red=rejected ({len(rejected_points)}/{len(boundary_points)})"
+            cv2.putText(rejection_frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(rejection_frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+
+            debug.addStage(f"Candidate {candidate_index} circle point rejection", rejection_frame)
+
+            # Diagnostic 4: Final circle using only retained LAB points.
+            final_fit_frame = frame.copy()
+
+            for point_u, point_v in inlier_points:
+                cv2.circle(final_fit_frame, (int(round(point_u)), int(round(point_v))), 1, (255, 0, 255), -1)
+
+            cv2.circle(final_fit_frame, (int(round(circle_u)), int(round(circle_v))),
+                       int(round(radius)), (0, 255, 0), 1)
+
+            radius_change = radius - initial_radius
+            text = f"Final fit: r={radius:.2f}px | delta={radius_change:+.2f}px | inliers={len(inlier_points)}"
+            cv2.putText(final_fit_frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 0), 3, cv2.LINE_AA)
+            cv2.putText(final_fit_frame, text, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 255, 255), 1, cv2.LINE_AA)
+
+            debug.addStage(f"Candidate {candidate_index} final circle fit", final_fit_frame)
 
         # Step 11: Require boundary evidence around most of the fitted circle.
         point_angles = np.arctan2(inlier_points[:, 1] - circle_v, inlier_points[:, 0] - circle_u)
@@ -712,7 +746,6 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         debug.addStage(f"Best candidate {best_candidate_index}", success_frame)
 
     return detection
-
 
 
 # Tennis-ball path: threshold configured colors, clean the mask, and use the largest valid blob.
