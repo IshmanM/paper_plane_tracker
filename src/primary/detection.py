@@ -603,6 +603,7 @@ def drawModelOrigin(frame: np.ndarray, measurement: Measurement, camera_calibrat
 
 #lab version
 
+
 def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, debug: DetectionDebug | None = None) -> Detection | None:
     if not object_vision_spec.color_ids:
         raise ValueError("Sphere detection requires at least one color_id")
@@ -616,6 +617,8 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     MIN_BOUNDARY_POINTS = 20
     LAB_CHROMA_GRADIENT_GAIN = 2.0
     MIN_LAB_EDGE_STRENGTH = 35.0
+    MAX_CENTER_SHIFT_FACTOR = 0.40
+    MIN_MAX_CENTER_SHIFT_PX = 2.5
 
     # Global yellow-green hotspot stage.
     GLOBAL_BLUR_KERNEL = (5, 5)
@@ -983,6 +986,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         # with the rough size and center estimated from the HSV candidate.
         seed_radius = np.sqrt(seed_area/np.pi)
         center_displacement = np.hypot(circle_u - center_u, circle_v - center_v)
+        max_center_displacement = max(MIN_MAX_CENTER_SHIFT_PX, MAX_CENTER_SHIFT_FACTOR*radius)
 
         if radius < 0.70*seed_radius or radius > 1.40*seed_radius:
             if debug is not None:
@@ -1000,7 +1004,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
             continue
 
-        if center_displacement > 0.40*radius:
+        if center_displacement > max_center_displacement:
             if debug is not None:
                 failure_frame = frame.copy()
 
@@ -1015,7 +1019,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
                 cv2.putText(failure_frame, f"REJECTED: center shift {center_displacement:.1f}px", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-                cv2.putText(failure_frame, f"Maximum: {0.40*radius:.1f}px", (10, 50),
+                cv2.putText(failure_frame, f"Maximum: {max_center_displacement:.1f}px", (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
 
                 debug.addStage(f"Candidate {candidate_index} rejected - center shift", failure_frame)
@@ -1067,6 +1071,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         if final_score > best_final_score:
             best_final_score = final_score
             best_result = (
+                candidate_index,
                 float(circle_u), float(circle_v), float(radius),
                 inlier_points, covered_angle_bins, float(final_score),
             )
@@ -1075,7 +1080,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         return None
 
     # Step 13: Build the final Detection from the best validated sphere candidate.
-    circle_u, circle_v, radius, inlier_points, covered_angle_bins, final_score = best_result
+    best_candidate_index, circle_u, circle_v, radius, inlier_points, covered_angle_bins, final_score = best_result
     diameter = 2.0*radius
     ellipse_px = ((circle_u, circle_v), (diameter, diameter), 0.0)
 
@@ -1091,15 +1096,14 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         cv2.circle(success_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 1)
 
-        cv2.putText(success_frame, f"PASSED candidate {candidate_index}", (10, 25),
+        cv2.putText(success_frame, f"BEST candidate {best_candidate_index}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
         cv2.putText(success_frame, f"inliers={len(inlier_points)} | coverage={covered_angle_bins}/{NUM_ANGLE_BINS}", (10, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
 
-        debug.addStage(f"Candidate {candidate_index} passed", success_frame)
+        debug.addStage(f"Best candidate {best_candidate_index}", success_frame)
 
     return detection
-
 
 
 # Tennis-ball path: threshold configured colors, clean the mask, and use the largest valid blob.
