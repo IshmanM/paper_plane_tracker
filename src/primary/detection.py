@@ -707,7 +707,36 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         return None
 
     candidates.sort(key=lambda candidate: candidate[0], reverse=True)
-    candidates = candidates[:MAX_SPHERE_CANDIDATES]
+
+    # Keep up to MAX_SPHERE_CANDIDATES spatially distinct hotspots. A close tennis
+    # ball can produce multiple bright LAB regions separated by its white seam/glare;
+    # those should count as one physical candidate rather than competing separately.
+    selected_candidates = []
+
+    for candidate in candidates:
+        _, _, x, y, w, h, _ = candidate
+        center_x, center_y = x + 0.5*w, y + 0.5*h
+        duplicate = False
+
+        for selected_candidate in selected_candidates:
+            _, _, selected_x, selected_y, selected_w, selected_h, _ = selected_candidate
+            selected_center_x = selected_x + 0.5*selected_w
+            selected_center_y = selected_y + 0.5*selected_h
+
+            center_distance = np.hypot(center_x - selected_center_x, center_y - selected_center_y)
+            duplicate_distance = 0.75*max(w, h, selected_w, selected_h)
+
+            if center_distance < duplicate_distance:
+                duplicate = True
+                break
+
+        if not duplicate:
+            selected_candidates.append(candidate)
+
+        if len(selected_candidates) >= MAX_SPHERE_CANDIDATES:
+            break
+
+    candidates = selected_candidates
 
     if debug is not None:
         candidate_frame = frame.copy()
@@ -791,34 +820,29 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
             debug.addStage(f"Candidate {candidate_index} loose HSV seed mask", seed_mask)
             debug.addStage(f"Candidate {candidate_index} selected HSV seed", seed_debug)
 
-        moments = cv2.moments(seed_contour)
+        # Use all loose-HSV pixels inside the hotspot ROI for the rough center and
+        # radial seed. This preserves separated ball regions when glare/white seams
+        # split the HSV mask into multiple connected components.
+        seed_moments = cv2.moments(seed_mask, binaryImage=True)
 
-        if moments["m00"] == 0:
+        if seed_moments["m00"] == 0:
             continue
 
-        center_u = moments["m10"]/moments["m00"]
-        center_v = moments["m01"]/moments["m00"]
-        seed_size = max(w, h)
+        center_u = hot_x1 + seed_moments["m10"]/seed_moments["m00"]
+        center_v = hot_y1 + seed_moments["m01"]/seed_moments["m00"]
 
-        # Step 4: From here onward this matches the working HSV-dominated version:
-        # create a tight 0.35*seed_size ROI from the ORIGINAL frame, apply the same
-        # 3x3 LAB-channel blur, then use combined L/a/b gradients for radial refinement.
-        padding = max(8, int(0.35*seed_size))
-        x1, y1 = max(0, x - padding), max(0, y - padding)
-        x2, y2 = min(frame.shape[1], x + w + padding), min(frame.shape[0], y + h + padding)
+        # The LAB hotspot defines the one and only working ROI. Do not recrop around
+        # the fragmented HSV component, because that can shift/shrink the refinement
+        # ROI toward one side of a close ball.
+        x1, y1, x2, y2 = hot_x1, hot_y1, hot_x2, hot_y2
+        color_roi = roi_frame
 
-        color_roi = frame[y1:y2, x1:x2]
+        # Use the larger of the HSV seed and LAB hotspot extents as the radial reach.
+        # The hotspot size prevents a partial HSV seed from artificially shrinking the
+        # maximum radius available to the LAB-gradient refinement.
+        seed_size = max(w, h, hot_w, hot_h)
+        seed_area = float(np.count_nonzero(seed_mask))
 
-        # A malformed/noisy candidate should never crash the entire live detector.
-        if color_roi.size == 0 or color_roi.shape[0] < 2 or color_roi.shape[1] < 2:
-            if debug is not None:
-                failure_frame = frame.copy()
-                cv2.putText(failure_frame, f"REJECTED: invalid ROI {color_roi.shape}", (10, 25),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
-                debug.addStage(f"Candidate {candidate_index} rejected - invalid ROI", failure_frame)
-            continue
-
-        color_roi = np.ascontiguousarray(color_roi)
         lab_roi = cv2.cvtColor(color_roi, cv2.COLOR_BGR2LAB)
         l_roi, a_roi, b_roi = cv2.split(lab_roi)
 
@@ -838,9 +862,10 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
             LAB_CHROMA_GRADIENT_GAIN*(grad_au*grad_au + grad_av*grad_av + grad_bu*grad_bu + grad_bv*grad_bv)
         )
 
-        seed_roi = np.zeros((y2 - y1, x2 - x1), dtype=np.uint8)
-        contour_roi = seed_contour - np.array([[[x1, y1]]], dtype=seed_contour.dtype)
-        cv2.drawContours(seed_roi, [contour_roi], -1, 255, -1)
+        # Keep the complete loose-HSV mask as the radial seed instead of filling only
+        # the largest connected component. This lets both sides of a seam/glare split
+        # contribute expected radii while the LAB gradient finds the actual boundary.
+        seed_roi = seed_mask.copy()
 
         if debug is not None:
             roi_frame = frame.copy()
@@ -1104,6 +1129,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         debug.addStage(f"Best candidate {best_candidate_index}", success_frame)
 
     return detection
+
 
 
 # Tennis-ball path: threshold configured colors, clean the mask, and use the largest valid blob.
