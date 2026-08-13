@@ -237,31 +237,25 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     # LAB-gradient radial refinement as the HSV-dominated version.
     LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 40, 15], dtype=np.int16)
 
-    # Step 1: Derive the target LAB chroma direction from the HSV range(s) already
-    # stored in ColorSpec, then build a continuous full-frame LAB response along that
-    # direction. This keeps the LAB hotspot detector synchronized with HSV tuning.
+    # Step 1: Get the target LAB chroma direction directly from ColorSpec, then build
+    # a continuous full-frame LAB response along that direction.
     lab_direction = np.zeros(2, dtype=np.float32)
 
     for color_id in object_vision_spec.color_ids:
         color_spec = COLOR_SPECS[color_id]
 
-        for lower_hsv, upper_hsv in color_spec.hsv_ranges:
-            # Hue determines the chroma direction. Use full saturation/value only to
-            # obtain a clean reference direction, not as a detection threshold.
-            reference_h = int(round((int(lower_hsv[0]) + int(upper_hsv[0]))/2))
-            reference_hsv = np.array([[[reference_h, 255, 255]]], dtype=np.uint8)
-            reference_bgr = cv2.cvtColor(reference_hsv, cv2.COLOR_HSV2BGR)
-            reference_lab = cv2.cvtColor(reference_bgr, cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
+        if color_spec.lab_value is None:
+            raise ValueError(f"Sphere detection requires ColorSpec.lab_value for {color_id}")
 
-            direction = reference_lab[1:3] - 128.0
-            direction_norm = np.linalg.norm(direction)
+        direction = color_spec.lab_value[1:3].astype(np.float32) - 128.0
+        direction_norm = np.linalg.norm(direction)
 
-            if direction_norm > 0.0:
-                lab_direction += direction/direction_norm
+        if direction_norm > 0.0:
+            lab_direction += direction/direction_norm
 
     lab_direction_norm = np.linalg.norm(lab_direction)
     if lab_direction_norm == 0.0:
-        raise ValueError("Could not derive a LAB chroma direction from the configured HSV ranges")
+        raise ValueError("Configured ColorSpec LAB values do not define a valid chroma direction")
 
     lab_direction /= lab_direction_norm
     lab_a_direction, lab_b_direction = float(lab_direction[0]), float(lab_direction[1])
@@ -286,7 +280,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         debug.stages.clear()
         debug.addStage("Original", frame)
         response_debug = np.clip(128.0 + 4.0*lab_color_response, 0, 255).astype(np.uint8)
-        debug.addStage("LAB color response from ColorSpec HSV", response_debug)
+        debug.addStage("LAB color response from ColorSpec LAB", response_debug)
         debug.addStage("LAB hotspot mask", hotspot_mask)
 
     # Step 2: Convert the brightest response regions into padded candidate ROIs.

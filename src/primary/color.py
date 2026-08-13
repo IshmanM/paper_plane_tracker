@@ -14,9 +14,11 @@ class ColorSpec:
         self,
         hsv_ranges: list[tuple[np.ndarray, np.ndarray]],
         draw_bgr: tuple[int, int, int],
+        lab_value: np.ndarray | None = None,
     ):
         self.hsv_ranges = hsv_ranges
         self.draw_bgr = draw_bgr
+        self.lab_value = lab_value
 
 
 # keep the SRICT spec here, margins will be added by detection functions for looser spec
@@ -26,14 +28,18 @@ COLOR_SPECS = {
             # (
             #     np.array([27, 35, 80], dtype=np.uint8),
             #     np.array([38, 255, 255], dtype=np.uint8),
+            # ),   
+            # (
+            #     np.array([30, 80, 80], dtype=np.uint8),
+            #     np.array([42, 255, 255], dtype=np.uint8),
             # ),
-              
             (
-                np.array([30, 80, 80], dtype=np.uint8),
-                np.array([42, 255, 255], dtype=np.uint8),
+                np.array([27, 80, 80], dtype=np.uint8),
+                np.array([40, 255, 255], dtype=np.uint8),
             ),
         ],
         draw_bgr=(0, 255, 0),
+        lab_value=np.array([242, 95, 201], dtype=np.uint8),
     ),
 
     ColorId.GREEN: ColorSpec(
