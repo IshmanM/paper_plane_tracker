@@ -209,7 +209,7 @@ def drawModelOrigin(frame: np.ndarray, measurement: Measurement, camera_calibrat
 
 
 #lab version
-def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration, debug: DetectionDebug | None = None) -> Detection | None:
+def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration | None = None, debug: DetectionDebug | None = None) -> Detection | None:
     if not object_vision_spec.color_ids:
         raise ValueError("Sphere detection requires at least one color_id")
     if object_vision_spec.minimum_contour_area_px is None:
