@@ -227,14 +227,16 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
     GLOBAL_BLUR_KERNEL = (5, 5)
     HOTSPOT_PERCENTILE = 98.5
-    MIN_HOTSPOT_RESPONSE = 8.0
+    MIN_HOTSPOT_RESPONSE_FACTOR = 0.30  # Minimum response relative to configured LAB chroma strength.
     MIN_HOTSPOT_AREA_PX = 6
     HOTSPOT_PADDING_FACTOR = 0.35
 
     LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 40, 15], dtype=np.int16)
 
-    # Step 1: Get the target LAB chroma direction directly from ColorSpec.
+    # Step 1: Get the target LAB chroma direction and reference chroma strength
+    # directly from ColorSpec.
     lab_direction = np.zeros(2, dtype=np.float32)
+    reference_chroma_strengths = []
 
     for color_id in object_vision_spec.color_ids:
         color_spec = COLOR_SPECS[color_id]
@@ -243,15 +245,18 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         direction = color_spec.lab_value[1:3].astype(np.float32) - 128.0
         direction_norm = np.linalg.norm(direction)
+
         if direction_norm > 0.0:
             lab_direction += direction/direction_norm
+            reference_chroma_strengths.append(direction_norm)
 
     lab_direction_norm = np.linalg.norm(lab_direction)
-    if lab_direction_norm == 0.0:
+    if lab_direction_norm == 0.0 or not reference_chroma_strengths:
         raise ValueError("Configured ColorSpec LAB values do not define a valid chroma direction")
 
     lab_direction /= lab_direction_norm
     lab_a_direction, lab_b_direction = float(lab_direction[0]), float(lab_direction[1])
+    reference_chroma_strength = float(np.mean(reference_chroma_strengths))
 
     blurred_frame = frame
 
@@ -265,7 +270,14 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
     lab_color_response = a*lab_a_direction + b*lab_b_direction
     positive_response = np.maximum(lab_color_response, 0.0)
-    hotspot_threshold = max(MIN_HOTSPOT_RESPONSE, float(np.percentile(positive_response, HOTSPOT_PERCENTILE)))
+
+    # A region must be both exceptional relative to the current frame and strong
+    # enough in absolute terms relative to the configured target LAB chroma. This
+    # prevents weak colors such as skin from becoming candidates just because they
+    # happen to occupy the highest-response pixels when the tennis ball is absent.
+    minimum_hotspot_response = MIN_HOTSPOT_RESPONSE_FACTOR*reference_chroma_strength
+    percentile_hotspot_response = float(np.percentile(positive_response, HOTSPOT_PERCENTILE))
+    hotspot_threshold = max(minimum_hotspot_response, percentile_hotspot_response)
     hotspot_mask = (positive_response >= hotspot_threshold).astype(np.uint8)*255
 
     hotspot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -357,6 +369,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         for color_id in object_vision_spec.color_ids:
             color_spec = COLOR_SPECS[color_id]
+
             for lower_hsv, upper_hsv in color_spec.hsv_ranges:
                 loose_lower_hsv = np.clip(lower_hsv.astype(np.int16) - LOOSE_HSV_LOWER_SUBTRACTION, 0, 255).astype(np.uint8)
                 seed_mask = cv2.bitwise_or(seed_mask, cv2.inRange(roi_hsv, loose_lower_hsv, upper_hsv))
@@ -371,6 +384,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
             sx, sy = int(seed_stats[seed_label, cv2.CC_STAT_LEFT]), int(seed_stats[seed_label, cv2.CC_STAT_TOP])
             sw, sh = int(seed_stats[seed_label, cv2.CC_STAT_WIDTH]), int(seed_stats[seed_label, cv2.CC_STAT_HEIGHT])
+
             if best_seed is None or seed_area > best_seed[0]:
                 best_seed = (seed_area, seed_label, sx, sy, sw, sh)
 
@@ -483,8 +497,10 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         if debug is not None:
             boundary_frame = frame.copy()
+
             for point_u, point_v in boundary_points:
                 cv2.circle(boundary_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
+
             cv2.putText(boundary_frame, f"Boundary points: {len(boundary_points)}/{NUM_RAYS}", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 0, 255), 2, cv2.LINE_AA)
             debug.addStage(f"Candidate {candidate_index} boundary points", boundary_frame)
@@ -512,15 +528,18 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         if len(inlier_points) < MIN_BOUNDARY_POINTS:
             if debug is not None:
                 failure_frame = frame.copy()
+
                 for point_u, point_v in boundary_points:
                     cv2.circle(failure_frame, (int(round(point_u)), int(round(point_v))), 2, (100, 100, 100), -1)
                 for point_u, point_v in inlier_points:
                     cv2.circle(failure_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
+
                 cv2.putText(failure_frame, f"REJECTED: circle inliers {len(inlier_points)}/{len(boundary_points)}", (10, 25),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
                 cv2.putText(failure_frame, f"Residual limit: {residual_limit:.2f}px", (10, 50),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
                 debug.addStage(f"Candidate {candidate_index} rejected - circle inliers", failure_frame)
+
             continue
 
         A = np.column_stack((2*inlier_points[:, 0], 2*inlier_points[:, 1], np.ones(len(inlier_points))))
@@ -571,6 +590,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         # Step 12: Score candidates that passed every geometric validation check.
         final_point_radii = np.hypot(inlier_points[:, 0] - circle_u, inlier_points[:, 1] - circle_v)
         mean_residual = np.mean(np.abs(final_point_radii - radius))
+
         coverage_score = covered_angle_bins/NUM_ANGLE_BINS
         support_score = len(inlier_points)/NUM_RAYS
         residual_score = 1.0/(1.0 + mean_residual/max(radius, 1.0))
@@ -578,8 +598,10 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
         if debug is not None:
             passed_frame = frame.copy()
+
             for point_u, point_v in inlier_points:
                 cv2.circle(passed_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
+
             cv2.circle(passed_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 1)
             cv2.putText(passed_frame, f"PASSED candidate {candidate_index}", (10, 25),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
@@ -605,8 +627,10 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
     if debug is not None:
         success_frame = frame.copy()
+
         for point_u, point_v in inlier_points:
             cv2.circle(success_frame, (int(round(point_u)), int(round(point_v))), 2, (255, 0, 255), -1)
+
         cv2.circle(success_frame, (int(round(circle_u)), int(round(circle_v))), int(round(radius)), (0, 255, 0), 1)
         cv2.putText(success_frame, f"BEST candidate {best_candidate_index}", (10, 25),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
