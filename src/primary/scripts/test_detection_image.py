@@ -374,7 +374,7 @@ def main() -> None:
             measurement = createMeasurementUsingShapeGroup(detection, object_vision_spec, camera_calibration)
 
     elif algorithm == DetectionAlgorithm.SPHERE:
-        detection = findSingleObjectSphere(frame, object_vision_spec, debug)
+        detection = findSingleObjectSphere(frame, object_vision_spec, camera_calibration, debug)
 
         if detection is not None:
             x, y, z = estimateObjectWorldPosition(
