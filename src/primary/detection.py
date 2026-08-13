@@ -602,8 +602,6 @@ def drawModelOrigin(frame: np.ndarray, measurement: Measurement, camera_calibrat
 #     return detection
 
 #lab version
-
-
 def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, debug: DetectionDebug | None = None) -> Detection | None:
     if not object_vision_spec.color_ids:
         raise ValueError("Sphere detection requires at least one color_id")
