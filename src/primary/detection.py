@@ -630,7 +630,7 @@ def findSingleObjectSphere(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     # Inside each hotspot ROI, loosen the ColorSpec HSV range only for rough
     # acquisition. From that point onward, use the same seed -> tight ROI ->
     # LAB-gradient radial refinement as the HSV-dominated version.
-    LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 50, 15], dtype=np.int16)
+    LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 35, 15], dtype=np.int16)
 
     # Step 1: Derive the target LAB chroma direction from the HSV range(s) already
     # stored in ColorSpec, then build a continuous full-frame LAB response along that

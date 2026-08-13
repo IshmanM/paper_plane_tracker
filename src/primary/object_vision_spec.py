@@ -269,8 +269,8 @@ OBJECT_VISION_SPECS = {
     ObjectVisionSpecId.TENNIS_BALL_DEFAULT: ObjectVisionSpec(
         object_type=ObjectType.TENNIS_BALL,
         color_ids=[ColorId.TENNIS_GREEN],
-        minimum_contour_area_px=75.0,
-        width=0.0635, height=0.0635, length=0.0635,
+        minimum_contour_area_px=12.0,
+        width=0.06715, height=0.06715, length=0.06715,
     ),
 
     ObjectVisionSpecId.ARUCO_MARKER_1: ObjectVisionSpec(
