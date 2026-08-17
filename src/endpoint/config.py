@@ -52,9 +52,9 @@ SERVO_CALIBRATIONS = {
 
 # Todo: calibrate these...
 FOAM_RESET_ANGLE_DEG = 165
-FOAM_RESET_HOLD_DELAY = 0.17 # seconds
+FOAM_RESET_HOLD_DELAY = 0.20 # seconds
 FOAM_TRIGGER_ANGLE_DEG = 53
-FOAM_TRIGGER_HOLD_DELAY = 0.17 # seconds
+FOAM_TRIGGER_HOLD_DELAY = 0.20 # seconds
 FOAM_MOTOR_SPEED_MAGNITUDE = 0.75 #MAX MAGNITUDE IS 1.0
 
 # Time required for the flywheels DC motors to reach required speed.

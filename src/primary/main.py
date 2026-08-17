@@ -187,6 +187,7 @@ if __name__ == "__main__":
             if key in (ord("q"), 27):
                 print("Quitting...")
                 platform.halt_triggering()
+                time.sleep(0.1) #todo: make a permanent fix instead of this temporary one
                 platform.turn_off()
                 stop_event.set()
                 break
