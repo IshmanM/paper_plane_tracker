@@ -1,3 +1,125 @@
 {
-    "samples": []
+    "samples": [
+        {
+            "position_camera_m": [
+                0.46105292338778947,
+                0.5034976858729542,
+                1.7488283099449469
+            ],
+            "pan_deg": 97.0,
+            "tilt_deg": 101.25,
+            "position_rms_m": 0.009853461343155246,
+            "num_measurements": 10
+        },
+        {
+            "position_camera_m": [
+                0.45835205869282375,
+                0.5049248779532681,
+                1.752754831303882
+            ],
+            "pan_deg": 97.0,
+            "tilt_deg": 102.0,
+            "position_rms_m": 0.00810662152736631,
+            "num_measurements": 10
+        },
+        {
+            "position_camera_m": [
+                -0.6164357171269585,
+                0.5096279798570296,
+                1.8497052509172291
+            ],
+            "pan_deg": 122.5,
+            "tilt_deg": 99.5,
+            "position_rms_m": 0.00615613509942866,
+            "num_measurements": 10
+        },
+        {
+            "position_camera_m": [
+                0.0466553494199687,
+                0.09966980072029455,
+                3.1875329242924204
+            ],
+            "pan_deg": 102.5,
+            "tilt_deg": 90.0,
+            "position_rms_m": 0.034197598245802374,
+            "num_measurements": 10
+        },
+        {
+            "position_camera_m": [
+                -0.5039221174054296,
+                0.08151437240248585,
+                3.249599083969072
+            ],
+            "pan_deg": 110.5,
+            "tilt_deg": 89.5,
+            "position_rms_m": 0.021674337529149924,
+            "num_measurements": 10
+        },
+        {
+            "position_camera_m": [
+                0.7500746383945684,
+                0.07107155844225423,
+                3.265811869159248
+            ],
+            "pan_deg": 91.5,
+            "tilt_deg": 89.5,
+            "position_rms_m": 0.05078908367005802,
+            "num_measurements": 10
+        },
+        {
+            "position_camera_m": [
+                0.6747926819999454,
+                0.5002750789135033,
+                3.046816618918638
+            ],
+            "pan_deg": 92.5,
+            "tilt_deg": 96.5,
+            "position_rms_m": 0.04272122959520291,
+            "num_measurements": 10
+        },
+        {
+            "position_camera_m": [
+                0.02599393978095118,
+                0.4987064624048907,
+                3.0335025930622224
+            ],
+            "pan_deg": 103.5,
+            "tilt_deg": 96.5,
+            "position_rms_m": 0.015766527490347963,
+            "num_measurements": 10
+        },
+        {
+            "position_camera_m": [
+                -0.5834625351767477,
+                0.4965455564594422,
+                3.068543796226728
+            ],
+            "pan_deg": 112.5,
+            "tilt_deg": 96.0,
+            "position_rms_m": 0.02795468758172758,
+            "num_measurements": 10
+        },
+        {
+            "position_camera_m": [
+                0.2618406262164885,
+                0.4195592922073832,
+                1.7718965517873335
+            ],
+            "pan_deg": 103.0,
+            "tilt_deg": 99.5,
+            "position_rms_m": 0.006441473332988989,
+            "num_measurements": 10
+        },
+        {
+            "position_camera_m": [
+                0.838538577562494,
+                0.4262457407238947,
+                1.7297545221755872
+            ],
+            "pan_deg": 85.5,
+            "tilt_deg": 99.0,
+            "position_rms_m": 0.00887681208950098,
+            "num_measurements": 10
+        }
+    ]
 }

@@ -39,6 +39,8 @@ COARSE_SERVO_STEP_DEG = 5.0
 FINE_SERVO_STEP_DEG = 0.5
 CMD_FREQUENCY_HZ = 30.0
 
+DISPLAY_SCALES = (1.0, 1.5, 2.0)
+
 
 def cmd_thread_calibrate_camera_to_platform(servo_angles: np.ndarray, servo_angles_lock: threading.Lock, stop_event: threading.Event, link: UdpLink, cmd_frequency_hz: float = CMD_FREQUENCY_HZ) -> None:
     cmd_period = 1.0/cmd_frequency_hz
@@ -99,13 +101,17 @@ def cmd_thread_calibrate_camera_to_platform(servo_angles: np.ndarray, servo_angl
                 break
 
 
-def _drawOverlay(frame: np.ndarray, lines: list[tuple[str, tuple[int, int, int]]]) -> None:
-    y = 22
+def _drawOverlay(frame: np.ndarray, lines: list[tuple[str, tuple[int, int, int]]], display_scale: float = 1.0) -> None:
+    x, y = int(round(10*display_scale)), int(round(22*display_scale))
+    y_step = int(round(20*display_scale))
+    font_scale = 0.48*display_scale
+    outline_thickness = max(1, int(round(3*display_scale)))
+    text_thickness = max(1, int(round(display_scale)))
 
     for text, color in lines:
-        cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 3, cv2.LINE_AA)
-        cv2.putText(frame, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1, cv2.LINE_AA)
-        y += 20
+        cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), outline_thickness, cv2.LINE_AA)
+        cv2.putText(frame, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, text_thickness, cv2.LINE_AA)
+        y += y_step
 
 
 def main() -> None:
@@ -177,8 +183,8 @@ def main() -> None:
 
     video_frozen = False
     fine_step = False
-    frame_convention_confirmed = False
     last_vision_frame = None
+    display_scale_index = 0
 
     print("Camera-to-platform calibration")
     print(f"Platform geometry used by laser model: {CALIBRATION_PLATFORM_GEOMETRY_SPEC_ID.name}")
@@ -188,8 +194,13 @@ def main() -> None:
     print("Platform convention (FLU): +x FORWARD, +y LEFT, +z UP.")
     print("Positive yaw = LEFT / ANTICLOCKWISE viewed from above.")
     print("A = LEFT / ANTICLOCKWISE, D = RIGHT / CLOCKWISE, W = UP, S = DOWN.")
-    print("Latch a target with T, physically verify these controls, then press C to confirm the convention.")
+    print("Physically verify the controls, then press C to confirm the convention before recording.")
     print(f"Loaded {len(samples)} existing samples.")
+    print("The OpenCV window is freely resizable. Tab cycles 1.0x -> 1.5x -> 2.0x presets.")
+    print("WASD/G can move the platform before or after latching; T only latches the target measurement for recording.")
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, config.FRAME_W, config.FRAME_H)
 
     try:
         while camera.isOpened():
@@ -300,26 +311,18 @@ def main() -> None:
                     (255, 255, 0),
                 ))
 
-            if not frame_convention_confirmed:
-                lines += [
-                    ("FRAME CHECK - verify physically before recording:", (0, 165, 255)),
-                    ("A LEFT / ANTICLOCKWISE above | D RIGHT / CLOCKWISE above | W UP | S DOWN", (0, 165, 255)),
-                    (
-                        f"FLU +x FORWARD, +y LEFT, +z UP | yaw {yaw_deg:+.2f} deg | "
-                        f"elev {elevation_deg:+.2f} deg",
-                        (0, 165, 255),
-                    ),
-                    (
-                        f"laser origin [{laser_origin_platform[0]:+.3f}, "
-                        f"{laser_origin_platform[1]:+.3f}, {laser_origin_platform[2]:+.3f}] | "
-                        f"ray [{laser_direction_platform[0]:+.3f}, "
-                        f"{laser_direction_platform[1]:+.3f}, {laser_direction_platform[2]:+.3f}]",
-                        (0, 165, 255),
-                    ),
-                    ("C = confirm convention", (0, 165, 255)),
-                ]
-            else:
-                lines.append(("Frame convention: CONFIRMED | C = re-check", (0, 255, 0)))
+            lines += [
+                (
+                    f"FLU: A left | D right | W up | S down | yaw {yaw_deg:+.2f} deg | elev {elevation_deg:+.2f} deg",
+                    (0, 165, 255),
+                ),
+                (
+                    f"laser origin [{laser_origin_platform[0]:+.3f}, {laser_origin_platform[1]:+.3f}, "
+                    f"{laser_origin_platform[2]:+.3f}] | ray [{laser_direction_platform[0]:+.3f}, "
+                    f"{laser_direction_platform[1]:+.3f}, {laser_direction_platform[2]:+.3f}]",
+                    (0, 165, 255),
+                ),
+            ]
 
             if candidate_diagnostics is not None:
                 lines.append((
@@ -328,20 +331,40 @@ def main() -> None:
                     (255, 0, 255),
                 ))
 
-            lines.append((
-                "T latch | P freeze | WASD aim | F fine/coarse | G exact | "
-                "R record | X undo | O solve | V save | Q/Esc quit",
-                (255, 255, 255),
-            ))
+            display_scale = DISPLAY_SCALES[display_scale_index]
+            lines += [
+                ("T latch | P freeze | WASD aim | F fine/coarse | G exact", (255, 255, 255)),
+                (
+                    f"R record | X undo | O solve | V save | Tab resize ({display_scale:.1f}x) | Q/Esc quit",
+                    (255, 255, 255),
+                ),
+            ]
 
-            _drawOverlay(frame, lines)
+            # Render to the current user-selected window size. Detection, measurement,
+            # averaging, and calibration always use the original camera-resolution frame.
+            try:
+                _, _, display_w, display_h = cv2.getWindowImageRect(WINDOW_NAME)
+            except cv2.error:
+                display_w, display_h = config.FRAME_W, config.FRAME_H
 
-            cv2.imshow(WINDOW_NAME, frame)
+            display_w = max(1, display_w)
+            display_h = max(1, display_h)
+            display_frame = cv2.resize(frame, (display_w, display_h), interpolation=cv2.INTER_LINEAR)
+            display_scale = min(display_w/config.FRAME_W, display_h/config.FRAME_H)
+            _drawOverlay(display_frame, lines, display_scale)
+
+            cv2.imshow(WINDOW_NAME, display_frame)
             key = cv2.waitKey(1) & 0xFF
 
             if key in (ord("q"), 27):
                 print("Quitting...")
                 break
+
+            elif key == 9:  # Tab
+                display_scale_index = (display_scale_index + 1)%len(DISPLAY_SCALES)
+                preset_scale = DISPLAY_SCALES[display_scale_index]
+                cv2.resizeWindow(WINDOW_NAME, int(round(config.FRAME_W*preset_scale)), int(round(config.FRAME_H*preset_scale)))
+                print(f"Display preset: {preset_scale:.1f}x")
 
             elif key == ord("p"):
                 video_frozen = not video_frozen
@@ -373,18 +396,7 @@ def main() -> None:
                 fine_step = not fine_step
                 print(f"Servo step: {'fine' if fine_step else 'coarse'}.")
 
-            elif key == ord("c"):
-                frame_convention_confirmed = not frame_convention_confirmed
-                print(
-                    f"Frame convention "
-                    f"{'CONFIRMED' if frame_convention_confirmed else 'set back to UNCONFIRMED/check mode'}."
-                )
-
             elif key in (ord("w"), ord("a"), ord("s"), ord("d")):
-                if latched_position_camera_m is None:
-                    print("Latch the target with T before moving the platform.")
-                    continue
-
                 step = FINE_SERVO_STEP_DEG if fine_step else COARSE_SERVO_STEP_DEG
                 pan_idx = config.SERVO_IDX["pan"]
                 tilt_idx = config.SERVO_IDX["tilt"]
@@ -408,10 +420,6 @@ def main() -> None:
                     )
 
             elif key == ord("g"):
-                if latched_position_camera_m is None:
-                    print("Latch the target with T before commanding exact angles.")
-                    continue
-
                 try:
                     text = input("Enter pan tilt degrees (example: 90 75): ").strip().replace(",", " ")
                     values = text.split()
@@ -437,10 +445,6 @@ def main() -> None:
                     print("Invalid input. Enter exactly two numbers: pan tilt")
 
             elif key == ord("r"):
-                if not frame_convention_confirmed:
-                    print("Confirm the physical frame/control convention with C before recording samples.")
-                    continue
-
                 if latched_position_camera_m is None:
                     print("Latch the target with T before recording.")
                     continue

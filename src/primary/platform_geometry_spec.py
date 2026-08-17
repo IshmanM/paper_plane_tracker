@@ -42,15 +42,19 @@ class PlatformGeometrySpec:
             raise ValueError("laser_origin_offset_foam_mechanism_m must be a finite length-3 vector")
 
 
-#TODO: tune based on CAD/real measurements
+# TODO: tune based on CAD/real measurements
 PLATFORM_GEOMETRY_SPECS = {
     PlatformGeometrySpecId.PLATFORM_1: PlatformGeometrySpec(
         foam_mechanism_origin_offset_m=np.array([
-            0.0,  # forward
-            0.0,  # left
+            0.0,     # forward
+            0.0,     # left 
             0.0525,  # up
         ]),
         rotation_platform_from_foam_mechanism_at_forward=np.eye(3),
-        laser_origin_offset_foam_mechanism_m=np.zeros(3),  # coaxial laser
+        laser_origin_offset_foam_mechanism_m=np.array([
+            0.0,     # forward
+           -0.052,   # left 
+           -0.003,   # up   
+        ]),
     ),
 }
