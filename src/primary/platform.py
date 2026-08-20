@@ -16,7 +16,7 @@ SERVO_ROTATION_TIME_MARGIN = 0.05 # seconds
 
 
 SEARCH_CENTER_PAN = 90.0 # degrees
-SEARCH_PAN_AMPLITUDE = 85.0 # degrees
+SEARCH_PAN_AMPLITUDE = 75.0 # degrees
 SEARCH_FREQUENCY = 0.2 # hz
 
 
@@ -37,7 +37,7 @@ GRAVITY = 9.81  # m/s^2
 MAX_AIM_SOLVE_ITERATIONS = 5
 
 # Tune experimentally.
-FOAM_PROTRUSION_SPEED = 9.0  # m/s
+FOAM_PROTRUSION_SPEED = 12.0  # m/s
 
 # Do not aim at objects effectively behind / on top of platform.
 MIN_FORWARD_RANGE = 0.02  # m
