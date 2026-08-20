@@ -75,6 +75,9 @@ if __name__ == "__main__":
         raise RuntimeError("Could not open camera.")
 
     tracker = SingleObjectTracker(
+        min_hits=3,
+        max_missed_on_confirmed=15,
+        max_missed_on_tentative=1,
         # params...
     )
 

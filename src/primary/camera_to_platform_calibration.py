@@ -12,6 +12,15 @@ from src.primary.platform_geometry_spec import PlatformGeometrySpec
 MIN_CALIBRATION_SAMPLES = 6
 MAX_RAY_FIT_ITERATIONS = 100
 
+# Final calibration objective is angular rather than meter distance-to-ray.
+# Huber weighting prevents a poorly centered sample from dominating the fit.
+ANGULAR_FIT_HUBER_DELTA_DEG = 0.35
+MAX_ANGULAR_FIT_ITERATIONS = 50
+ANGULAR_FIT_ROTATION_FINITE_DIFF_RAD = 1e-5
+ANGULAR_FIT_TRANSLATION_FINITE_DIFF_M = 1e-5
+MAX_ANGULAR_FIT_ROTATION_STEP_DEG = 2.0
+MAX_ANGULAR_FIT_TRANSLATION_STEP_M = 0.05
+
 # Platform FLU -> OpenCV-like axes for the PnP initializer only:
 # [forward, left, up] -> [right, down, forward].
 OPENCV_LIKE_FROM_PLATFORM = np.array([
@@ -198,6 +207,124 @@ def _refineUsingAlternatingRayFit(
     return R, t
 
 
+def _angularErrors(R: np.ndarray, t: np.ndarray, positions_camera_m: np.ndarray, ray_origins_platform: np.ndarray, directions_platform: np.ndarray) -> np.ndarray:
+    positions_platform = (R@positions_camera_m.T).T + t
+    to_targets = positions_platform - ray_origins_platform
+    distances = np.linalg.norm(to_targets, axis=1)
+
+    if np.any(distances <= 1e-9):
+        return np.full(len(positions_camera_m), np.inf, dtype=np.float64)
+
+    target_directions = to_targets/distances[:, None]
+    dots = np.sum(target_directions*directions_platform, axis=1)
+    return np.arccos(np.clip(dots, -1.0, 1.0))
+
+
+def _angularResidualVectors(R: np.ndarray, t: np.ndarray, positions_camera_m: np.ndarray, ray_origins_platform: np.ndarray, directions_platform: np.ndarray) -> np.ndarray:
+    positions_platform = (R@positions_camera_m.T).T + t
+    to_targets = positions_platform - ray_origins_platform
+    distances = np.linalg.norm(to_targets, axis=1)
+
+    if np.any(distances <= 1e-9):
+        return np.full((len(positions_camera_m), 3), np.nan, dtype=np.float64)
+
+    target_directions = to_targets/distances[:, None]
+    return target_directions - directions_platform
+
+
+def _robustAngularCost(errors_rad: np.ndarray) -> float:
+    delta = np.deg2rad(ANGULAR_FIT_HUBER_DELTA_DEG)
+    quadratic = np.minimum(errors_rad, delta)
+    linear = errors_rad - quadratic
+    return float(np.sum(0.5*quadratic*quadratic + delta*linear))
+
+
+def _refineUsingRobustAngularFit(
+    R: np.ndarray,
+    t: np.ndarray,
+    positions_camera_m: np.ndarray,
+    ray_origins_platform: np.ndarray,
+    directions_platform: np.ndarray,
+    max_iterations: int = MAX_ANGULAR_FIT_ITERATIONS,
+) -> tuple[np.ndarray, np.ndarray]:
+
+    R = R.copy()
+    t = t.copy()
+    delta_huber = np.deg2rad(ANGULAR_FIT_HUBER_DELTA_DEG)
+    max_rotation_step_rad = np.deg2rad(MAX_ANGULAR_FIT_ROTATION_STEP_DEG)
+
+    for _ in range(max_iterations):
+        errors_rad = _angularErrors(R, t, positions_camera_m, ray_origins_platform, directions_platform)
+        residual_vectors = _angularResidualVectors(R, t, positions_camera_m, ray_origins_platform, directions_platform)
+
+        if not np.all(np.isfinite(errors_rad)) or not np.all(np.isfinite(residual_vectors)):
+            break
+
+        # IRLS form of Huber loss. A sample inside the expected angular uncertainty
+        # keeps full weight; a larger miss is smoothly down-weighted rather than
+        # pulling the whole camera->platform transform toward it.
+        weights = np.ones_like(errors_rad)
+        large = errors_rad > delta_huber
+        weights[large] = delta_huber/np.maximum(errors_rad[large], 1e-12)
+        sqrt_weights = np.sqrt(weights)[:, None]
+        residual = (sqrt_weights*residual_vectors).reshape(-1)
+
+        J = np.zeros((residual.size, 6), dtype=np.float64)
+
+        for axis in range(3):
+            rotation_step = np.zeros(3, dtype=np.float64)
+            rotation_step[axis] = ANGULAR_FIT_ROTATION_FINITE_DIFF_RAD
+            dR, _ = cv2.Rodrigues(rotation_step)
+            residual_step = _angularResidualVectors(
+                dR@R, t, positions_camera_m, ray_origins_platform, directions_platform
+            )
+            J[:, axis] = ((sqrt_weights*(residual_step - residual_vectors))/ANGULAR_FIT_ROTATION_FINITE_DIFF_RAD).reshape(-1)
+
+        for axis in range(3):
+            t_step = t.copy()
+            t_step[axis] += ANGULAR_FIT_TRANSLATION_FINITE_DIFF_M
+            residual_step = _angularResidualVectors(
+                R, t_step, positions_camera_m, ray_origins_platform, directions_platform
+            )
+            J[:, 3 + axis] = ((sqrt_weights*(residual_step - residual_vectors))/ANGULAR_FIT_TRANSLATION_FINITE_DIFF_M).reshape(-1)
+
+        delta, *_ = np.linalg.lstsq(J, -residual, rcond=None)
+        rotation_delta = delta[:3]
+        translation_delta = delta[3:]
+
+        rotation_norm = float(np.linalg.norm(rotation_delta))
+        if rotation_norm > max_rotation_step_rad:
+            rotation_delta *= max_rotation_step_rad/rotation_norm
+
+        translation_norm = float(np.linalg.norm(translation_delta))
+        if translation_norm > MAX_ANGULAR_FIT_TRANSLATION_STEP_M:
+            translation_delta *= MAX_ANGULAR_FIT_TRANSLATION_STEP_M/translation_norm
+
+        old_cost = _robustAngularCost(errors_rad)
+        accepted = False
+
+        for scale in (1.0, 0.5, 0.25, 0.125, 0.0625):
+            dR, _ = cv2.Rodrigues(scale*rotation_delta)
+            R_candidate = dR@R
+            t_candidate = t + scale*translation_delta
+            candidate_errors = _angularErrors(
+                R_candidate, t_candidate, positions_camera_m, ray_origins_platform, directions_platform
+            )
+
+            if np.all(np.isfinite(candidate_errors)) and _robustAngularCost(candidate_errors) < old_cost:
+                R, t = R_candidate, t_candidate
+                accepted = True
+                break
+
+        if not accepted:
+            break
+
+        if np.linalg.norm(scale*rotation_delta) < 1e-9 and np.linalg.norm(scale*translation_delta) < 1e-8:
+            break
+
+    return R, t
+
+
 def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec: PlatformGeometrySpec) -> tuple[CameraToPlatformCalibration, dict]:
     if len(samples) < MIN_CALIBRATION_SAMPLES:
         raise ValueError(f"Need at least {MIN_CALIBRATION_SAMPLES} calibration samples, got {len(samples)}")
@@ -265,12 +392,22 @@ def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec
 
     best_R = None
     best_t = None
-    best_rms = float("inf")
+    best_angular_cost = float("inf")
 
     for R_initial, t_initial in initial_solutions:
+        # The old point-to-ray refinement is retained only as a stable initializer.
+        # The final transform is optimized with a robust ANGULAR objective so a
+        # similar aiming miss has similar influence regardless of target distance.
         R, t = _refineUsingAlternatingRayFit(
             R_initial,
             t_initial,
+            positions_camera_m,
+            ray_origins_platform,
+            directions_platform,
+        )
+        R, t = _refineUsingRobustAngularFit(
+            R,
+            t,
             positions_camera_m,
             ray_origins_platform,
             directions_platform,
@@ -283,13 +420,13 @@ def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec
         if np.any(along_ray_m <= 0.0):
             continue
 
-        errors_m = _rayErrors(R, t, positions_camera_m, ray_origins_platform, directions_platform)
-        rms_m = float(np.sqrt(np.mean(errors_m**2)))
+        angular_errors_rad = _angularErrors(R, t, positions_camera_m, ray_origins_platform, directions_platform)
+        angular_cost = _robustAngularCost(angular_errors_rad)
 
-        if rms_m < best_rms:
+        if angular_cost < best_angular_cost:
             best_R = R
             best_t = t
-            best_rms = rms_m
+            best_angular_cost = angular_cost
 
     if best_R is None:
         raise RuntimeError("Calibration solutions placed one or more targets behind their laser origins")
@@ -297,6 +434,8 @@ def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec
     errors_m = _rayErrors(best_R, best_t, positions_camera_m, ray_origins_platform, directions_platform)
     calibration = CameraToPlatformCalibration.fromValues(best_R, best_t)
 
+    # Keep the existing results.json schema unchanged for compatibility. These
+    # meter diagnostics are evaluated at the new robust-angular optimum.
     diagnostics = {
         "num_samples": len(samples),
         "fit_rms_ray_error_m": float(np.sqrt(np.mean(errors_m**2))),

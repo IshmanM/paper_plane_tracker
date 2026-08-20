@@ -70,8 +70,8 @@ MAX_SERVO_ANGLES[SERVO_IDX["pan"]] = 175.0 # degrees
 MAX_SERVO_ANGLES[SERVO_IDX["tilt"]] = 115.0 # degrees
 
 SERVO_DEADBAND = np.zeros(NUM_SERVOS, dtype=float)
-SERVO_DEADBAND[SERVO_IDX["pan"]] = 0.5 # degrees
-SERVO_DEADBAND[SERVO_IDX["tilt"]] = 0.5 # degrees
+SERVO_DEADBAND[SERVO_IDX["pan"]] = 0.1 # degrees
+SERVO_DEADBAND[SERVO_IDX["tilt"]] = 0.1 # degrees
 
 MAX_SERVO_SPEEDS = np.zeros(NUM_SERVOS, dtype=float)
 MAX_SERVO_SPEEDS[SERVO_IDX["pan"]] = 120.0 # degrees/s
