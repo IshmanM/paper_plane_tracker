@@ -37,7 +37,7 @@ GRAVITY = 9.81  # m/s^2
 MAX_AIM_SOLVE_ITERATIONS = 5
 
 # Tune experimentally.
-FOAM_PROTRUSION_SPEED = 25.0  # m/s
+FOAM_PROTRUSION_SPEED = 9.0  # m/s
 
 # Do not aim at objects effectively behind / on top of platform.
 MIN_FORWARD_RANGE = 0.02  # m
