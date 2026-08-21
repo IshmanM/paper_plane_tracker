@@ -215,7 +215,8 @@ def main() -> None:
         frequency_hz=args.frequency_hz,
         num_channels=16,
         default_calibration=calibration,
-        pca_reference_clock_speed=args.reference_clock_frequency_hz,
+        pca_reference_clock_frequency_hz=args.reference_clock_frequency_hz,
+        use_calibration=True,
     )
 
     try:

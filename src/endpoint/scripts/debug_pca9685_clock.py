@@ -143,7 +143,7 @@ def main() -> None:
     print(f"PWM-period scale vs nominal:           {period_scale_vs_nominal:.6f}x")
     print()
     print("Suggested config value:")
-    print(f"PCA9685_REFERENCE_CLOCK_SPEED = {round(estimated_reference_clock_hz)}")
+    print(f"PCA9685_REFERENCE_CLOCK_FREQUENCY_HZ = {round(estimated_reference_clock_hz)}")
 
 
 if __name__ == "__main__":

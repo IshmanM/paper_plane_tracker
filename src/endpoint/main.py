@@ -1,3 +1,4 @@
+import argparse
 import board
 
 import src.endpoint.config as config
@@ -19,7 +20,15 @@ from src.comm.network_config import(
 )
 
 
-if __name__ == "__main__": 
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run the endpoint server.")
+    parser.add_argument(
+        "--no-servo-calibration",
+        action="store_true",
+        help="ONLY for empirical servo characterization: bypass servo trim and polynomial/lookup calibration.",
+    )
+    args = parser.parse_args()
+    use_servo_calibration = not args.no_servo_calibration
 
     i2c = board.I2C()
 
@@ -28,8 +37,11 @@ if __name__ == "__main__":
         frequency_hz=config.PCA9685_FREQUENCY_HZ, 
         num_channels=config.PCA9685_NUM_CHANNELS,
         default_calibration=config.DEFAULT_SERVO_CALIBRATION,
-        pca_reference_clock_speed=config.PCA9685_REFERENCE_CLOCK_FREQUENCY_HZ,
+        pca_reference_clock_frequency_hz=config.PCA9685_REFERENCE_CLOCK_FREQUENCY_HZ,
+        use_calibration=use_servo_calibration,
     )
+
+    print(f"Servo calibration: {'ENABLED' if use_servo_calibration else 'BYPASSED FOR CHARACTERIZATION'}")
 
     for channel, calibration in config.SERVO_CALIBRATIONS.items():
         servo_driver.set_channel_calibration(channel, calibration)

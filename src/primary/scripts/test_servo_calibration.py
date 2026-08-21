@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 import src.primary.config as config
+import src.endpoint.config as endpoint_config
 from src.primary.camera_calibration import CameraCalibration
 from src.primary.detection import detectSingleObject, drawDetection
 from src.primary.object_vision_spec import ObjectVisionSpecId
@@ -189,21 +190,33 @@ def _fitPhysicalCoordinates(samples: list[dict]) -> tuple[np.ndarray, np.ndarray
 
     phase_deg = np.rad2deg(phase_rad)
 
-    # This experiment determines slope/shape, not absolute mechanical zero. Align by
-    # one constant only; endpoint trim remains responsible for zero alignment.
+    # This experiment determines relative servo-angle shape, not absolute mechanical zero.
+    # Choose one constant coordinate alignment near the command values. The final endpoint
+    # trim later shifts the INPUT to the polynomial/lookup model to establish absolute zero.
     physical_angle_deg = phase_deg + float(np.median(commands - phase_deg))
     return physical_angle_deg, rotation_axis_camera
 
 
-def _fitNoConstantCorrection(desired_deg: np.ndarray, measured_deg: np.ndarray, reference_deg: float, degree: int) -> list[float]:
-    # corrected = desired + c1*x + c2*x^2 + ...; x = desired-reference.
-    # No constant term means this calibration does not replace the existing trim.
-    x = measured_deg - reference_deg
-    correction = desired_deg - measured_deg
-    degree = min(degree, max(1, len(np.unique(np.round(x, 8))) - 1))
-    A = np.column_stack([x**power for power in range(1, degree + 1)])
-    coefficients, *_ = np.linalg.lstsq(A, correction, rcond=None)
-    return coefficients.tolist()
+def _buildPulseLookupTable(samples: list[dict]) -> list[dict]:
+    rows = []
+    unique_commands = sorted(set(round(float(sample["test_angle_deg"]), 8) for sample in samples))
+
+    for command in unique_commands:
+        group = [sample for sample in samples if abs(sample["test_angle_deg"] - command) <= ANGLE_MATCH_TOLERANCE_DEG]
+        physical_values = np.asarray([sample["estimated_physical_angle_deg"] for sample in group], dtype=float)
+        pulse_values = np.asarray([sample["pulse_us"] for sample in group], dtype=float)
+        rows.append({
+            "source_command_angle_deg": float(command),
+            "servo_angle_deg": float(np.median(physical_values)),
+            "pulse_us": float(np.median(pulse_values)),
+            "num_samples": len(group),
+            "physical_angle_std_deg": float(np.std(physical_values, ddof=1)) if len(group) >= 2 else 0.0,
+        })
+
+    rows.sort(key=lambda row: row["servo_angle_deg"])
+    if any(b["servo_angle_deg"] <= a["servo_angle_deg"] for a, b in zip(rows[:-1], rows[1:])):
+        raise RuntimeError("Reconstructed servo angles are not strictly increasing; cannot build a monotonic lookup table.")
+    return rows
 
 
 def _analyze(samples: list[dict], test_config: dict, summary_path: Path) -> dict | None:
@@ -217,80 +230,78 @@ def _analyze(samples: list[dict], test_config: dict, summary_path: Path) -> dict
     for sample, physical in zip(samples, physical_angle_deg):
         sample["estimated_physical_angle_deg"] = float(physical)
 
+    # Keep the old scale/nonlinearity/backlash diagnostics because they are useful
+    # descriptions of the hardware even though the endpoint model is now angle->pulse.
     linear_coeff = np.polyfit(commands, physical_angle_deg, 1)
     overall_scale = float(linear_coeff[0])
     linear_prediction = np.polyval(linear_coeff, commands)
     nonlinearity_residual = physical_angle_deg - linear_prediction
 
-    max_polynomial_degree = min(test_config["polynomial_degree"], len(np.unique(commands)) - 1)
-    reference_deg = float(0.5*(test_config["angle_a_deg"] + test_config["angle_b_deg"]))
-    polynomial_fits = {}
-
-    for degree in range(1, max_polynomial_degree + 1):
-        physical_from_command_coeff = np.polyfit(commands - reference_deg, physical_angle_deg - reference_deg, degree)
-        physical_prediction = reference_deg + np.polyval(physical_from_command_coeff, commands - reference_deg)
-        physical_fit_residual = physical_angle_deg - physical_prediction
-
-        correction_coeff_by_power = _fitNoConstantCorrection(commands, physical_angle_deg, reference_deg, degree)
-
-        polynomial_fits[str(degree)] = {
-            "degree": degree,
-            "physical_from_command_coefficients_descending": physical_from_command_coeff.tolist(),
-            "physical_fit_rms_deg": float(np.sqrt(np.mean(physical_fit_residual**2))),
-            "physical_fit_max_abs_deg": float(np.max(np.abs(physical_fit_residual))),
-            "endpoint_correction_coefficients_by_power_no_constant": correction_coeff_by_power,
-        }
-
     interval_rows = []
     for previous, current in zip(samples[:-1], samples[1:]):
         command_delta = current["test_angle_deg"] - previous["test_angle_deg"]
-        if abs(command_delta) <= ANGLE_MATCH_TOLERANCE_DEG:
-            continue
-
+        if abs(command_delta) <= ANGLE_MATCH_TOLERANCE_DEG: continue
         measured_delta = current["estimated_physical_angle_deg"] - previous["estimated_physical_angle_deg"]
         interval_rows.append({
-            "from_command_deg": previous["test_angle_deg"],
-            "to_command_deg": current["test_angle_deg"],
-            "cycle": current["cycle"],
-            "direction": current["direction"],
-            "command_delta_deg": float(command_delta),
-            "measured_delta_deg": float(measured_delta),
+            "from_command_deg": previous["test_angle_deg"], "to_command_deg": current["test_angle_deg"],
+            "cycle": current["cycle"], "direction": current["direction"],
+            "command_delta_deg": float(command_delta), "measured_delta_deg": float(measured_delta),
             "physical_per_command_scale": float(abs(measured_delta/command_delta)),
         })
 
-    backlash_values = []
     unique_commands = sorted(set(round(float(q), 8) for q in commands))
-
+    backlash_values = []
     for command in unique_commands:
-        forward_values = [
-            sample["estimated_physical_angle_deg"] for sample in samples
-            if abs(sample["test_angle_deg"] - command) <= ANGLE_MATCH_TOLERANCE_DEG and sample["direction"] == "forward"
-        ]
-        reverse_values = [
-            sample["estimated_physical_angle_deg"] for sample in samples
-            if abs(sample["test_angle_deg"] - command) <= ANGLE_MATCH_TOLERANCE_DEG and sample["direction"] == "reverse"
-        ]
-        if forward_values and reverse_values:
-            backlash_values.append(abs(float(np.mean(forward_values) - np.mean(reverse_values))))
+        forward_values = [sample["estimated_physical_angle_deg"] for sample in samples if abs(sample["test_angle_deg"] - command) <= ANGLE_MATCH_TOLERANCE_DEG and sample["direction"] == "forward"]
+        reverse_values = [sample["estimated_physical_angle_deg"] for sample in samples if abs(sample["test_angle_deg"] - command) <= ANGLE_MATCH_TOLERANCE_DEG and sample["direction"] == "reverse"]
+        if forward_values and reverse_values: backlash_values.append(abs(float(np.mean(forward_values) - np.mean(reverse_values))))
 
     repeatability_values = []
     for command in unique_commands:
         for direction in ("forward", "reverse"):
-            values = [
-                sample["estimated_physical_angle_deg"] for sample in samples
-                if abs(sample["test_angle_deg"] - command) <= ANGLE_MATCH_TOLERANCE_DEG and sample["direction"] == direction
-            ]
-            if len(values) >= 2:
-                repeatability_values.append(float(np.std(values, ddof=1)))
+            values = [sample["estimated_physical_angle_deg"] for sample in samples if abs(sample["test_angle_deg"] - command) <= ANGLE_MATCH_TOLERANCE_DEG and sample["direction"] == direction]
+            if len(values) >= 2: repeatability_values.append(float(np.std(values, ddof=1)))
 
     local_scales = np.asarray([row["physical_per_command_scale"] for row in interval_rows], dtype=float)
     backlash_values = np.asarray(backlash_values, dtype=float)
     repeatability_values = np.asarray(repeatability_values, dtype=float)
 
+    # Collapse repeated forward/reverse/cycle measurements at each test pulse into one
+    # robust lookup point. This table directly means (servo calibration angle, pulse_us).
+    lookup_rows = _buildPulseLookupTable(samples)
+    lookup_angles = np.asarray([row["servo_angle_deg"] for row in lookup_rows], dtype=float)
+    lookup_pulses = np.asarray([row["pulse_us"] for row in lookup_rows], dtype=float)
+    pulse_lookup_table = [[float(angle), float(pulse)] for angle, pulse in zip(lookup_angles, lookup_pulses)]
+
+    max_polynomial_degree = min(test_config["polynomial_degree"], len(lookup_rows) - 1)
+    reference_deg = float(0.5*(lookup_angles[0] + lookup_angles[-1]))
+    polynomial_fits = {}
+    raw_physical = np.asarray([sample["estimated_physical_angle_deg"] for sample in samples], dtype=float)
+    raw_pulses = np.asarray([sample["pulse_us"] for sample in samples], dtype=float)
+
+    for degree in range(1, max_polynomial_degree + 1):
+        coefficients = np.polyfit(lookup_angles - reference_deg, lookup_pulses, degree)
+        lookup_prediction = np.polyval(coefficients, lookup_angles - reference_deg)
+        lookup_residual = lookup_pulses - lookup_prediction
+        raw_prediction = np.polyval(coefficients, raw_physical - reference_deg)
+        raw_residual = raw_pulses - raw_prediction
+
+        polynomial_fits[str(degree)] = {
+            "degree": degree,
+            "pulse_polynomial_coefficients_descending": coefficients.tolist(),
+            "pulse_polynomial_reference_deg": reference_deg,
+            "pulse_polynomial_valid_angle_range_deg": [float(lookup_angles[0]), float(lookup_angles[-1])],
+            "lookup_point_fit_rms_us": float(np.sqrt(np.mean(lookup_residual**2))),
+            "lookup_point_fit_max_abs_us": float(np.max(np.abs(lookup_residual))),
+            "raw_sample_fit_rms_us": float(np.sqrt(np.mean(raw_residual**2))),
+            "raw_sample_fit_max_abs_us": float(np.max(np.abs(raw_residual))),
+        }
+
     summary = {
         "test_config": test_config,
         "num_ray_samples": len(samples),
         "estimated_rotation_axis_camera": rotation_axis_camera.tolist(),
+        "relative_angle_coordinate_note": "Camera sweep determines servo-angle shape up to one constant offset. Endpoint trim later shifts the model INPUT; for pan/tilt trim is conventionally established at the physical forward pose.",
         "overall_physical_per_command_scale": overall_scale,
         "inverse_global_scale_correction": None if abs(overall_scale) < 1e-12 else 1.0/overall_scale,
         "local_scale_mean": float(np.mean(local_scales)) if local_scales.size else None,
@@ -302,10 +313,11 @@ def _analyze(samples: list[dict], test_config: dict, summary_path: Path) -> dict
         "backlash_max_deg": float(np.max(backlash_values)) if backlash_values.size else None,
         "repeatability_same_direction_std_mean_deg": float(np.mean(repeatability_values)) if repeatability_values.size else None,
         "repeatability_same_direction_std_max_deg": float(np.max(repeatability_values)) if repeatability_values.size else None,
+        "pulse_lookup_points": lookup_rows,
+        "pulse_lookup_table": pulse_lookup_table,
         "maximum_polynomial_degree": max_polynomial_degree,
-        "polynomial_reference_deg": reference_deg,
+        "pulse_polynomial_reference_deg": reference_deg,
         "polynomial_fits": polynomial_fits,
-        "endpoint_correction_formula": "corrected_command_deg = desired_deg + sum(c[k-1]*(desired_deg-reference_deg)**k for k=1..degree); keep existing trim unchanged",
         "intervals": interval_rows,
     }
 
@@ -316,52 +328,44 @@ def _analyze(samples: list[dict], test_config: dict, summary_path: Path) -> dict
     print("-------------------------")
     print(f"Axis: {test_config['axis'].upper()} | samples: {len(samples)} | round trips: {test_config['num_round_trips']}")
     print(f"Overall physical/command scale: {overall_scale:.6f}")
-    print(f"Inverse global correction:      {summary['inverse_global_scale_correction']:.6f}")
-    if local_scales.size:
-        print(f"Local scale: mean {np.mean(local_scales):.6f} | min {np.min(local_scales):.6f} | max {np.max(local_scales):.6f}")
+    if local_scales.size: print(f"Local scale: mean {np.mean(local_scales):.6f} | min {np.min(local_scales):.6f} | max {np.max(local_scales):.6f}")
     print(f"Nonlinearity vs best line: RMS {summary['nonlinearity_rms_deg_from_best_linear']:.4f} deg | max {summary['nonlinearity_max_abs_deg_from_best_linear']:.4f} deg")
-    print(f"Backlash: mean {summary['backlash_mean_deg']:.4f} deg | max {summary['backlash_max_deg']:.4f} deg" if summary["backlash_mean_deg"] is not None else "Backlash: insufficient forward/reverse overlap")
-    print(
-        f"Repeatability same-direction std: mean {summary['repeatability_same_direction_std_mean_deg']:.4f} deg | max {summary['repeatability_same_direction_std_max_deg']:.4f} deg"
-        if summary["repeatability_same_direction_std_mean_deg"] is not None else "Repeatability: insufficient repeated same-direction samples"
-    )
-    print(f"Polynomial reference: {reference_deg:.3f} deg")
-    print("\nPolynomial fits:")
+    print(f"Backlash diagnostic only: mean {summary['backlash_mean_deg']:.4f} deg | max {summary['backlash_max_deg']:.4f} deg" if summary["backlash_mean_deg"] is not None else "Backlash: insufficient forward/reverse overlap")
+    print(f"Repeatability same-direction std: mean {summary['repeatability_same_direction_std_mean_deg']:.4f} deg | max {summary['repeatability_same_direction_std_max_deg']:.4f} deg" if summary["repeatability_same_direction_std_mean_deg"] is not None else "Repeatability: insufficient repeated same-direction samples")
+
+    print("\nPulse lookup table: (servo calibration angle deg, pulse_us)")
+    print("pulse_lookup_table=(")
+    for angle, pulse in pulse_lookup_table:
+        print(f"    ({angle:.9f}, {pulse:.6f}),")
+    print(")")
+
+    print(f"\nPulse polynomial reference: {reference_deg:.9f} deg")
     for degree in range(1, max_polynomial_degree + 1):
         fit = polynomial_fits[str(degree)]
+        print(f"  Degree {degree}: lookup RMS {fit['lookup_point_fit_rms_us']:.4f} us | raw RMS {fit['raw_sample_fit_rms_us']:.4f} us")
+        print(f"    coefficients descending: {fit['pulse_polynomial_coefficients_descending']}")
+        print(f"    valid angle range: {fit['pulse_polynomial_valid_angle_range_deg']}")
 
-        if degree == 1:
-            slope = fit["physical_from_command_coefficients_descending"][0]
-            inverse_scale = None if abs(slope) < 1e-12 else 1.0/slope
-            print(
-                f"  Degree 1 (scale only): physical/command={slope:.6f} | "
-                f"inverse scale={inverse_scale:.6f}"
-            )
-        else:
-            print(f"  Degree {degree}")
-
-        print(
-            f"    physical fit: RMS {fit['physical_fit_rms_deg']:.4f} deg | "
-            f"max {fit['physical_fit_max_abs_deg']:.4f} deg"
-        )
-        print(
-            f"    physical-from-command coeffs descending: "
-            f"{fit['physical_from_command_coefficients_descending']}"
-        )
-        print(
-            f"    endpoint correction coeffs [c1..c{degree}], no constant: "
-            f"{fit['endpoint_correction_coefficients_by_power_no_constant']}"
-        )
-
+    print("\nTrim note: the fitted table/polynomial is NOT shifted when trim changes.")
+    print("Normal endpoint evaluation is pulse_model(command_angle + angle_trim_deg).")
+    print("Ideally a trim measured at 30 deg or 90 deg would be identical; pan/tilt trim is still defined at forward pose by convention.")
     print(f"Saved summary: {summary_path}")
     return summary
 
 
 def main() -> None:
-    print("IMPORTANT: This test assumes the endpoint-side servo calibration currently applies ONLY a trim offset.")
-    print("Disable/remove any scale, polynomial, lookup-table, or other angle correction before collecting this test data.")
-    if not _promptYesNo("Is the endpoint servo calibration currently trim-only?"):
-        print("Test cancelled. Configure the endpoint calibration to use trim only, then run this script again.")
+    print("SERVO CHARACTERIZATION MODE")
+    print("---------------------------")
+    print("Endpoint main.py must currently have USE_SERVO_CALIBRATION = False.")
+    print("In that mode:")
+    print("  trim:               BYPASSED")
+    print("  pulse polynomial:   BYPASSED")
+    print("  pulse lookup table: BYPASSED")
+    print("  output:              baseline linear angle->pulse mapping only")
+    print("NOTE: this primary checkout's src.endpoint.config must match the config running on the endpoint.")
+    print()
+    if not _promptYesNo("Is endpoint USE_SERVO_CALIBRATION currently False?"):
+        print("Test cancelled. Set USE_SERVO_CALIBRATION=False in endpoint main.py and restart the endpoint.")
         return
 
     axis_text = input("Test axis [pan]: ").strip().lower()
@@ -373,6 +377,14 @@ def main() -> None:
     other_axis = "tilt" if axis == "pan" else "pan"
     other_idx = config.SERVO_IDX[other_axis]
     forward_angle = float(config.FORWARD_SERVO_ANGLES[axis_idx])
+
+    endpoint_channel = endpoint_config.PAN_CHANNEL if axis == "pan" else endpoint_config.TILT_CHANNEL
+    endpoint_servo_calibration = endpoint_config.SERVO_CALIBRATIONS.get(endpoint_channel, endpoint_config.DEFAULT_SERVO_CALIBRATION)
+    print(
+        f"Endpoint baseline for {axis.upper()} channel {endpoint_channel}: "
+        f"{endpoint_servo_calibration.min_angle_deg:g}-{endpoint_servo_calibration.max_angle_deg:g} deg -> "
+        f"{endpoint_servo_calibration.min_pulse_us:g}-{endpoint_servo_calibration.max_pulse_us:g} us"
+    )
 
     default_a = max(float(config.MIN_SERVO_ANGLES[axis_idx]), forward_angle - 30.0)
     default_b = min(float(config.MAX_SERVO_ANGLES[axis_idx]), forward_angle + 30.0)
@@ -406,8 +418,15 @@ def main() -> None:
         "fixed_other_angle_deg": fixed_other_angle_deg,
         "num_round_trips": num_round_trips,
         "polynomial_degree": polynomial_degree,
-        "polynomial_degree_meaning": "maximum degree; analysis reports every degree from 1 through this value",
-        "trim_note": "Endpoint trim may remain enabled, but must stay unchanged throughout the test and when using the fitted correction.",
+        "polynomial_degree_meaning": "maximum pulse-polynomial degree; analysis reports every degree from 1 through this value",
+        "endpoint_use_servo_calibration_required": False,
+        "baseline_min_angle_deg": endpoint_servo_calibration.min_angle_deg,
+        "baseline_max_angle_deg": endpoint_servo_calibration.max_angle_deg,
+        "baseline_min_pulse_us": endpoint_servo_calibration.min_pulse_us,
+        "baseline_max_pulse_us": endpoint_servo_calibration.max_pulse_us,
+        "endpoint_pca_requested_pwm_frequency_hz": endpoint_config.PCA9685_FREQUENCY_HZ,
+        "endpoint_pca_reference_clock_frequency_hz": endpoint_config.PCA9685_REFERENCE_CLOCK_FREQUENCY_HZ,
+        "trim_note": "Trim is bypassed while collecting data. After fitting, trim shifts the INPUT to the pulse polynomial/lookup; the model itself is not shifted.",
     }
 
     camera_calibration = CameraCalibration(config.CAMERA_CALIBRATION_PATH, config.FRAME_W, config.FRAME_H)
@@ -641,6 +660,7 @@ def main() -> None:
                             "direction": pose["direction"],
                             "test_axis": axis,
                             "test_angle_deg": pose["angle_deg"],
+                            "pulse_us": float(endpoint_servo_calibration.baseline_angle_to_pulse_us(pose["angle_deg"])),
                             "fixed_axis": other_axis,
                             "fixed_angle_deg": fixed_other_angle_deg,
                             "pan_deg": float(q[config.SERVO_IDX["pan"]]),
@@ -655,7 +675,7 @@ def main() -> None:
 
                         print(
                             f"  RAW ray #{sample['index']}: cycle={sample['cycle']} {sample['direction']} | "
-                            f"{axis}={sample['test_angle_deg']:.3f} deg | baseline={baseline_m:.3f} m | "
+                            f"{axis}={sample['test_angle_deg']:.3f} deg | pulse={sample['pulse_us']:.3f} us | baseline={baseline_m:.3f} m | "
                             f"ray_C=[{direction_camera[0]:+.6f}, {direction_camera[1]:+.6f}, {direction_camera[2]:+.6f}]"
                         )
 
@@ -698,7 +718,8 @@ def main() -> None:
                     print(f"Erased ray #{removed['index']}. Press SPACE to repeat that scheduled pose.")
 
             elif key == ord("o"):
-                _analyze(samples, test_config, summary_path)
+                if _analyze(samples, test_config, summary_path) is not None:
+                    _saveRaw(raw_path, test_config, samples)
 
     finally:
         if samples:
