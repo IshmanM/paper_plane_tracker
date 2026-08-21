@@ -21,6 +21,14 @@ ANGULAR_FIT_TRANSLATION_FINITE_DIFF_M = 1e-5
 MAX_ANGULAR_FIT_ROTATION_STEP_DEG = 2.0
 MAX_ANGULAR_FIT_TRANSLATION_STEP_M = 0.05
 
+# Jointly estimate a small fixed laser-axis angular offset relative to foam +x.
+# These angles are used only while solving and are printed, not saved.
+LASER_ANGLE_INITIAL_YAW_DEG = 0.0
+LASER_ANGLE_INITIAL_ELEVATION_DEG = 0.0
+MAX_ABS_LASER_ANGLE_DEG = 10.0
+LASER_ANGLE_FINITE_DIFF_RAD = 1e-5
+MAX_LASER_ANGLE_STEP_DEG = 1.0
+
 # Platform FLU -> OpenCV-like axes for the PnP initializer only:
 # [forward, left, up] -> [right, down, forward].
 OPENCV_LIKE_FROM_PLATFORM = np.array([
@@ -207,6 +215,18 @@ def _refineUsingAlternatingRayFit(
     return R, t
 
 
+def _laserDirectionFoam(laser_yaw_rad: float, laser_elevation_rad: float) -> np.ndarray:
+    cy, sy = np.cos(laser_yaw_rad), np.sin(laser_yaw_rad)
+    ce, se = np.cos(laser_elevation_rad), np.sin(laser_elevation_rad)
+    return np.array([ce*cy, ce*sy, se], dtype=np.float64)
+
+
+def _laserDirectionsPlatform(foam_rotations_platform: np.ndarray, laser_yaw_rad: float, laser_elevation_rad: float) -> np.ndarray:
+    direction_foam = _laserDirectionFoam(laser_yaw_rad, laser_elevation_rad)
+    directions = np.einsum("nij,j->ni", foam_rotations_platform, direction_foam)
+    return directions/np.linalg.norm(directions, axis=1, keepdims=True)
+
+
 def _angularErrors(R: np.ndarray, t: np.ndarray, positions_camera_m: np.ndarray, ray_origins_platform: np.ndarray, directions_platform: np.ndarray) -> np.ndarray:
     positions_platform = (R@positions_camera_m.T).T + t
     to_targets = positions_platform - ray_origins_platform
@@ -239,58 +259,69 @@ def _robustAngularCost(errors_rad: np.ndarray) -> float:
     return float(np.sum(0.5*quadratic*quadratic + delta*linear))
 
 
-def _refineUsingRobustAngularFit(
+def _refineUsingRobustJointAngularFit(
     R: np.ndarray,
     t: np.ndarray,
     positions_camera_m: np.ndarray,
     ray_origins_platform: np.ndarray,
-    directions_platform: np.ndarray,
+    foam_rotations_platform: np.ndarray,
+    laser_yaw_rad: float = np.deg2rad(LASER_ANGLE_INITIAL_YAW_DEG),
+    laser_elevation_rad: float = np.deg2rad(LASER_ANGLE_INITIAL_ELEVATION_DEG),
     max_iterations: int = MAX_ANGULAR_FIT_ITERATIONS,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, float, float]:
 
     R = R.copy()
     t = t.copy()
-    delta_huber = np.deg2rad(ANGULAR_FIT_HUBER_DELTA_DEG)
     max_rotation_step_rad = np.deg2rad(MAX_ANGULAR_FIT_ROTATION_STEP_DEG)
+    max_laser_step_rad = np.deg2rad(MAX_LASER_ANGLE_STEP_DEG)
+    max_abs_laser_angle_rad = np.deg2rad(MAX_ABS_LASER_ANGLE_DEG)
+    delta_huber = np.deg2rad(ANGULAR_FIT_HUBER_DELTA_DEG)
 
     for _ in range(max_iterations):
+        directions_platform = _laserDirectionsPlatform(foam_rotations_platform, laser_yaw_rad, laser_elevation_rad)
         errors_rad = _angularErrors(R, t, positions_camera_m, ray_origins_platform, directions_platform)
         residual_vectors = _angularResidualVectors(R, t, positions_camera_m, ray_origins_platform, directions_platform)
 
         if not np.all(np.isfinite(errors_rad)) or not np.all(np.isfinite(residual_vectors)):
             break
 
-        # IRLS form of Huber loss. A sample inside the expected angular uncertainty
-        # keeps full weight; a larger miss is smoothly down-weighted rather than
-        # pulling the whole camera->platform transform toward it.
         weights = np.ones_like(errors_rad)
         large = errors_rad > delta_huber
         weights[large] = delta_huber/np.maximum(errors_rad[large], 1e-12)
         sqrt_weights = np.sqrt(weights)[:, None]
         residual = (sqrt_weights*residual_vectors).reshape(-1)
 
-        J = np.zeros((residual.size, 6), dtype=np.float64)
+        # Parameters: camera rotation xyz, camera translation xyz,
+        # laser yaw offset, laser elevation offset.
+        J = np.zeros((residual.size, 8), dtype=np.float64)
 
         for axis in range(3):
             rotation_step = np.zeros(3, dtype=np.float64)
             rotation_step[axis] = ANGULAR_FIT_ROTATION_FINITE_DIFF_RAD
             dR, _ = cv2.Rodrigues(rotation_step)
-            residual_step = _angularResidualVectors(
-                dR@R, t, positions_camera_m, ray_origins_platform, directions_platform
-            )
+            residual_step = _angularResidualVectors(dR@R, t, positions_camera_m, ray_origins_platform, directions_platform)
             J[:, axis] = ((sqrt_weights*(residual_step - residual_vectors))/ANGULAR_FIT_ROTATION_FINITE_DIFF_RAD).reshape(-1)
 
         for axis in range(3):
             t_step = t.copy()
             t_step[axis] += ANGULAR_FIT_TRANSLATION_FINITE_DIFF_M
-            residual_step = _angularResidualVectors(
-                R, t_step, positions_camera_m, ray_origins_platform, directions_platform
-            )
+            residual_step = _angularResidualVectors(R, t_step, positions_camera_m, ray_origins_platform, directions_platform)
             J[:, 3 + axis] = ((sqrt_weights*(residual_step - residual_vectors))/ANGULAR_FIT_TRANSLATION_FINITE_DIFF_M).reshape(-1)
 
+        yaw_step_directions = _laserDirectionsPlatform(
+            foam_rotations_platform, laser_yaw_rad + LASER_ANGLE_FINITE_DIFF_RAD, laser_elevation_rad
+        )
+        yaw_step_residual = _angularResidualVectors(R, t, positions_camera_m, ray_origins_platform, yaw_step_directions)
+        J[:, 6] = ((sqrt_weights*(yaw_step_residual - residual_vectors))/LASER_ANGLE_FINITE_DIFF_RAD).reshape(-1)
+
+        elevation_step_directions = _laserDirectionsPlatform(
+            foam_rotations_platform, laser_yaw_rad, laser_elevation_rad + LASER_ANGLE_FINITE_DIFF_RAD
+        )
+        elevation_step_residual = _angularResidualVectors(R, t, positions_camera_m, ray_origins_platform, elevation_step_directions)
+        J[:, 7] = ((sqrt_weights*(elevation_step_residual - residual_vectors))/LASER_ANGLE_FINITE_DIFF_RAD).reshape(-1)
+
         delta, *_ = np.linalg.lstsq(J, -residual, rcond=None)
-        rotation_delta = delta[:3]
-        translation_delta = delta[3:]
+        rotation_delta, translation_delta, laser_delta = delta[:3], delta[3:6], delta[6:8]
 
         rotation_norm = float(np.linalg.norm(rotation_delta))
         if rotation_norm > max_rotation_step_rad:
@@ -300,6 +331,10 @@ def _refineUsingRobustAngularFit(
         if translation_norm > MAX_ANGULAR_FIT_TRANSLATION_STEP_M:
             translation_delta *= MAX_ANGULAR_FIT_TRANSLATION_STEP_M/translation_norm
 
+        laser_norm = float(np.linalg.norm(laser_delta))
+        if laser_norm > max_laser_step_rad:
+            laser_delta *= max_laser_step_rad/laser_norm
+
         old_cost = _robustAngularCost(errors_rad)
         accepted = False
 
@@ -307,22 +342,28 @@ def _refineUsingRobustAngularFit(
             dR, _ = cv2.Rodrigues(scale*rotation_delta)
             R_candidate = dR@R
             t_candidate = t + scale*translation_delta
-            candidate_errors = _angularErrors(
-                R_candidate, t_candidate, positions_camera_m, ray_origins_platform, directions_platform
-            )
+            yaw_candidate = float(np.clip(laser_yaw_rad + scale*laser_delta[0], -max_abs_laser_angle_rad, max_abs_laser_angle_rad))
+            elevation_candidate = float(np.clip(laser_elevation_rad + scale*laser_delta[1], -max_abs_laser_angle_rad, max_abs_laser_angle_rad))
+            candidate_directions = _laserDirectionsPlatform(foam_rotations_platform, yaw_candidate, elevation_candidate)
+            candidate_errors = _angularErrors(R_candidate, t_candidate, positions_camera_m, ray_origins_platform, candidate_directions)
 
             if np.all(np.isfinite(candidate_errors)) and _robustAngularCost(candidate_errors) < old_cost:
                 R, t = R_candidate, t_candidate
+                laser_yaw_rad, laser_elevation_rad = yaw_candidate, elevation_candidate
                 accepted = True
                 break
 
         if not accepted:
             break
 
-        if np.linalg.norm(scale*rotation_delta) < 1e-9 and np.linalg.norm(scale*translation_delta) < 1e-8:
+        if (
+            np.linalg.norm(scale*rotation_delta) < 1e-9
+            and np.linalg.norm(scale*translation_delta) < 1e-8
+            and np.linalg.norm(scale*laser_delta) < 1e-9
+        ):
             break
 
-    return R, t
+    return R, t, laser_yaw_rad, laser_elevation_rad
 
 
 def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec: PlatformGeometrySpec) -> tuple[CameraToPlatformCalibration, dict]:
@@ -331,7 +372,7 @@ def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec
 
     positions_camera_m = []
     ray_origins_platform = []
-    directions_platform = []
+    foam_rotations_platform = []
 
     for sample_index, sample in enumerate(samples):
         try:
@@ -345,14 +386,24 @@ def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec
         if position_camera_m.shape != (3,) or not np.all(np.isfinite(position_camera_m)):
             raise ValueError(f"Sample {sample_index} position_camera_m must be a finite length-3 vector")
 
-        ray_origin_platform, direction_platform = servoAnglesToLaserRay(pan_deg, tilt_deg, platform_geometry_spec)
+        yaw_deg, elevation_deg = servoAnglesToPlatformYawElevation(pan_deg, tilt_deg)
+        R_joint = rotationPlatformFromPanTilt(np.deg2rad(yaw_deg), np.deg2rad(elevation_deg))
+        R_foam = R_joint@platform_geometry_spec.rotation_platform_from_foam_mechanism_at_forward
+        foam_origin_platform = R_joint@platform_geometry_spec.foam_mechanism_origin_offset_m
+        ray_origin_platform = foam_origin_platform + R_foam@platform_geometry_spec.laser_origin_offset_foam_mechanism_m
+
         positions_camera_m.append(position_camera_m)
         ray_origins_platform.append(ray_origin_platform)
-        directions_platform.append(direction_platform)
+        foam_rotations_platform.append(R_foam)
 
     positions_camera_m = np.asarray(positions_camera_m, dtype=np.float64)
     ray_origins_platform = np.asarray(ray_origins_platform, dtype=np.float64)
-    directions_platform = np.asarray(directions_platform, dtype=np.float64)
+    foam_rotations_platform = np.asarray(foam_rotations_platform, dtype=np.float64)
+    directions_platform = _laserDirectionsPlatform(
+        foam_rotations_platform,
+        np.deg2rad(LASER_ANGLE_INITIAL_YAW_DEG),
+        np.deg2rad(LASER_ANGLE_INITIAL_ELEVATION_DEG),
+    )
 
     if np.linalg.matrix_rank(positions_camera_m - np.mean(positions_camera_m, axis=0)) < 2:
         raise ValueError("Calibration target positions are degenerate; collect samples spread across different directions/positions")
@@ -392,12 +443,13 @@ def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec
 
     best_R = None
     best_t = None
+    best_laser_yaw_rad = None
+    best_laser_elevation_rad = None
     best_angular_cost = float("inf")
 
     for R_initial, t_initial in initial_solutions:
-        # The old point-to-ray refinement is retained only as a stable initializer.
-        # The final transform is optimized with a robust ANGULAR objective so a
-        # similar aiming miss has similar influence regardless of target distance.
+        # Zero laser-angle error is only the initializer. The final fit jointly
+        # estimates camera extrinsics plus fixed laser yaw/elevation relative to foam +x.
         R, t = _refineUsingAlternatingRayFit(
             R_initial,
             t_initial,
@@ -405,37 +457,63 @@ def solveCameraToPlatformCalibration(samples: list[dict], platform_geometry_spec
             ray_origins_platform,
             directions_platform,
         )
-        R, t = _refineUsingRobustAngularFit(
+        R, t, laser_yaw_rad, laser_elevation_rad = _refineUsingRobustJointAngularFit(
             R,
             t,
             positions_camera_m,
             ray_origins_platform,
-            directions_platform,
+            foam_rotations_platform,
         )
 
+        fitted_directions_platform = _laserDirectionsPlatform(
+            foam_rotations_platform, laser_yaw_rad, laser_elevation_rad
+        )
         positions_platform = (R@positions_camera_m.T).T + t
-        along_ray_m = np.sum((positions_platform - ray_origins_platform)*directions_platform, axis=1)
+        along_ray_m = np.sum((positions_platform - ray_origins_platform)*fitted_directions_platform, axis=1)
 
-        # Laser rays only extend forward from their origins.
         if np.any(along_ray_m <= 0.0):
             continue
 
-        angular_errors_rad = _angularErrors(R, t, positions_camera_m, ray_origins_platform, directions_platform)
+        angular_errors_rad = _angularErrors(
+            R, t, positions_camera_m, ray_origins_platform, fitted_directions_platform
+        )
         angular_cost = _robustAngularCost(angular_errors_rad)
 
         if angular_cost < best_angular_cost:
             best_R = R
             best_t = t
+            best_laser_yaw_rad = laser_yaw_rad
+            best_laser_elevation_rad = laser_elevation_rad
             best_angular_cost = angular_cost
 
     if best_R is None:
         raise RuntimeError("Calibration solutions placed one or more targets behind their laser origins")
 
-    errors_m = _rayErrors(best_R, best_t, positions_camera_m, ray_origins_platform, directions_platform)
+    fitted_directions_platform = _laserDirectionsPlatform(
+        foam_rotations_platform, best_laser_yaw_rad, best_laser_elevation_rad
+    )
+    errors_m = _rayErrors(best_R, best_t, positions_camera_m, ray_origins_platform, fitted_directions_platform)
+    angular_errors_deg = np.rad2deg(
+        _angularErrors(best_R, best_t, positions_camera_m, ray_origins_platform, fitted_directions_platform)
+    )
     calibration = CameraToPlatformCalibration.fromValues(best_R, best_t)
 
-    # Keep the existing results.json schema unchanged for compatibility. These
-    # meter diagnostics are evaluated at the new robust-angular optimum.
+    # Transient solve-only laser-angle estimate. CameraToPlatformCalibration.save()
+    # ignores these attributes, so results.json remains unchanged.
+    calibration.laser_yaw_offset_rad = float(best_laser_yaw_rad)
+    calibration.laser_elevation_offset_rad = float(best_laser_elevation_rad)
+
+    laser_direction_foam = _laserDirectionFoam(best_laser_yaw_rad, best_laser_elevation_rad)
+    print("\nEstimated laser angular offset relative to foam axis (NOT SAVED):")
+    print(f"laser yaw offset:       {np.rad2deg(best_laser_yaw_rad):+.6f} deg  (+ = left)")
+    print(f"laser elevation offset: {np.rad2deg(best_laser_elevation_rad):+.6f} deg  (+ = up)")
+    print(f"laser direction foam:   [{laser_direction_foam[0]:+.8f}, {laser_direction_foam[1]:+.8f}, {laser_direction_foam[2]:+.8f}]")
+    print(f"RMS angular residual:   {np.sqrt(np.mean(angular_errors_deg**2)):.6f} deg")
+    print(f"Mean angular residual:  {np.mean(angular_errors_deg):.6f} deg")
+    print(f"Max angular residual:   {np.max(angular_errors_deg):.6f} deg")
+
+    # Keep results.json exactly compatible. Laser-angle values are intentionally
+    # omitted from diagnostics, so CameraToPlatformCalibration.save() cannot save them.
     diagnostics = {
         "num_samples": len(samples),
         "fit_rms_ray_error_m": float(np.sqrt(np.mean(errors_m**2))),

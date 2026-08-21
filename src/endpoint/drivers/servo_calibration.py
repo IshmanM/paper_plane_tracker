@@ -40,6 +40,8 @@ class ServoCalibration:
          # raw_servo_angle = commanded_angle + angle_trim_deg
         self.angle_trim_deg = float(angle_trim_deg)
 
+        #note that all scaling/polynomials are applied AFTER trim deg is applied
+
         self.validate()
 
 

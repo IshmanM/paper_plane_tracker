@@ -139,7 +139,34 @@ def _servoAnglesToFoamRay(pan_deg: float, tilt_deg: float, platform_geometry_spe
     return origin, direction/np.linalg.norm(direction)
 
 
-def _solveServoAnglesToPoint(target_platform_m: np.ndarray, q_initial: np.ndarray, platform_geometry_spec, aim_with_laser: bool) -> tuple[bool, np.ndarray, float]:
+def _servoAnglesToEstimatedLaserRay(
+    pan_deg: float,
+    tilt_deg: float,
+    platform_geometry_spec,
+    laser_yaw_offset_rad: float,
+    laser_elevation_offset_rad: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    yaw_deg, elevation_deg = servoAnglesToPlatformYawElevation(pan_deg, tilt_deg)
+    R_joint = rotationPlatformFromPanTilt(np.deg2rad(yaw_deg), np.deg2rad(elevation_deg))
+    R_foam = R_joint@platform_geometry_spec.rotation_platform_from_foam_mechanism_at_forward
+    foam_origin_platform = R_joint@platform_geometry_spec.foam_mechanism_origin_offset_m
+    laser_origin_platform = foam_origin_platform + R_foam@platform_geometry_spec.laser_origin_offset_foam_mechanism_m
+
+    cy, sy = np.cos(laser_yaw_offset_rad), np.sin(laser_yaw_offset_rad)
+    ce, se = np.cos(laser_elevation_offset_rad), np.sin(laser_elevation_offset_rad)
+    laser_direction_foam = np.array([ce*cy, ce*sy, se], dtype=float)
+    laser_direction_platform = R_foam@laser_direction_foam
+    return laser_origin_platform, laser_direction_platform/np.linalg.norm(laser_direction_platform)
+
+
+def _solveServoAnglesToPoint(
+    target_platform_m: np.ndarray,
+    q_initial: np.ndarray,
+    platform_geometry_spec,
+    aim_with_laser: bool,
+    laser_yaw_offset_rad: float = 0.0,
+    laser_elevation_offset_rad: float = 0.0,
+) -> tuple[bool, np.ndarray, float]:
     target_platform_m = np.asarray(target_platform_m, dtype=float)
     q = np.clip(np.asarray(q_initial, dtype=float).copy(), config.MIN_SERVO_ANGLES, config.MAX_SERVO_ANGLES)
     pan_idx, tilt_idx = config.SERVO_IDX["pan"], config.SERVO_IDX["tilt"]
@@ -148,7 +175,13 @@ def _solveServoAnglesToPoint(target_platform_m: np.ndarray, q_initial: np.ndarra
     def residual(q_test: np.ndarray) -> tuple[np.ndarray | None, float]:
         pan_deg, tilt_deg = float(q_test[pan_idx]), float(q_test[tilt_idx])
         origin, direction = (
-            servoAnglesToLaserRay(pan_deg, tilt_deg, platform_geometry_spec)
+            _servoAnglesToEstimatedLaserRay(
+                pan_deg,
+                tilt_deg,
+                platform_geometry_spec,
+                laser_yaw_offset_rad,
+                laser_elevation_offset_rad,
+            )
             if aim_with_laser else
             _servoAnglesToFoamRay(pan_deg, tilt_deg, platform_geometry_spec)
         )
@@ -367,8 +400,16 @@ def main() -> None:
                     with servo_angles_lock:
                         q_start = servo_angles.copy()
 
+                    laser_yaw_offset_rad = float(getattr(test_calibration, "laser_yaw_offset_rad", 0.0))
+                    laser_elevation_offset_rad = float(getattr(test_calibration, "laser_elevation_offset_rad", 0.0))
+
                     aim_valid, q_test, aim_error_deg = _solveServoAnglesToPoint(
-                        target_platform_m, q_start, platform_geometry_spec, test_aim_with_laser
+                        target_platform_m,
+                        q_start,
+                        platform_geometry_spec,
+                        test_aim_with_laser,
+                        laser_yaw_offset_rad,
+                        laser_elevation_offset_rad,
                     )
 
                     if aim_valid:
@@ -668,6 +709,12 @@ def main() -> None:
                     print(f"RMS ray error:  {candidate_diagnostics['fit_rms_ray_error_m']:.6f} m")
                     print(f"Mean ray error: {candidate_diagnostics['fit_mean_ray_error_m']:.6f} m")
                     print(f"Max ray error:  {candidate_diagnostics['fit_max_ray_error_m']:.6f} m")
+                    if hasattr(candidate_calibration, "laser_yaw_offset_rad"):
+                        print(
+                            f"Test-mode laser model: yaw "
+                            f"{np.rad2deg(candidate_calibration.laser_yaw_offset_rad):+.3f} deg, elevation "
+                            f"{np.rad2deg(candidate_calibration.laser_elevation_offset_rad):+.3f} deg"
+                        )
                     print("Press V to save this candidate.")
 
                 except Exception as e:
