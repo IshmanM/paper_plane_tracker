@@ -4,7 +4,9 @@ from src.endpoint.drivers.servo_calibration import ServoCalibration
 
 PCA9685_FREQUENCY_HZ = 50.0
 PCA9685_NUM_CHANNELS = 16
-PCA9685_REFERENCE_CLOCK_FREQUENCY_HZ = 24_516_000 # hz. based on last debug_pca9685_clock test
+
+# Note: 3v3 vs 5v will chang below clock value
+PCA9685_REFERENCE_CLOCK_FREQUENCY_HZ = 24_516_000 # hz. based on last debug_pca9685_clock test at 3V3 logic level
 
 
 PAN_CHANNEL = 0
@@ -40,7 +42,7 @@ SERVO_CALIBRATIONS = {
         max_angle_deg=180.0,
         min_pulse_us=500.0,
         max_pulse_us=2500.0,
-        angle_trim_deg=4.4
+        angle_trim_deg=7.0
     ),
 
     FOAM_CHANNEL: ServoCalibration(
