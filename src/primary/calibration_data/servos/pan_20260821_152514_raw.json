@@ -1,0 +1,492 @@
+{
+    "test_config": {
+        "axis": "pan",
+        "other_axis": "tilt",
+        "angle_a_deg": 90.0,
+        "angle_b_deg": 130.0,
+        "step_deg": 10.0,
+        "fixed_other_angle_deg": 90.0,
+        "num_round_trips": 2,
+        "polynomial_degree": 3,
+        "polynomial_degree_meaning": "maximum degree; analysis reports every degree from 1 through this value",
+        "trim_note": "Endpoint trim may remain enabled, but must stay unchanged throughout the test and when using the fitted correction."
+    },
+    "samples": [
+        {
+            "index": 1,
+            "cycle": 1,
+            "direction": "forward",
+            "test_axis": "pan",
+            "test_angle_deg": 90.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 90.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.3213921878528694,
+            "estimated_physical_angle_deg": 88.5111618181196,
+            "near_position_camera_m": [
+                0.770859043235847,
+                0.007096046462996812,
+                1.59907764708324
+            ],
+            "far_position_camera_m": [
+                0.7927474793868399,
+                -0.00912577988564406,
+                1.919313009161872
+            ],
+            "direction_camera": [
+                0.06810506595453787,
+                -0.05047361747344987,
+                0.9964005790496471
+            ]
+        },
+        {
+            "index": 2,
+            "cycle": 1,
+            "direction": "forward",
+            "test_axis": "pan",
+            "test_angle_deg": 100.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 100.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.5318922085928992,
+            "estimated_physical_angle_deg": 99.0520959946345,
+            "near_position_camera_m": [
+                0.5321706441610634,
+                0.031734431877786504,
+                1.1768652220157325
+            ],
+            "far_position_camera_m": [
+                0.47076782475108303,
+                0.0010529247660187465,
+                1.7043096839751772
+            ],
+            "direction_camera": [
+                -0.1154422238528728,
+                -0.057683693455361056,
+                0.9916378797026923
+            ]
+        },
+        {
+            "index": 3,
+            "cycle": 1,
+            "direction": "forward",
+            "test_axis": "pan",
+            "test_angle_deg": 110.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 110.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.5382509068462793,
+            "estimated_physical_angle_deg": 109.88923248720516,
+            "near_position_camera_m": [
+                0.3705677146187058,
+                0.0426532688586436,
+                0.9707461647669341
+            ],
+            "far_position_camera_m": [
+                0.20903341842536344,
+                0.012706311283730879,
+                1.4833121503787088
+            ],
+            "direction_camera": [
+                -0.300109659154695,
+                -0.05563754225771396,
+                0.9522807655169635
+            ]
+        },
+        {
+            "index": 4,
+            "cycle": 1,
+            "direction": "forward",
+            "test_axis": "pan",
+            "test_angle_deg": 120.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 120.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.6271876030301369,
+            "estimated_physical_angle_deg": 122.24359660575166,
+            "near_position_camera_m": [
+                0.21656682538737565,
+                0.0497907844854799,
+                0.8427748022359381
+            ],
+            "far_position_camera_m": [
+                -0.09527848205230793,
+                0.0168855191769336,
+                1.3859451596170382
+            ],
+            "direction_camera": [
+                -0.4972121673532172,
+                -0.05246478908315599,
+                0.8660412845484772
+            ]
+        },
+        {
+            "index": 5,
+            "cycle": 1,
+            "direction": "forward",
+            "test_axis": "pan",
+            "test_angle_deg": 130.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 130.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.6221931783235944,
+            "estimated_physical_angle_deg": 134.29550113698406,
+            "near_position_camera_m": [
+                0.16698770497052481,
+                0.06140165477095814,
+                0.6213193139828881
+            ],
+            "far_position_camera_m": [
+                -0.24825261057908476,
+                0.03352757178868147,
+                1.083837277950315
+            ],
+            "direction_camera": [
+                -0.6673816589703088,
+                -0.044799724512215276,
+                0.7433671407545992
+            ]
+        },
+        {
+            "index": 6,
+            "cycle": 1,
+            "direction": "reverse",
+            "test_axis": "pan",
+            "test_angle_deg": 120.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 120.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.6588867390480081,
+            "estimated_physical_angle_deg": 121.52215995168669,
+            "near_position_camera_m": [
+                0.28131978954716697,
+                0.055549870142921474,
+                0.7410086472831965
+            ],
+            "far_position_camera_m": [
+                -0.03906428260835247,
+                0.020811235612562123,
+                1.3157077063335232
+            ],
+            "direction_camera": [
+                -0.48625059994138914,
+                -0.05272322612009377,
+                0.8722273874879924
+            ]
+        },
+        {
+            "index": 7,
+            "cycle": 1,
+            "direction": "reverse",
+            "test_axis": "pan",
+            "test_angle_deg": 110.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 110.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.6071636004325214,
+            "estimated_physical_angle_deg": 110.18779525690627,
+            "near_position_camera_m": [
+                0.4012669196892128,
+                0.04848819099988642,
+                0.8860202741753854
+            ],
+            "far_position_camera_m": [
+                0.21603335141716773,
+                0.015424637535584675,
+                1.4632922761880427
+            ],
+            "direction_camera": [
+                -0.3050801598450424,
+                -0.05445575696690063,
+                0.950768461089284
+            ]
+        },
+        {
+            "index": 8,
+            "cycle": 1,
+            "direction": "reverse",
+            "test_axis": "pan",
+            "test_angle_deg": 100.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 100.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.5413197241684745,
+            "estimated_physical_angle_deg": 99.3893452839185,
+            "near_position_camera_m": [
+                0.5333109947448831,
+                0.03501000227739765,
+                1.1335699269253008
+            ],
+            "far_position_camera_m": [
+                0.4676679585197553,
+                0.0024995679592346802,
+                1.669910403888791
+            ],
+            "direction_camera": [
+                -0.1212648150332275,
+                -0.060057730887420564,
+                0.9908016519947931
+            ]
+        },
+        {
+            "index": 9,
+            "cycle": 1,
+            "direction": "reverse",
+            "test_axis": "pan",
+            "test_angle_deg": 90.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 90.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.5077675750975035,
+            "estimated_physical_angle_deg": 87.91184965198713,
+            "near_position_camera_m": [
+                0.7713126908134258,
+                0.005898607574782033,
+                1.6375280674069472
+            ],
+            "far_position_camera_m": [
+                0.8112217736385052,
+                -0.0221939489729365,
+                2.142944711073411
+            ],
+            "direction_camera": [
+                0.07859714716406603,
+                -0.05532562125953808,
+                0.9953700638907703
+            ]
+        },
+        {
+            "index": 10,
+            "cycle": 2,
+            "direction": "forward",
+            "test_axis": "pan",
+            "test_angle_deg": 100.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 100.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.5186427607344185,
+            "estimated_physical_angle_deg": 98.98284055158604,
+            "near_position_camera_m": [
+                0.524086064492456,
+                0.02912981855865866,
+                1.2251220003043533
+            ],
+            "far_position_camera_m": [
+                0.464826185149371,
+                0.00027726031638678893,
+                1.7395596640162345
+            ],
+            "direction_camera": [
+                -0.11425953243648991,
+                -0.05563088975042381,
+                0.9918921127587269
+            ]
+        },
+        {
+            "index": 11,
+            "cycle": 2,
+            "direction": "forward",
+            "test_axis": "pan",
+            "test_angle_deg": 110.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 110.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.5357840666854282,
+            "estimated_physical_angle_deg": 110.16856406262026,
+            "near_position_camera_m": [
+                0.394803218839536,
+                0.047096883241453655,
+                0.895823112551336
+            ],
+            "far_position_camera_m": [
+                0.23151846873852375,
+                0.0176664792844657,
+                1.405270369704963
+            ],
+            "direction_camera": [
+                -0.30475850301252183,
+                -0.054929599043614816,
+                0.9508443584469934
+            ]
+        },
+        {
+            "index": 12,
+            "cycle": 2,
+            "direction": "forward",
+            "test_axis": "pan",
+            "test_angle_deg": 120.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 120.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.6623528323251904,
+            "estimated_physical_angle_deg": 121.97470886606418,
+            "near_position_camera_m": [
+                0.24292021450166432,
+                0.05229033133071468,
+                0.7957417633126357
+            ],
+            "far_position_camera_m": [
+                -0.08371082628360742,
+                0.019796602592066816,
+                1.3710395951157732
+            ],
+            "direction_camera": [
+                -0.4931375316062786,
+                -0.049058035465144145,
+                0.8685670291218561
+            ]
+        },
+        {
+            "index": 13,
+            "cycle": 2,
+            "direction": "forward",
+            "test_axis": "pan",
+            "test_angle_deg": 130.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 130.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.6243925604528378,
+            "estimated_physical_angle_deg": 134.25346907172872,
+            "near_position_camera_m": [
+                0.1464080601576883,
+                0.06023558491569475,
+                0.6431236513101168
+            ],
+            "far_position_camera_m": [
+                -0.2699579933386099,
+                0.03264372889124726,
+                1.1076062328197946
+            ],
+            "direction_camera": [
+                -0.6668337835324795,
+                -0.04418991796512858,
+                0.7438951245236074
+            ]
+        },
+        {
+            "index": 14,
+            "cycle": 2,
+            "direction": "reverse",
+            "test_axis": "pan",
+            "test_angle_deg": 120.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 120.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.5704180006252269,
+            "estimated_physical_angle_deg": 121.45406117684774,
+            "near_position_camera_m": [
+                0.26505779236920757,
+                0.05396173526174135,
+                0.7770341195726472
+            ],
+            "far_position_camera_m": [
+                -0.011716622644364846,
+                0.024553951947748016,
+                1.2749375247746335
+            ],
+            "direction_camera": [
+                -0.48521332550901974,
+                -0.051554795398742484,
+                0.872874636943858
+            ]
+        },
+        {
+            "index": 15,
+            "cycle": 2,
+            "direction": "reverse",
+            "test_axis": "pan",
+            "test_angle_deg": 110.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 110.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.4900936315874692,
+            "estimated_physical_angle_deg": 110.0,
+            "near_position_camera_m": [
+                0.36700476580465935,
+                0.042408051047194105,
+                0.9926915369333905
+            ],
+            "far_position_camera_m": [
+                0.2190189773417306,
+                0.015287435124509887,
+                1.4591210024772963
+            ],
+            "direction_camera": [
+                -0.301954114326248,
+                -0.05533762157822261,
+                0.9517150101156946
+            ]
+        },
+        {
+            "index": 16,
+            "cycle": 2,
+            "direction": "reverse",
+            "test_axis": "pan",
+            "test_angle_deg": 100.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 100.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.4846203000160194,
+            "estimated_physical_angle_deg": 99.37472248702106,
+            "near_position_camera_m": [
+                0.5222103693756311,
+                0.03073738617554735,
+                1.2096156794155473
+            ],
+            "far_position_camera_m": [
+                0.4635649268803719,
+                0.0017220117372202554,
+                1.6897986188338023
+            ],
+            "direction_camera": [
+                -0.12101317772557342,
+                -0.05987238759368514,
+                0.9908436344956708
+            ]
+        },
+        {
+            "index": 17,
+            "cycle": 2,
+            "direction": "reverse",
+            "test_axis": "pan",
+            "test_angle_deg": 90.0,
+            "fixed_axis": "tilt",
+            "fixed_angle_deg": 90.0,
+            "pan_deg": 90.0,
+            "tilt_deg": 90.0,
+            "baseline_m": 0.4202917185848339,
+            "estimated_physical_angle_deg": 89.4350706731028,
+            "near_position_camera_m": [
+                0.7804203725736713,
+                0.001705363917776335,
+                1.7018115531829086
+            ],
+            "far_position_camera_m": [
+                0.8023188975830825,
+                -0.022638623751769293,
+                2.1208258173526984
+            ],
+            "direction_camera": [
+                0.052103156072515235,
+                -0.05792164487921479,
+                0.9969605529717659
+            ]
+        }
+    ]
+}

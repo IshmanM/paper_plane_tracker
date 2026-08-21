@@ -1,0 +1,224 @@
+{
+    "test_config": {
+        "axis": "pan",
+        "other_axis": "tilt",
+        "angle_a_deg": 90.0,
+        "angle_b_deg": 130.0,
+        "step_deg": 10.0,
+        "fixed_other_angle_deg": 90.0,
+        "num_round_trips": 2,
+        "polynomial_degree": 3,
+        "polynomial_degree_meaning": "maximum degree; analysis reports every degree from 1 through this value",
+        "trim_note": "Endpoint trim may remain enabled, but must stay unchanged throughout the test and when using the fitted correction."
+    },
+    "num_ray_samples": 17,
+    "estimated_rotation_axis_camera": [
+        0.011025216298093297,
+        -0.9969972760915604,
+        -0.07664774015970223
+    ],
+    "overall_physical_per_command_scale": 1.1325225472867961,
+    "inverse_global_scale_correction": 0.8829846278961221,
+    "local_scale_mean": 1.1458000538889306,
+    "local_scale_min": 0.993965181391826,
+    "local_scale_max": 1.2799407894880972,
+    "nonlinearity_rms_deg_from_best_linear": 0.6144568703164581,
+    "nonlinearity_max_abs_deg_from_best_linear": 1.4210142057857666,
+    "backlash_mean_deg": 0.3032263704914975,
+    "backlash_max_deg": 0.6210421716406955,
+    "repeatability_same_direction_std_mean_deg": 0.21683824303806848,
+    "repeatability_same_direction_std_max_deg": 1.0770799132767903,
+    "maximum_polynomial_degree": 3,
+    "polynomial_reference_deg": 110.0,
+    "polynomial_fits": {
+        "1": {
+            "degree": 1,
+            "physical_from_command_coefficients_descending": [
+                1.1325225472867941,
+                0.6645074130529569
+            ],
+            "physical_fit_rms_deg": 0.6144568703164609,
+            "physical_fit_max_abs_deg": 1.421014205785724,
+            "endpoint_correction_coefficients_by_power_no_constant": [
+                -0.11673721615188296
+            ]
+        },
+        "2": {
+            "degree": 2,
+            "physical_from_command_coefficients_descending": [
+                0.0033144507261425736,
+                1.1381402603819522,
+                0.1252069559178886
+            ],
+            "physical_fit_rms_deg": 0.3347583917104623,
+            "physical_fit_max_abs_deg": 0.7763323867487486,
+            "endpoint_correction_coefficients_by_power_no_constant": [
+                -0.11621141892747175,
+                -0.002498952748830291
+            ]
+        },
+        "3": {
+            "degree": 3,
+            "physical_from_command_coefficients_descending": [
+                3.8683150282688565e-05,
+                0.003352750874937328,
+                1.1260757135116082,
+                0.12290894699020675
+            ],
+            "physical_fit_rms_deg": 0.32800471818755755,
+            "physical_fit_max_abs_deg": 0.8020408486313357,
+            "endpoint_correction_coefficients_by_power_no_constant": [
+                -0.10882243049094939,
+                -0.0024570261413536265,
+                -1.8153056624746478e-05
+            ]
+        }
+    },
+    "endpoint_correction_formula": "corrected_command_deg = desired_deg + sum(c[k-1]*(desired_deg-reference_deg)**k for k=1..degree); keep existing trim unchanged",
+    "intervals": [
+        {
+            "from_command_deg": 90.0,
+            "to_command_deg": 100.0,
+            "cycle": 1,
+            "direction": "forward",
+            "command_delta_deg": 10.0,
+            "measured_delta_deg": 10.540934176514895,
+            "physical_per_command_scale": 1.0540934176514896
+        },
+        {
+            "from_command_deg": 100.0,
+            "to_command_deg": 110.0,
+            "cycle": 1,
+            "direction": "forward",
+            "command_delta_deg": 10.0,
+            "measured_delta_deg": 10.837136492570664,
+            "physical_per_command_scale": 1.0837136492570665
+        },
+        {
+            "from_command_deg": 110.0,
+            "to_command_deg": 120.0,
+            "cycle": 1,
+            "direction": "forward",
+            "command_delta_deg": 10.0,
+            "measured_delta_deg": 12.3543641185465,
+            "physical_per_command_scale": 1.23543641185465
+        },
+        {
+            "from_command_deg": 120.0,
+            "to_command_deg": 130.0,
+            "cycle": 1,
+            "direction": "forward",
+            "command_delta_deg": 10.0,
+            "measured_delta_deg": 12.051904531232395,
+            "physical_per_command_scale": 1.2051904531232396
+        },
+        {
+            "from_command_deg": 130.0,
+            "to_command_deg": 120.0,
+            "cycle": 1,
+            "direction": "reverse",
+            "command_delta_deg": -10.0,
+            "measured_delta_deg": -12.773341185297369,
+            "physical_per_command_scale": 1.2773341185297369
+        },
+        {
+            "from_command_deg": 120.0,
+            "to_command_deg": 110.0,
+            "cycle": 1,
+            "direction": "reverse",
+            "command_delta_deg": -10.0,
+            "measured_delta_deg": -11.334364694780419,
+            "physical_per_command_scale": 1.1334364694780419
+        },
+        {
+            "from_command_deg": 110.0,
+            "to_command_deg": 100.0,
+            "cycle": 1,
+            "direction": "reverse",
+            "command_delta_deg": -10.0,
+            "measured_delta_deg": -10.798449972987768,
+            "physical_per_command_scale": 1.079844997298777
+        },
+        {
+            "from_command_deg": 100.0,
+            "to_command_deg": 90.0,
+            "cycle": 1,
+            "direction": "reverse",
+            "command_delta_deg": -10.0,
+            "measured_delta_deg": -11.477495631931376,
+            "physical_per_command_scale": 1.1477495631931376
+        },
+        {
+            "from_command_deg": 90.0,
+            "to_command_deg": 100.0,
+            "cycle": 2,
+            "direction": "forward",
+            "command_delta_deg": 10.0,
+            "measured_delta_deg": 11.070990899598911,
+            "physical_per_command_scale": 1.1070990899598911
+        },
+        {
+            "from_command_deg": 100.0,
+            "to_command_deg": 110.0,
+            "cycle": 2,
+            "direction": "forward",
+            "command_delta_deg": 10.0,
+            "measured_delta_deg": 11.185723511034226,
+            "physical_per_command_scale": 1.1185723511034227
+        },
+        {
+            "from_command_deg": 110.0,
+            "to_command_deg": 120.0,
+            "cycle": 2,
+            "direction": "forward",
+            "command_delta_deg": 10.0,
+            "measured_delta_deg": 11.806144803443914,
+            "physical_per_command_scale": 1.1806144803443914
+        },
+        {
+            "from_command_deg": 120.0,
+            "to_command_deg": 130.0,
+            "cycle": 2,
+            "direction": "forward",
+            "command_delta_deg": 10.0,
+            "measured_delta_deg": 12.27876020566454,
+            "physical_per_command_scale": 1.227876020566454
+        },
+        {
+            "from_command_deg": 130.0,
+            "to_command_deg": 120.0,
+            "cycle": 2,
+            "direction": "reverse",
+            "command_delta_deg": -10.0,
+            "measured_delta_deg": -12.799407894880972,
+            "physical_per_command_scale": 1.2799407894880972
+        },
+        {
+            "from_command_deg": 120.0,
+            "to_command_deg": 110.0,
+            "cycle": 2,
+            "direction": "reverse",
+            "command_delta_deg": -10.0,
+            "measured_delta_deg": -11.454061176847745,
+            "physical_per_command_scale": 1.1454061176847745
+        },
+        {
+            "from_command_deg": 110.0,
+            "to_command_deg": 100.0,
+            "cycle": 2,
+            "direction": "reverse",
+            "command_delta_deg": -10.0,
+            "measured_delta_deg": -10.62527751297894,
+            "physical_per_command_scale": 1.062527751297894
+        },
+        {
+            "from_command_deg": 100.0,
+            "to_command_deg": 90.0,
+            "cycle": 2,
+            "direction": "reverse",
+            "command_delta_deg": -10.0,
+            "measured_delta_deg": -9.93965181391826,
+            "physical_per_command_scale": 0.993965181391826
+        }
+    ]
+}
