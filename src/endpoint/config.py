@@ -4,6 +4,8 @@ from src.endpoint.drivers.servo_calibration import ServoCalibration
 
 PCA9685_FREQUENCY_HZ = 50.0
 PCA9685_NUM_CHANNELS = 16
+PCA9685_REFERENCE_CLOCK_FREQUENCY_HZ = 25000000 # hz. Determine experimentally, usually different than the 25MHz claimed
+
 
 PAN_CHANNEL = 0
 TILT_CHANNEL = 1

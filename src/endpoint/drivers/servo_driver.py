@@ -26,7 +26,7 @@ class ServoDriver:
         - platform state machine
         - platform-level min/max angle safety
     """
-    def __init__(self, i2c, frequency_hz: float = 50.0, num_channels: int = 16, default_calibration: ServoCalibration | None = None):
+    def __init__(self, i2c, frequency_hz: float = 50.0, num_channels: int = 16, default_calibration: ServoCalibration | None = None, pca_reference_clock_speed: int = 25000000):
 
         if frequency_hz <= 0.0:
             raise ValueError("frequency_hz must be positive")
@@ -56,7 +56,7 @@ class ServoDriver:
         self.last_pulse_us: dict[int, float] = {}
 
         self.i2c = i2c
-        self.pca = PCA9685(self.i2c)
+        self.pca = PCA9685(i2c_bus=self.i2c, reference_clock_speed=pca_reference_clock_speed)
 
         # PCA9685 has one shared PWM frequency for all channels.
         self.pca.frequency = self.frequency_hz

@@ -27,7 +27,8 @@ if __name__ == "__main__":
         i2c=i2c,
         frequency_hz=config.PCA9685_FREQUENCY_HZ, 
         num_channels=config.PCA9685_NUM_CHANNELS,
-        default_calibration=config.DEFAULT_SERVO_CALIBRATION
+        default_calibration=config.DEFAULT_SERVO_CALIBRATION,
+        pca_reference_clock_speed=config.PCA9685_REFERENCE_CLOCK_FREQUENCY_HZ,
     )
 
     for channel, calibration in config.SERVO_CALIBRATIONS.items():
