@@ -3,6 +3,7 @@ import time
 
 import board
 
+import src.endpoint.config as config
 from src.endpoint.drivers.servo_driver import ServoDriver, ServoCalibration
 
 
@@ -93,6 +94,13 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--reference-clock-frequency-hz",
+        type=int,
+        default=config.PCA9685_REFERENCE_CLOCK_FREQUENCY_HZ,
+        help="PCA9685 reference clock frequency. Defaults to endpoint config.",
+    )
+
+    parser.add_argument(
         "--cal-min-angle",
         type=float,
         default=DEFAULT_CAL_MIN_ANGLE_DEG,
@@ -167,6 +175,7 @@ def main() -> None:
     print("-------------------------------------")
     print(f"Test channel: {args.channel}")
     print(f"PWM frequency: {args.frequency_hz} Hz")
+    print(f"PCA reference clock: {args.reference_clock_frequency_hz} Hz")
     print(
         f"Calibration: {args.cal_min_angle}-{args.cal_max_angle} deg "
         f"-> {args.min_pulse_us}-{args.max_pulse_us} us"
@@ -206,6 +215,7 @@ def main() -> None:
         frequency_hz=args.frequency_hz,
         num_channels=16,
         default_calibration=calibration,
+        pca_reference_clock_speed=args.reference_clock_frequency_hz,
     )
 
     try:

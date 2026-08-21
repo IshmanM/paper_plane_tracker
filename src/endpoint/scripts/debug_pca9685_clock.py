@@ -72,7 +72,7 @@ def main() -> None:
     print(f"Debug nominal PCA reference clock:     {NOMINAL_REFERENCE_CLOCK_HZ / 1e6:.6f} MHz")
     print(f"Expected PCA prescale:                 {prescale}")
     print(f"Nominal quantized PWM frequency:       {nominal_quantized_frequency_hz:.6f} Hz")
-    print(f"NOTE: config.PCA9685_REFERENCE_CLOCK_SPEED is ignored by this test.")
+    print("NOTE: the endpoint config reference-clock calibration is ignored by this test.")
     print()
     input("Press Enter to begin measurement...")
 
@@ -87,8 +87,11 @@ def main() -> None:
         with timestamps_lock:
             timestamps_ns.append(time.monotonic_ns())
 
+    actual_prescale = None
+
     try:
         pca.frequency = target_frequency_hz
+        actual_prescale = int(pca.prescale_reg)
         pca.channels[pca_channel].duty_cycle = 0x8000  # 50% duty for easy edge measurement.
         gpio.when_activated = on_rising_edge
 
@@ -117,12 +120,19 @@ def main() -> None:
     median_period_s = statistics.median(periods_s)
     period_std_s = statistics.stdev(periods_s) if len(periods_s) >= 2 else 0.0
 
-    estimated_reference_clock_hz = measured_frequency_hz * 4096.0 * (prescale + 1)
+    if actual_prescale is None:
+        raise RuntimeError("Failed to read PCA9685 prescale register.")
+
+    actual_nominal_frequency_hz = NOMINAL_REFERENCE_CLOCK_HZ / (4096.0 * (actual_prescale + 1))
+    estimated_reference_clock_hz = measured_frequency_hz * 4096.0 * (actual_prescale + 1)
     clock_ratio = estimated_reference_clock_hz / NOMINAL_REFERENCE_CLOCK_HZ
-    period_scale_vs_nominal = nominal_quantized_frequency_hz / measured_frequency_hz
+    period_scale_vs_nominal = actual_nominal_frequency_hz / measured_frequency_hz
 
     print()
     print("RESULTS")
+    print(f"Expected PCA prescale:                 {prescale}")
+    print(f"Actual PCA prescale register:          {actual_prescale}")
+    print(f"Prescale matches expectation:          {actual_prescale == prescale}")
     print(f"Rising edges captured:                 {len(ts)}")
     print(f"Mean period:                           {mean_period_s * 1000.0:.6f} ms")
     print(f"Median period:                         {median_period_s * 1000.0:.6f} ms")
