@@ -41,8 +41,8 @@ SERVO_CALIBRATIONS = {
         # Candidate pulse-width quadratic reconstructed from pan_20260821_152514. OLD RUN: rerun with
         # endpoint USE_SERVO_CALIBRATION=False after the final driver changes before enabling this.
         # x = servo_angle_deg - 110; pulse_us = c2*x^2 + c1*x + c0
-        # pulse_polynomial_coefficients_descending=(-0.0237015538, 9.79857658, 1720.90106),
-        # pulse_polynomial_reference_deg=110.0, pulse_polynomial_valid_angle_range_deg=(88.51, 134.27),
+        pulse_polynomial_coefficients_descending=(-0.0237015538, 9.79857658, 1720.90106),
+        pulse_polynomial_reference_deg=110.0, pulse_polynomial_valid_angle_range_deg=(88.51, 134.27),
         # For a generated lookup table, endpoint-linear extrapolation can be allowed
         # from the tested table endpoints out to the servo calibration limits:
         # pulse_lookup_extrapolation_angle_range_deg=(0.0, 180.0),
