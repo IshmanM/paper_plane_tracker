@@ -27,12 +27,19 @@ class ServoCalibration:
     Lookup rows are:
         ((servo_angle_deg, pulse_us), ...)
 
+    Inside the lookup range, pulse width is linearly interpolated. Outside the
+    tested lookup range, endpoint-linear extrapolation can optionally be enabled
+    up to pulse_lookup_extrapolation_angle_range_deg. Below the table, the slope
+    of the first two points is continued; above it, the slope of the last two
+    points is continued. None means no extrapolation.
+
     This is servo calibration, not platform-level motion safety.
     """
     def __init__(self, min_angle_deg: float=0.0, max_angle_deg: float=180.0, min_pulse_us: float=500.0, max_pulse_us: float=2500.0,
                  angle_trim_deg: float=0.0, pulse_polynomial_coefficients_descending: tuple[float, ...] | None=None,
                  pulse_polynomial_reference_deg: float=0.0, pulse_polynomial_valid_angle_range_deg: tuple[float, float] | None=None,
-                 pulse_lookup_table: tuple[tuple[float, float], ...] | None=None):
+                 pulse_lookup_table: tuple[tuple[float, float], ...] | None=None,
+                 pulse_lookup_extrapolation_angle_range_deg: tuple[float, float] | None=None):
         self.min_angle_deg = float(min_angle_deg)
         self.max_angle_deg = float(max_angle_deg)
         self.min_pulse_us = float(min_pulse_us)
@@ -42,6 +49,7 @@ class ServoCalibration:
         self.pulse_polynomial_coefficients_descending = None if pulse_polynomial_coefficients_descending is None else tuple(float(x) for x in pulse_polynomial_coefficients_descending)
         self.pulse_polynomial_valid_angle_range_deg = None if pulse_polynomial_valid_angle_range_deg is None else tuple(float(x) for x in pulse_polynomial_valid_angle_range_deg)
         self.pulse_lookup_table = None if pulse_lookup_table is None else tuple((float(angle), float(pulse)) for angle, pulse in pulse_lookup_table)
+        self.pulse_lookup_extrapolation_angle_range_deg = None if pulse_lookup_extrapolation_angle_range_deg is None else tuple(float(x) for x in pulse_lookup_extrapolation_angle_range_deg)
         self.validate()
 
     def validate(self) -> None:
@@ -70,6 +78,9 @@ class ServoCalibration:
             if lo < self.min_angle_deg or hi > self.max_angle_deg:
                 raise ValueError("Pulse polynomial valid range must lie inside min_angle_deg/max_angle_deg")
 
+        if self.pulse_lookup_table is None and self.pulse_lookup_extrapolation_angle_range_deg is not None:
+            raise ValueError("pulse_lookup_extrapolation_angle_range_deg is only valid with a pulse lookup table")
+
         if self.pulse_lookup_table is not None:
             if len(self.pulse_lookup_table) < 2: raise ValueError("pulse_lookup_table must contain at least two points")
             angles = [angle for angle, _ in self.pulse_lookup_table]
@@ -80,6 +91,15 @@ class ServoCalibration:
                 raise ValueError("Lookup-table angle range must lie inside min_angle_deg/max_angle_deg")
             if any(pulse < self.min_pulse_us or pulse > self.max_pulse_us for pulse in pulses):
                 raise ValueError("Lookup-table pulse widths must lie inside min_pulse_us/max_pulse_us")
+
+            if self.pulse_lookup_extrapolation_angle_range_deg is not None:
+                extrap_lo, extrap_hi = self.pulse_lookup_extrapolation_angle_range_deg
+                if not math.isfinite(extrap_lo) or not math.isfinite(extrap_hi) or extrap_hi <= extrap_lo:
+                    raise ValueError("pulse_lookup_extrapolation_angle_range_deg must be (min, max) with min < max")
+                if extrap_lo < self.min_angle_deg or extrap_hi > self.max_angle_deg:
+                    raise ValueError("Lookup extrapolation range must lie inside min_angle_deg/max_angle_deg")
+                if extrap_lo > angles[0] or extrap_hi < angles[-1]:
+                    raise ValueError("Lookup extrapolation range must contain the entire lookup-table angle range")
 
     def cmd_to_servo_angle_deg(self, cmd_angle_deg: float) -> float:
         cmd_angle_deg = float(cmd_angle_deg)
@@ -123,8 +143,31 @@ class ServoCalibration:
     def _lookup_pulse_us(self, servo_angle_deg: float) -> float:
         table = self.pulse_lookup_table
         angles = [row[0] for row in table]
-        if servo_angle_deg < angles[0] or servo_angle_deg > angles[-1]:
-            raise ValueError(f"servo_angle_deg={servo_angle_deg} is outside pulse lookup-table range [{angles[0]}, {angles[-1]}]")
+
+        # Outside the tested range, optionally continue only the nearest endpoint
+        # segment's slope. This is deliberately linear extrapolation, never a
+        # higher-order continuation of the whole lookup table.
+        if servo_angle_deg < angles[0]:
+            if self.pulse_lookup_extrapolation_angle_range_deg is None:
+                raise ValueError(f"servo_angle_deg={servo_angle_deg} is below pulse lookup-table range [{angles[0]}, {angles[-1]}] and lookup extrapolation is disabled")
+            extrap_lo, _ = self.pulse_lookup_extrapolation_angle_range_deg
+            if servo_angle_deg < extrap_lo:
+                raise ValueError(f"servo_angle_deg={servo_angle_deg} is below lookup extrapolation minimum {extrap_lo}")
+            angle_0, pulse_0 = table[0]
+            angle_1, pulse_1 = table[1]
+            slope_us_per_deg = (pulse_1 - pulse_0)/(angle_1 - angle_0)
+            return pulse_0 + slope_us_per_deg*(servo_angle_deg - angle_0)
+
+        if servo_angle_deg > angles[-1]:
+            if self.pulse_lookup_extrapolation_angle_range_deg is None:
+                raise ValueError(f"servo_angle_deg={servo_angle_deg} is above pulse lookup-table range [{angles[0]}, {angles[-1]}] and lookup extrapolation is disabled")
+            _, extrap_hi = self.pulse_lookup_extrapolation_angle_range_deg
+            if servo_angle_deg > extrap_hi:
+                raise ValueError(f"servo_angle_deg={servo_angle_deg} is above lookup extrapolation maximum {extrap_hi}")
+            angle_0, pulse_0 = table[-2]
+            angle_1, pulse_1 = table[-1]
+            slope_us_per_deg = (pulse_1 - pulse_0)/(angle_1 - angle_0)
+            return pulse_1 + slope_us_per_deg*(servo_angle_deg - angle_1)
 
         index = bisect.bisect_left(angles, servo_angle_deg)
         if index < len(table) and angles[index] == servo_angle_deg: return table[index][1]

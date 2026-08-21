@@ -219,6 +219,25 @@ def _buildPulseLookupTable(samples: list[dict]) -> list[dict]:
     return rows
 
 
+
+def _extrapolateLookupEndpointLinear(lookup_table: list[list[float]], angle_deg: float) -> float:
+    if len(lookup_table) < 2: raise ValueError("Lookup table needs at least two points")
+    if angle_deg < lookup_table[0][0]:
+        angle_0, pulse_0 = lookup_table[0]
+        angle_1, pulse_1 = lookup_table[1]
+        return float(pulse_0 + (pulse_1 - pulse_0)/(angle_1 - angle_0)*(angle_deg - angle_0))
+    if angle_deg > lookup_table[-1][0]:
+        angle_0, pulse_0 = lookup_table[-2]
+        angle_1, pulse_1 = lookup_table[-1]
+        return float(pulse_1 + (pulse_1 - pulse_0)/(angle_1 - angle_0)*(angle_deg - angle_1))
+
+    angles = [row[0] for row in lookup_table]
+    index = int(np.searchsorted(angles, angle_deg))
+    if index < len(lookup_table) and np.isclose(angles[index], angle_deg): return float(lookup_table[index][1])
+    angle_0, pulse_0 = lookup_table[index - 1]
+    angle_1, pulse_1 = lookup_table[index]
+    return float(pulse_0 + (pulse_1 - pulse_0)/(angle_1 - angle_0)*(angle_deg - angle_0))
+
 def _analyze(samples: list[dict], test_config: dict, summary_path: Path) -> dict | None:
     if len(samples) < 4:
         print("Need at least 4 completed rays before analysis.")
@@ -272,6 +291,16 @@ def _analyze(samples: list[dict], test_config: dict, summary_path: Path) -> dict
     lookup_angles = np.asarray([row["servo_angle_deg"] for row in lookup_rows], dtype=float)
     lookup_pulses = np.asarray([row["pulse_us"] for row in lookup_rows], dtype=float)
     pulse_lookup_table = [[float(angle), float(pulse)] for angle, pulse in zip(lookup_angles, lookup_pulses)]
+    lookup_extrapolation_angle_range_deg = [
+        float(test_config["baseline_min_angle_deg"]),
+        float(test_config["baseline_max_angle_deg"]),
+    ]
+    lookup_extrapolated_min_pulse_us = _extrapolateLookupEndpointLinear(pulse_lookup_table, lookup_extrapolation_angle_range_deg[0])
+    lookup_extrapolated_max_pulse_us = _extrapolateLookupEndpointLinear(pulse_lookup_table, lookup_extrapolation_angle_range_deg[1])
+    lookup_extrapolation_within_allowed_pulse_range = (
+        test_config["baseline_min_pulse_us"] <= lookup_extrapolated_min_pulse_us <= test_config["baseline_max_pulse_us"]
+        and test_config["baseline_min_pulse_us"] <= lookup_extrapolated_max_pulse_us <= test_config["baseline_max_pulse_us"]
+    )
 
     max_polynomial_degree = min(test_config["polynomial_degree"], len(lookup_rows) - 1)
     reference_deg = float(0.5*(lookup_angles[0] + lookup_angles[-1]))
@@ -315,6 +344,11 @@ def _analyze(samples: list[dict], test_config: dict, summary_path: Path) -> dict
         "repeatability_same_direction_std_max_deg": float(np.max(repeatability_values)) if repeatability_values.size else None,
         "pulse_lookup_points": lookup_rows,
         "pulse_lookup_table": pulse_lookup_table,
+        "pulse_lookup_extrapolation_mode": "endpoint_linear",
+        "pulse_lookup_extrapolation_angle_range_deg": lookup_extrapolation_angle_range_deg,
+        "lookup_extrapolated_min_pulse_us": lookup_extrapolated_min_pulse_us,
+        "lookup_extrapolated_max_pulse_us": lookup_extrapolated_max_pulse_us,
+        "lookup_extrapolation_within_allowed_pulse_range": lookup_extrapolation_within_allowed_pulse_range,
         "maximum_polynomial_degree": max_polynomial_degree,
         "pulse_polynomial_reference_deg": reference_deg,
         "polynomial_fits": polynomial_fits,
@@ -338,6 +372,12 @@ def _analyze(samples: list[dict], test_config: dict, summary_path: Path) -> dict
     for angle, pulse in pulse_lookup_table:
         print(f"    ({angle:.9f}, {pulse:.6f}),")
     print(")")
+    print(f"pulse_lookup_extrapolation_angle_range_deg=({lookup_extrapolation_angle_range_deg[0]:.1f}, {lookup_extrapolation_angle_range_deg[1]:.1f})")
+    print("Outside the tested table range: continue the first/last lookup segment linearly.")
+    print(f"Extrapolated pulse at {lookup_extrapolation_angle_range_deg[0]:g} deg: {lookup_extrapolated_min_pulse_us:.3f} us")
+    print(f"Extrapolated pulse at {lookup_extrapolation_angle_range_deg[1]:g} deg: {lookup_extrapolated_max_pulse_us:.3f} us")
+    if not lookup_extrapolation_within_allowed_pulse_range:
+        print("WARNING: full-range endpoint extrapolation leaves the configured min/max pulse range; runtime will reject those out-of-range pulses.")
 
     print(f"\nPulse polynomial reference: {reference_deg:.9f} deg")
     for degree in range(1, max_polynomial_degree + 1):
