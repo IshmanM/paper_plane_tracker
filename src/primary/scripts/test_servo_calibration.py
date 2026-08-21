@@ -396,7 +396,9 @@ def _analyze(samples: list[dict], test_config: dict, summary_path: Path) -> dict
 def main() -> None:
     print("SERVO CHARACTERIZATION MODE")
     print("---------------------------")
-    print("Endpoint main.py must currently have USE_SERVO_CALIBRATION = False.")
+    print("Endpoint must currently be running with:")
+    print("  python -m src.endpoint.main --no-servo-calibration")
+    print()
     print("In that mode:")
     print("  trim:               BYPASSED")
     print("  pulse polynomial:   BYPASSED")
@@ -404,8 +406,9 @@ def main() -> None:
     print("  output:              baseline linear angle->pulse mapping only")
     print("NOTE: this primary checkout's src.endpoint.config must match the config running on the endpoint.")
     print()
-    if not _promptYesNo("Is endpoint USE_SERVO_CALIBRATION currently False?"):
-        print("Test cancelled. Set USE_SERVO_CALIBRATION=False in endpoint main.py and restart the endpoint.")
+
+    if not _promptYesNo("Is the endpoint currently running with --no-servo-calibration?"):
+        print("Test cancelled. Restart the endpoint with --no-servo-calibration, then run this script again.")
         return
 
     axis_text = input("Test axis [pan]: ").strip().lower()
