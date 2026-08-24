@@ -62,7 +62,7 @@ FORWARD_SERVO_ANGLES[SERVO_IDX["pan"]] = 90.0 # degrees
 FORWARD_SERVO_ANGLES[SERVO_IDX["tilt"]] = 90.0 # degrees
 
 MIN_SERVO_ANGLES = np.zeros(NUM_SERVOS, dtype=float)
-MIN_SERVO_ANGLES[SERVO_IDX["pan"]] = 0.0 # degrees
+MIN_SERVO_ANGLES[SERVO_IDX["pan"]] = 5.0 # degrees
 MIN_SERVO_ANGLES[SERVO_IDX["tilt"]] = 30.0 # degrees
 
 MAX_SERVO_ANGLES = np.zeros(NUM_SERVOS, dtype=float)
