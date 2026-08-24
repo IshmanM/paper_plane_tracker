@@ -24,14 +24,22 @@ class ServoCalibration:
         x = servo_angle_deg - pulse_polynomial_reference_deg
         pulse_us = cN*x**N + ... + c1*x + c0
 
+    pulse_polynomial_valid_angle_range_deg records the angle range over which the
+    polynomial was fitted/tested. It is diagnostic metadata only; it does NOT
+    restrict commanded angles. Polynomial operation is still bounded only by
+    min_angle_deg/max_angle_deg and min_pulse_us/max_pulse_us.
+
     Lookup rows are:
         ((servo_angle_deg, pulse_us), ...)
 
     Inside the lookup range, pulse width is linearly interpolated. Outside the
-    tested lookup range, endpoint-linear extrapolation can optionally be enabled
-    up to pulse_lookup_extrapolation_angle_range_deg. Below the table, the slope
-    of the first two points is continued; above it, the slope of the last two
-    points is continued. None means no extrapolation.
+    tested lookup range, the first/last lookup segment is always extrapolated
+    linearly. Runtime operation is bounded only by min_angle_deg/max_angle_deg and
+    min_pulse_us/max_pulse_us.
+
+    pulse_lookup_extrapolation_angle_range_deg is metadata describing the range
+    over which lookup extrapolation was intended/evaluated. It does NOT restrict
+    commanded angles. None simply means that metadata was not recorded.
 
     This is servo calibration, not platform-level motion safety.
     """
@@ -66,8 +74,6 @@ class ServoCalibration:
             if not all(math.isfinite(x) for x in self.pulse_polynomial_coefficients_descending):
                 raise ValueError("Pulse polynomial coefficients must be finite")
 
-        if self.pulse_polynomial_coefficients_descending is not None and self.pulse_polynomial_valid_angle_range_deg is None:
-            raise ValueError("pulse_polynomial_valid_angle_range_deg is required when a pulse polynomial is used")
         if self.pulse_polynomial_coefficients_descending is None and self.pulse_polynomial_valid_angle_range_deg is not None:
             raise ValueError("pulse_polynomial_valid_angle_range_deg is only valid with a pulse polynomial")
 
@@ -96,10 +102,6 @@ class ServoCalibration:
                 extrap_lo, extrap_hi = self.pulse_lookup_extrapolation_angle_range_deg
                 if not math.isfinite(extrap_lo) or not math.isfinite(extrap_hi) or extrap_hi <= extrap_lo:
                     raise ValueError("pulse_lookup_extrapolation_angle_range_deg must be (min, max) with min < max")
-                if extrap_lo < self.min_angle_deg or extrap_hi > self.max_angle_deg:
-                    raise ValueError("Lookup extrapolation range must lie inside min_angle_deg/max_angle_deg")
-                if extrap_lo > angles[0] or extrap_hi < angles[-1]:
-                    raise ValueError("Lookup extrapolation range must contain the entire lookup-table angle range")
 
     def cmd_to_servo_angle_deg(self, cmd_angle_deg: float) -> float:
         cmd_angle_deg = float(cmd_angle_deg)
@@ -113,10 +115,9 @@ class ServoCalibration:
         servo_angle_deg = self._validate_servo_angle(servo_angle_deg)
 
         if self.pulse_polynomial_coefficients_descending is not None:
-            if self.pulse_polynomial_valid_angle_range_deg is not None:
-                lo, hi = self.pulse_polynomial_valid_angle_range_deg
-                if servo_angle_deg < lo or servo_angle_deg > hi:
-                    raise ValueError(f"servo_angle_deg={servo_angle_deg} is outside polynomial calibration range [{lo}, {hi}]")
+            # pulse_polynomial_valid_angle_range_deg is fit/test metadata only.
+            # The polynomial may be evaluated anywhere inside min_angle_deg/max_angle_deg;
+            # the resulting pulse must still remain inside min_pulse_us/max_pulse_us.
             pulse_us = self._polynomial_pulse_us(servo_angle_deg)
         elif self.pulse_lookup_table is not None:
             pulse_us = self._lookup_pulse_us(servo_angle_deg)
@@ -144,26 +145,16 @@ class ServoCalibration:
         table = self.pulse_lookup_table
         angles = [row[0] for row in table]
 
-        # Outside the tested range, optionally continue only the nearest endpoint
-        # segment's slope. This is deliberately linear extrapolation, never a
-        # higher-order continuation of the whole lookup table.
+        # Outside the tested table, always continue the nearest endpoint segment
+        # linearly. pulse_lookup_extrapolation_angle_range_deg is metadata only;
+        # actual runtime bounds are min_angle_deg/max_angle_deg and pulse limits.
         if servo_angle_deg < angles[0]:
-            if self.pulse_lookup_extrapolation_angle_range_deg is None:
-                raise ValueError(f"servo_angle_deg={servo_angle_deg} is below pulse lookup-table range [{angles[0]}, {angles[-1]}] and lookup extrapolation is disabled")
-            extrap_lo, _ = self.pulse_lookup_extrapolation_angle_range_deg
-            if servo_angle_deg < extrap_lo:
-                raise ValueError(f"servo_angle_deg={servo_angle_deg} is below lookup extrapolation minimum {extrap_lo}")
             angle_0, pulse_0 = table[0]
             angle_1, pulse_1 = table[1]
             slope_us_per_deg = (pulse_1 - pulse_0)/(angle_1 - angle_0)
             return pulse_0 + slope_us_per_deg*(servo_angle_deg - angle_0)
 
         if servo_angle_deg > angles[-1]:
-            if self.pulse_lookup_extrapolation_angle_range_deg is None:
-                raise ValueError(f"servo_angle_deg={servo_angle_deg} is above pulse lookup-table range [{angles[0]}, {angles[-1]}] and lookup extrapolation is disabled")
-            _, extrap_hi = self.pulse_lookup_extrapolation_angle_range_deg
-            if servo_angle_deg > extrap_hi:
-                raise ValueError(f"servo_angle_deg={servo_angle_deg} is above lookup extrapolation maximum {extrap_hi}")
             angle_0, pulse_0 = table[-2]
             angle_1, pulse_1 = table[-1]
             slope_us_per_deg = (pulse_1 - pulse_0)/(angle_1 - angle_0)

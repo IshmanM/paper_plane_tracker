@@ -72,10 +72,12 @@ def _promptManualCalibrationModel(base_kwargs: dict) -> ServoCalibration:
         table = tuple((float(pair.split(":")[0].strip()), float(pair.split(":")[1].strip())) for pair in table_text.split(",") if pair.strip())
         if len(table) < 2: raise ValueError("Lookup table requires at least two points")
 
+        print("Outside the lookup table, endpoint-linear extrapolation is always used within the servo min/max angle limits.")
+        record_range = input("Record intended/evaluated extrapolation range as metadata? [y/N]: ").strip().lower() in ("y", "yes")
         extrapolation_range = None
-        if input("Enable endpoint-linear extrapolation outside the table? [y/N]: ").strip().lower() in ("y", "yes"):
-            extrap_min_deg = _promptFloat("Lookup extrapolation minimum servo angle deg", base_kwargs["min_angle_deg"])
-            extrap_max_deg = _promptFloat("Lookup extrapolation maximum servo angle deg", base_kwargs["max_angle_deg"])
+        if record_range:
+            extrap_min_deg = _promptFloat("Metadata extrapolation minimum servo angle deg", base_kwargs["min_angle_deg"])
+            extrap_max_deg = _promptFloat("Metadata extrapolation maximum servo angle deg", base_kwargs["max_angle_deg"])
             extrapolation_range = (extrap_min_deg, extrap_max_deg)
 
         return ServoCalibration(**base_kwargs, pulse_lookup_table=table, pulse_lookup_extrapolation_angle_range_deg=extrapolation_range)
