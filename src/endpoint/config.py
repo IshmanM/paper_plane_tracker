@@ -42,19 +42,19 @@ SERVO_CALIBRATIONS = {
         # Candidate pulse-width quadratic reconstructed from pan_20260821_152514. OLD RUN: rerun with
         # endpoint --no-servo-calibration after the final driver changes before enabling this.
         # x = servo_angle_deg - 110; pulse_us = c2*x^2 + c1*x + c0
-        pulse_polynomial_coefficients_descending=(-0.0237015538, 9.79857658, 1720.90106),
-        pulse_polynomial_reference_deg=110.0,
-        pulse_polynomial_valid_angle_range_deg=(88.51, 134.27),
+        # pulse_polynomial_coefficients_descending=(-0.0237015538, 9.79857658, 1720.90106),
+        # pulse_polynomial_reference_deg=110.0,
+        # pulse_polynomial_valid_angle_range_deg=(88.51, 134.27),
 
         # Same OLD pan run represented as a lookup table instead of a polynomial.
-        # pulse_lookup_table=(
-        #     (88.511162, 1500.000000),
-        #     (99.213409, 1611.111111),
-        #     (110.084282, 1722.222222),
-        #     (121.748434, 1833.333333),
-        #     (134.274485, 1944.444444),
-        # ),
-        # pulse_lookup_extrapolation_angle_range_deg=(0.0, 180.0),
+        pulse_lookup_table=(
+            (88.511162, 1500.000000),
+            (99.213409, 1611.111111),
+            (110.084282, 1722.222222),
+            (121.748434, 1833.333333),
+            (134.274485, 1944.444444),
+        ),
+        pulse_lookup_extrapolation_angle_range_deg=(0.0, 180.0),
     ),
 
     TILT_CHANNEL: ServoCalibration(
