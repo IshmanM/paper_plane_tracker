@@ -42,30 +42,30 @@ SERVO_CALIBRATIONS = {
         # Candidate pulse-width quadratic reconstructed from pan_20260821_152514. OLD RUN: rerun with
         # endpoint --no-servo-calibration after the final driver changes before enabling this.
         # x = servo_angle_deg - 110; pulse_us = c2*x^2 + c1*x + c0
-        # pulse_polynomial_coefficients_descending=(0.000134301131282, 2.40649407868e-05, 9.68513977329, 1500.0,),
-        # pulse_polynomial_reference_deg=90.0,
-        # pulse_polynomial_valid_angle_range_deg=(16.043, 164.340),
+        pulse_polynomial_coefficients_descending=(0.000134301131282, 2.40649407868e-05, 9.68513977329, 1500.0,),
+        pulse_polynomial_reference_deg=90.0,
+        pulse_polynomial_valid_angle_range_deg=(16.043, 164.340),
 
         # Same OLD pan run represented as a lookup table instead of a polynomial.
-        pulse_lookup_table=(
-            (16.043, 722.2),
-            (24.446, 833.3),
-            (34.377, 944.4),
-            (45.073, 1055.6),
-            (56.387, 1166.7),
-            (67.846, 1277.8),
-            (78.540, 1388.9),
-            (90.000, 1500.0),
-            (100.695, 1611.1),
-            (111.391, 1722.2),
-            (123.614, 1833.3),
-            (134.928, 1944.4),
-            (146.005, 2055.6),
-            (154.790, 2166.7),
-            (164.340, 2277.8),
-        ),
-        pulse_lookup_extrapolation_angle_range_deg=(0.0, 180.0),
-            ),
+        # pulse_lookup_table=(
+        #     (16.043, 722.2),
+        #     (24.446, 833.3),
+        #     (34.377, 944.4),
+        #     (45.073, 1055.6),
+        #     (56.387, 1166.7),
+        #     (67.846, 1277.8),
+        #     (78.540, 1388.9),
+        #     (90.000, 1500.0),
+        #     (100.695, 1611.1),
+        #     (111.391, 1722.2),
+        #     (123.614, 1833.3),
+        #     (134.928, 1944.4),
+        #     (146.005, 2055.6),
+        #     (154.790, 2166.7),
+        #     (164.340, 2277.8),
+        # ),
+        # pulse_lookup_extrapolation_angle_range_deg=(0.0, 180.0),
+    ),
 
     TILT_CHANNEL: ServoCalibration(
         min_angle_deg=20.0,
