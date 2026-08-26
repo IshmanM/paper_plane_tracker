@@ -186,7 +186,7 @@ def cmd_thread_main(
                 for telemetry in link.recv_telemetry_available():
                     comm_buffer.set_latest_endpoint_telemetry(telemetry)
 
-                    print(telemetry) # for debug only
+                    # print(telemetry) # for debug only
 
                 #Todo: consider storing errors in the comm_buffer and/or a log file
                 for error_msg in link.recv_errors_available():

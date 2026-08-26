@@ -37,7 +37,7 @@ OBJECT_VISION_SPEC_IDS = (
 TRACKER_KWARGS = dict(
     min_hits=3,
     max_missed_on_confirmed=15,
-    max_missed_on_tentative=1,
+    max_missed_on_tentative=1, #todo: try 0
     # params...
 )
 
@@ -148,6 +148,12 @@ if __name__ == "__main__":
                     last_detection_px_w = detection.px_w
                     last_detection_px_h = detection.px_h
                     drawDetection(frame, detection)
+
+                    print(
+                        f"BALL | u={detection.u:.2f} v={detection.v:.2f} | "
+                        f"w={detection.px_w:.3f} h={detection.px_h:.3f} | "
+                        f"xyz=[{measurement.x:.3f}, {measurement.y:.3f}, {measurement.z:.3f}]"
+                    ) # FOR DEBUG ONLY
 
                 if not object_detected:
                     detection_label = "No detection"

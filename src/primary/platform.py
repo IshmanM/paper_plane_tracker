@@ -23,7 +23,7 @@ SEARCH_FREQUENCY = 0.2 # hz
 TRIGGER_TIME_LOWER_THRESHOLD = 0.040 # seconds. allow up to this much time late
 TRIGGER_TIME_UPPER_THRESHOLD = 0.020 # seconds. allow up to this much time early
 
-FIRST_INTERCEPT_MAX_NUM_CANDIDATES = 10 
+FIRST_INTERCEPT_MAX_NUM_CANDIDATES = 76 
 FIRST_INTERCEPT_MAX_LOOKAHEAD = 2.5 # seconds
 
 SUBSEQUENT_INTERCEPT_MAX_NUM_CANDIDATES = 5 
@@ -46,8 +46,8 @@ MIN_FORWARD_RANGE = 0.02  # m
 # Usually False for a turret. High arc is slower and less direct.
 USE_HIGH_ARC = False
 
-MIN_FIRST_INTERCEPT_READY_MARGIN = 0.05 # seconds
-MIN_SUBSEQUENT_INTERCEPT_READY_MARGIN = 0.025 # seconds
+MIN_FIRST_INTERCEPT_READY_MARGIN = 0.020 # seconds
+MIN_SUBSEQUENT_INTERCEPT_READY_MARGIN = 0.010 # seconds
 
 ACTIVE_PLAN_INTERCEPT_POSITION_TOLERANCES = np.array([0.03, 0.03, 0.06], dtype=float) # x, y, z meters
 
@@ -172,6 +172,13 @@ class Platform:
                 self.active_plan = plan
                 self.mode = PlatformMode.SLEWING_TO_LEAD
 
+                print(
+                    f"FIRST PLAN | "
+                    f"ready in {plan.ready_time - now:.3f}s | "
+                    f"trigger in {plan.trigger_time - now:.3f}s | "
+                    f"ready->trigger {plan.trigger_time - plan.ready_time:.3f}s"
+                ) # FOR DEBUG ONLY
+
                 # print("made it to A") # FOR DEBUG ONLY
             else:
                 self.active_plan = self._make_search_plan(now)
@@ -187,6 +194,13 @@ class Platform:
 
                 if valid_plan_computed:
                     self.active_plan = plan
+  
+                    print(
+                        f"REPLACED FIRST PLAN | "
+                        f"ready in {plan.ready_time - now:.3f}s | "
+                        f"trigger in {plan.trigger_time - now:.3f}s | "
+                        f"ready->trigger {plan.trigger_time - plan.ready_time:.3f}s"
+                    ) # FOR DEBUG ONLY
 
                     # print("made it to C") # FOR DEBUG ONLY
                 else:
@@ -197,6 +211,10 @@ class Platform:
             
             # if (and not elif) incase the new best first intercept plan somehow chooses a point that the platform is already pointed toward
             if (self.mode == PlatformMode.SLEWING_TO_LEAD and self._close_to_trigger_time(now)):
+
+                print(f"ENTER FOLLOWING | trigger error {(now - self.active_plan.trigger_time)*1000:.1f} ms") # FOR DEBUG ONLY
+
+
                 self.mode = PlatformMode.FOLLOWING_LEAD
 
         # elif (and not if) because the we dont want to get into receding horizon stuff until first foam
@@ -859,6 +877,9 @@ class Platform:
             return False
         
         if self.active_plan.trigger_time < now and not self._close_to_trigger_time(now):
+
+            print(f"PLAN INVALID: missed trigger by {(now - self.active_plan.trigger_time)*1000:.1f} ms") # FOR DEBUG ONLY
+
             return False
         
         current_intercept_prediction = np.asarray(tracker.predict(dt)[:3], dtype=float).reshape(-1).copy()
@@ -871,6 +892,24 @@ class Platform:
         if np.any(tolerances <= 0.0):
             raise ValueError("ACTIVE_PLAN_INTERCEPT_POSITION_TOLERANCES must be > 0")
 
-        normalized_error = (current_intercept_prediction - planned_intercept_prediction) / tolerances
-        return np.linalg.norm(normalized_error) <= 1.0
+        position_error = current_intercept_prediction - planned_intercept_prediction
+        normalized_error = position_error/tolerances
+        error_norm = np.linalg.norm(normalized_error)
+
+        if error_norm > 1.0:
+            print(f"PLAN INVALID | error={position_error} m | norm={error_norm:.2f}") # FOR DEBUG ONLY
+
+        track_position = np.array([tracker.track.x, tracker.track.y, tracker.track.z]) # FOR DEBUG ONLY
+        track_velocity = np.array([tracker.track.dx, tracker.track.dy, tracker.track.dz]) # FOR DEBUG ONLY
+        print(
+            f"PLAN INVALID | "
+            f"dt={dt:.3f}s | "
+            f"pos={track_position} | "
+            f"vel={track_velocity} | "
+            f"vel*dt={track_velocity*dt} | "
+            f"error={position_error} | "
+            f"norm={error_norm:.2f}"
+        ) # FOR DEBUG ONLY
+        
+        return error_norm <= 1.0
         
