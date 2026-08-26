@@ -53,8 +53,8 @@ PLATFORM_GEOMETRY_SPECS = {
         rotation_platform_from_foam_mechanism_at_forward=np.eye(3),
         laser_origin_offset_foam_mechanism_m=np.array([
             0.0,     # +ve forward
-           -0.052,   # +ve left 
-           -0.005,   # +ve up   
+           -0.068,   # +ve left 
+           -0.01545, # +ve up   
         ]),
     ),
 }
