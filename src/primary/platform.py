@@ -26,6 +26,9 @@ TRIGGER_TIME_UPPER_THRESHOLD = 0.020 # seconds. allow up to this much time early
 FIRST_INTERCEPT_MAX_NUM_CANDIDATES = 76 
 FIRST_INTERCEPT_MAX_LOOKAHEAD = 2.5 # seconds
 
+FIRST_INTERCEPT_REFRESH_NUM_CANDIDATES = 10
+FIRST_INTERCEPT_REFRESH_HALF_WINDOW = 0.005 # seconds, +/- around previous intercept time
+
 SUBSEQUENT_INTERCEPT_MAX_NUM_CANDIDATES = 5 
 SUBSEQUENT_INTERCEPT_MAX_LOOKAHEAD = 0.5 # seconds
 
@@ -190,30 +193,38 @@ class Platform:
         if self.mode == PlatformMode.SLEWING_TO_LEAD:
             
             if not self._active_plan_still_valid(tracker, now):
-                valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now)
+                valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now, fixed_intercept_time=self.active_plan.intercept_time)
 
                 if valid_plan_computed:
                     self.active_plan = plan
   
                     print(
-                        f"REPLACED FIRST PLAN | "
+                        f"REPLACED FIRST PLAN, INTERCEPT WINDOW | "
                         f"ready in {plan.ready_time - now:.3f}s | "
                         f"trigger in {plan.trigger_time - now:.3f}s | "
                         f"ready->trigger {plan.trigger_time - plan.ready_time:.3f}s"
                     ) # FOR DEBUG ONLY
 
-                    # print("made it to C") # FOR DEBUG ONLY
                 else:
-                    self.active_plan = self._make_search_plan(now)
-                    self.mode = PlatformMode.SEARCHING
+                    # Existing intercept time is no longer achievable. Find a new one.
+                    valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now)
 
-                    # print("made it to D") # FOR DEBUG ONLY
+                    if valid_plan_computed:
+                        self.active_plan = plan
+                        print(
+                            f"REPLACED FIRST PLAN, FROM SCRATCH | "
+                            f"ready in {plan.ready_time - now:.3f}s | "
+                            f"trigger in {plan.trigger_time - now:.3f}s | "
+                            f"ready->trigger {plan.trigger_time - plan.ready_time:.3f}s"
+                        ) # FOR DEBUG ONLY
+                    else:
+                        self.active_plan = self._make_search_plan(now)
+                        self.mode = PlatformMode.SEARCHING
             
             # if (and not elif) incase the new best first intercept plan somehow chooses a point that the platform is already pointed toward
             if (self.mode == PlatformMode.SLEWING_TO_LEAD and self._close_to_trigger_time(now)):
 
                 print(f"ENTER FOLLOWING | trigger error {(now - self.active_plan.trigger_time)*1000:.1f} ms") # FOR DEBUG ONLY
-
 
                 self.mode = PlatformMode.FOLLOWING_LEAD
 
@@ -376,42 +387,49 @@ class Platform:
         return np.asarray(config.DEFAULT_SERVO_ANGLES, dtype=float).copy()
 
 
-    def _make_best_valid_subsequent_intercept_plan(self, tracker: SingleObjectTracker, now) -> tuple[bool, Plan | None]:
+    def _make_best_valid_first_intercept_plan(self, tracker: SingleObjectTracker, now, fixed_intercept_time=None) -> tuple[bool, Plan | None]:
         """
-        Build the best SUBSEQUENT_INTERCEPT plan. 
-        Might have way different implementation than FIRST_INTERCEPT plans later.
+        Build the best FIRST_INTERCEPT plan.
+        Might have way different implementation than SUBSEQUENT_INTERCEPT plans later.
 
         Returns:
-        (True, plan)  if a feasible subsequent plan was found
+        (True, plan)  if a feasible first plan was found
         (False, None) otherwise
 
         Important timing meaning:
         intercept_time = when object and foam meet
-        trigger_time      = when platform must trigger/release
+        trigger_time = when platform must trigger/release
         expected_ready_time = when pan/tilt is expected to be aimed and settled
 
         This function intentionally searches candidate intercept times instead of trying to solve everything analytically.
         """
 
-        candidate_intercept_times = np.linspace(
-            start=now, 
-            stop=now + SUBSEQUENT_INTERCEPT_MAX_LOOKAHEAD, 
-            num=SUBSEQUENT_INTERCEPT_MAX_NUM_CANDIDATES
-        )
+        if fixed_intercept_time is None:
+            candidate_intercept_times = np.linspace(
+                start=now,
+                stop=now + FIRST_INTERCEPT_MAX_LOOKAHEAD,
+                num=FIRST_INTERCEPT_MAX_NUM_CANDIDATES
+            )
+        else:
+            candidate_intercept_times = np.linspace(
+                start=fixed_intercept_time - FIRST_INTERCEPT_REFRESH_HALF_WINDOW,
+                stop=fixed_intercept_time + FIRST_INTERCEPT_REFRESH_HALF_WINDOW,
+                num=FIRST_INTERCEPT_REFRESH_NUM_CANDIDATES
+            )
 
-        cost_weights = SUBSEQUENT_INTERCEPT_PLAN_COST_WEIGHTS 
+        cost_weights = FIRST_INTERCEPT_PLAN_COST_WEIGHTS
 
         return self._make_best_valid_intercept_plan_from_candidates(
-            tracker, 
-            now, 
-            PlanType.SUBSEQUENT_INTERCEPT, 
-            candidate_intercept_times, 
-            cost_weights, 
-            min_ready_margin=MIN_SUBSEQUENT_INTERCEPT_READY_MARGIN
+            tracker,
+            now,
+            PlanType.FIRST_INTERCEPT,
+            candidate_intercept_times,
+            cost_weights,
+            min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN
         )
 
 
-    def _make_best_valid_first_intercept_plan(self, tracker: SingleObjectTracker, now) -> tuple[bool, Plan | None]:
+    def _make_best_valid_first_intercept_plan(self, tracker: SingleObjectTracker, now, fixed_intercept_time=None) -> tuple[bool, Plan | None]:
         """
         Build the best FIRST_INTERCEPT plan. 
         Might have way different implementation than SUBSEQUENT_INTERCEPT plans later.
@@ -428,11 +446,14 @@ class Platform:
         This function intentionally searches candidate intercept times instead of trying to solve everything analytically.
         """
 
-        candidate_intercept_times = np.linspace(
-            start=now, 
-            stop=now + FIRST_INTERCEPT_MAX_LOOKAHEAD, 
-            num=FIRST_INTERCEPT_MAX_NUM_CANDIDATES
-        )
+        if fixed_intercept_time is None:
+            candidate_intercept_times = np.linspace(
+                start=now, 
+                stop=now + FIRST_INTERCEPT_MAX_LOOKAHEAD, 
+                num=FIRST_INTERCEPT_MAX_NUM_CANDIDATES
+            )
+        else:
+           candidate_intercept_times = [fixed_intercept_time] 
 
         cost_weights = FIRST_INTERCEPT_PLAN_COST_WEIGHTS 
 
