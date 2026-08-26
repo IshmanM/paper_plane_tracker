@@ -101,6 +101,7 @@ class Platform:
     ):
         self.mode = PlatformMode.OFF
         self.active_plan = self._make_off_plan(now=time.perf_counter())
+        self.first_intercept_anchor_time = None
 
         self.triggering_halted = True # Forcing parameter
 
@@ -149,6 +150,7 @@ class Platform:
 
         if not self._tracker_is_usable(tracker):
             self.active_plan = self._make_search_plan(now)
+            self.first_intercept_anchor_time = None
             self.mode = PlatformMode.SEARCHING
 
             self.comm_buffer.set_platform_snapshot(
@@ -162,6 +164,7 @@ class Platform:
 
         if (self.mode != PlatformMode.SEARCHING and self.active_plan.track_id != tracker.track.id):
             self.active_plan = self._make_search_plan(now)
+            self.first_intercept_anchor_time = None
             self.mode = PlatformMode.SEARCHING
             # Don't return. Let SEARCHING immediately try to acquire the new track
         
@@ -173,6 +176,7 @@ class Platform:
             
             if valid_plan_computed:
                 self.active_plan = plan
+                self.first_intercept_anchor_time = plan.intercept_time
                 self.mode = PlatformMode.SLEWING_TO_LEAD
 
                 print(
@@ -185,6 +189,7 @@ class Platform:
                 # print("made it to A") # FOR DEBUG ONLY
             else:
                 self.active_plan = self._make_search_plan(now)
+                self.first_intercept_anchor_time = None
                 self.mode = PlatformMode.SEARCHING
 
                 # print("made it to B") # FOR DEBUG ONLY
@@ -193,7 +198,7 @@ class Platform:
         if self.mode == PlatformMode.SLEWING_TO_LEAD:
             
             if not self._active_plan_still_valid(tracker, now):
-                valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now, fixed_intercept_time=self.active_plan.intercept_time)
+                valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now, fixed_intercept_time=self.first_intercept_anchor_time)
 
                 if valid_plan_computed:
                     self.active_plan = plan
@@ -211,6 +216,7 @@ class Platform:
 
                     if valid_plan_computed:
                         self.active_plan = plan
+                        self.first_intercept_anchor_time = plan.intercept_time
                         print(
                             f"REPLACED FIRST PLAN, FROM SCRATCH | "
                             f"ready in {plan.ready_time - now:.3f}s | "
@@ -219,6 +225,7 @@ class Platform:
                         ) # FOR DEBUG ONLY
                     else:
                         self.active_plan = self._make_search_plan(now)
+                        self.first_intercept_anchor_time = None
                         self.mode = PlatformMode.SEARCHING
             
             # if (and not elif) incase the new best first intercept plan somehow chooses a point that the platform is already pointed toward
@@ -241,9 +248,11 @@ class Platform:
                 valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now)
                 if valid_plan_computed: # tbh this case probably wont ever happen
                     self.active_plan = plan
+                    self.first_intercept_anchor_time = plan.intercept_time
                     self.mode = PlatformMode.SLEWING_TO_LEAD
                 else:
                     self.active_plan = self._make_search_plan(now)
+                    self.first_intercept_anchor_time = None
                     self.mode = PlatformMode.SEARCHING
 
     
@@ -267,6 +276,7 @@ class Platform:
         now = time.perf_counter()
 
         self.active_plan = self._make_off_plan(now)
+        self.first_intercept_anchor_time = None
         self.mode = PlatformMode.OFF
         self.triggering_halted = True
 
@@ -286,6 +296,7 @@ class Platform:
         now = time.perf_counter()
 
         self.active_plan = self._make_search_plan(now)
+        self.first_intercept_anchor_time = None
         self.mode = PlatformMode.SEARCHING
         
         self.comm_buffer.set_platform_snapshot(
@@ -387,6 +398,41 @@ class Platform:
         return np.asarray(config.DEFAULT_SERVO_ANGLES, dtype=float).copy()
 
 
+    def _make_best_valid_subsequent_intercept_plan(self, tracker: SingleObjectTracker, now) -> tuple[bool, Plan | None]:
+        """
+        Build the best SUBSEQUENT_INTERCEPT plan. 
+        Might have way different implementation than FIRST_INTERCEPT plans later.
+
+        Returns:
+        (True, plan)  if a feasible subsequent plan was found
+        (False, None) otherwise
+
+        Important timing meaning:
+        intercept_time = when object and foam meet
+        trigger_time      = when platform must trigger/release
+        expected_ready_time = when pan/tilt is expected to be aimed and settled
+
+        This function intentionally searches candidate intercept times instead of trying to solve everything analytically.
+        """
+
+        candidate_intercept_times = np.linspace(
+            start=now, 
+            stop=now + SUBSEQUENT_INTERCEPT_MAX_LOOKAHEAD, 
+            num=SUBSEQUENT_INTERCEPT_MAX_NUM_CANDIDATES
+        )
+
+        cost_weights = SUBSEQUENT_INTERCEPT_PLAN_COST_WEIGHTS 
+
+        return self._make_best_valid_intercept_plan_from_candidates(
+            tracker, 
+            now, 
+            PlanType.SUBSEQUENT_INTERCEPT, 
+            candidate_intercept_times, 
+            cost_weights, 
+            min_ready_margin=MIN_SUBSEQUENT_INTERCEPT_READY_MARGIN
+        )
+
+
     def _make_best_valid_first_intercept_plan(self, tracker: SingleObjectTracker, now, fixed_intercept_time=None) -> tuple[bool, Plan | None]:
         """
         Build the best FIRST_INTERCEPT plan.
@@ -428,43 +474,6 @@ class Platform:
             min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN
         )
 
-
-    def _make_best_valid_first_intercept_plan(self, tracker: SingleObjectTracker, now, fixed_intercept_time=None) -> tuple[bool, Plan | None]:
-        """
-        Build the best FIRST_INTERCEPT plan. 
-        Might have way different implementation than SUBSEQUENT_INTERCEPT plans later.
-
-        Returns:
-        (True, plan)  if a feasible first plan was found
-        (False, None) otherwise
-
-        Important timing meaning:
-        intercept_time = when object and foam meet
-        trigger_time      = when platform must trigger/release
-        expected_ready_time = when pan/tilt is expected to be aimed and settled
-
-        This function intentionally searches candidate intercept times instead of trying to solve everything analytically.
-        """
-
-        if fixed_intercept_time is None:
-            candidate_intercept_times = np.linspace(
-                start=now, 
-                stop=now + FIRST_INTERCEPT_MAX_LOOKAHEAD, 
-                num=FIRST_INTERCEPT_MAX_NUM_CANDIDATES
-            )
-        else:
-           candidate_intercept_times = [fixed_intercept_time] 
-
-        cost_weights = FIRST_INTERCEPT_PLAN_COST_WEIGHTS 
-
-        return self._make_best_valid_intercept_plan_from_candidates(
-            tracker, 
-            now, 
-            PlanType.FIRST_INTERCEPT, 
-            candidate_intercept_times, 
-            cost_weights, 
-            min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN
-        )
 
 
     def _plan_cost(self, now, plan: Plan, weights: dict[str, float], min_ready_margin) -> float:
@@ -933,4 +942,3 @@ class Platform:
         ) # FOR DEBUG ONLY
         
         return error_norm <= 1.0
-        
