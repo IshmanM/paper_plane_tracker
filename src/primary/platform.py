@@ -102,6 +102,7 @@ class Platform:
         self.mode = PlatformMode.OFF
         self.active_plan = self._make_off_plan(now=time.perf_counter())
         self.first_intercept_anchor_time = None
+        self.first_intercept_original_trigger_time = None
 
         self.triggering_halted = True # Forcing parameter
 
@@ -151,6 +152,7 @@ class Platform:
         if not self._tracker_is_usable(tracker):
             self.active_plan = self._make_search_plan(now)
             self.first_intercept_anchor_time = None
+            self.first_intercept_original_trigger_time = None
             self.mode = PlatformMode.SEARCHING
 
             self.comm_buffer.set_platform_snapshot(
@@ -165,6 +167,7 @@ class Platform:
         if (self.mode != PlatformMode.SEARCHING and self.active_plan.track_id != tracker.track.id):
             self.active_plan = self._make_search_plan(now)
             self.first_intercept_anchor_time = None
+            self.first_intercept_original_trigger_time = None
             self.mode = PlatformMode.SEARCHING
             # Don't return. Let SEARCHING immediately try to acquire the new track
         
@@ -177,6 +180,7 @@ class Platform:
             if valid_plan_computed:
                 self.active_plan = plan
                 self.first_intercept_anchor_time = plan.intercept_time
+                self.first_intercept_original_trigger_time = plan.trigger_time
                 self.mode = PlatformMode.SLEWING_TO_LEAD
 
                 print(
@@ -190,6 +194,7 @@ class Platform:
             else:
                 self.active_plan = self._make_search_plan(now)
                 self.first_intercept_anchor_time = None
+                self.first_intercept_original_trigger_time = None
                 self.mode = PlatformMode.SEARCHING
 
                 # print("made it to B") # FOR DEBUG ONLY
@@ -201,13 +206,15 @@ class Platform:
                 valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now, fixed_intercept_time=self.first_intercept_anchor_time)
 
                 if valid_plan_computed:
+                    trigger_delay_added = plan.trigger_time - self.active_plan.trigger_time
+                    total_trigger_delay = plan.trigger_time - self.first_intercept_original_trigger_time
                     self.active_plan = plan
-  
+
                     print(
                         f"REPLACED FIRST PLAN, INTERCEPT WINDOW | "
-                        f"ready in {plan.ready_time - now:.3f}s | "
                         f"trigger in {plan.trigger_time - now:.3f}s | "
-                        f"ready->trigger {plan.trigger_time - plan.ready_time:.3f}s"
+                        f"delay added {trigger_delay_added*1000:.1f} ms | "
+                        f"total delay {total_trigger_delay*1000:.1f} ms"
                     ) # FOR DEBUG ONLY
 
                 else:
@@ -215,17 +222,20 @@ class Platform:
                     valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now)
 
                     if valid_plan_computed:
+                        trigger_delay_added = plan.trigger_time - self.active_plan.trigger_time
+                        total_trigger_delay = plan.trigger_time - self.first_intercept_original_trigger_time
                         self.active_plan = plan
                         self.first_intercept_anchor_time = plan.intercept_time
                         print(
                             f"REPLACED FIRST PLAN, FROM SCRATCH | "
-                            f"ready in {plan.ready_time - now:.3f}s | "
                             f"trigger in {plan.trigger_time - now:.3f}s | "
-                            f"ready->trigger {plan.trigger_time - plan.ready_time:.3f}s"
+                            f"delay added {trigger_delay_added*1000:.1f} ms | "
+                            f"total delay {total_trigger_delay*1000:.1f} ms"
                         ) # FOR DEBUG ONLY
                     else:
                         self.active_plan = self._make_search_plan(now)
                         self.first_intercept_anchor_time = None
+                        self.first_intercept_original_trigger_time = None
                         self.mode = PlatformMode.SEARCHING
             
             # if (and not elif) incase the new best first intercept plan somehow chooses a point that the platform is already pointed toward
@@ -249,10 +259,12 @@ class Platform:
                 if valid_plan_computed: # tbh this case probably wont ever happen
                     self.active_plan = plan
                     self.first_intercept_anchor_time = plan.intercept_time
+                    self.first_intercept_original_trigger_time = plan.trigger_time
                     self.mode = PlatformMode.SLEWING_TO_LEAD
                 else:
                     self.active_plan = self._make_search_plan(now)
                     self.first_intercept_anchor_time = None
+                    self.first_intercept_original_trigger_time = None
                     self.mode = PlatformMode.SEARCHING
 
     
@@ -277,6 +289,7 @@ class Platform:
 
         self.active_plan = self._make_off_plan(now)
         self.first_intercept_anchor_time = None
+        self.first_intercept_original_trigger_time = None
         self.mode = PlatformMode.OFF
         self.triggering_halted = True
 
@@ -297,6 +310,7 @@ class Platform:
 
         self.active_plan = self._make_search_plan(now)
         self.first_intercept_anchor_time = None
+        self.first_intercept_original_trigger_time = None
         self.mode = PlatformMode.SEARCHING
         
         self.comm_buffer.set_platform_snapshot(
@@ -471,7 +485,8 @@ class Platform:
             PlanType.FIRST_INTERCEPT,
             candidate_intercept_times,
             cost_weights,
-            min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN
+            min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN,
+            debug_rejections=fixed_intercept_time is not None
         )
 
 
@@ -564,8 +579,8 @@ class Platform:
         return cost
 
 
-    def _make_best_valid_intercept_plan_from_candidates(self, tracker: SingleObjectTracker, now, plan_type: PlanType, candidate_intercept_times, cost_weights, min_ready_margin) -> tuple[bool, Plan | None]:
-        
+    def _make_best_valid_intercept_plan_from_candidates(self, tracker: SingleObjectTracker, now, plan_type: PlanType, candidate_intercept_times, cost_weights, min_ready_margin, debug_rejections=False) -> tuple[bool, Plan | None]:
+
         # Current estimate of where the servos are starting from
         # should eventually come from feedback or Pi-side ACK
         q_start = self._planning_servo_angles()
@@ -573,24 +588,23 @@ class Platform:
         best_plan = None
         best_cost = np.inf # lower cost is better
 
+        rejection_counts = {"backward": 0, "prediction": 0, "aim": 0, "missed_trigger": 0, "ready_margin": 0, "cost": 0}
+        best_failed_ready_margin = -np.inf
+
         for intercept_time in candidate_intercept_times:
-            
-            # print("_make_best_valid_intercept_plan_from_candidates A") # FOR DEBUG ONLY
 
             # Cannot predict backwards.
             dt = intercept_time - tracker.track.state_time
             if dt <= 0.0:
+                rejection_counts["backward"] += 1
                 continue
 
             # 1. Predict object position at candidate intercept time.
             # Todo: might eventually want to add different behavior for position outside the visible range
             object_position_world = tracker.predict(dt)[:3].copy()
             if not np.all(np.isfinite(object_position_world)):
+                rejection_counts["prediction"] += 1
                 continue
-            
-
-            # print("_make_best_valid_intercept_plan_from_candidates B") # FOR DEBUG ONLY
-                
 
             # 2. Transform object position into platform frame.
             object_position_platform = estimateObjectPlatformPosition(object_position_world, self.camera_to_platform_calibration)
@@ -598,29 +612,26 @@ class Platform:
             # 3. Use platform-frame point to compute servo raw pan/tilt angles and foam flight time
             angles_valid, q_raw, foam_flight_time = self._object_position_to_servo_angles_and_flight_time(object_position_platform)
             if not angles_valid:
+                rejection_counts["aim"] += 1
                 continue
-
-
-            # print("_make_best_valid_intercept_plan_from_candidates c") # FOR DEBUG ONLY
 
             # 4. Convert intercept time to trigger time.
             trigger_time = intercept_time - foam_flight_time - TRIGGER_DELAY
             if trigger_time < now and not self._close_to_trigger_time(now, trigger_time=trigger_time):
+                rejection_counts["missed_trigger"] += 1
                 continue
 
-
-            # print("_make_best_valid_intercept_plan_from_candidates D") # FOR DEBUG ONLY
             # 5. Estimate the ready time and whether its within margin
-
             servo_rotation_time = self._estimate_servo_rotation_time(q_from=q_start, q_to=q_raw)
             expected_ready_time = now + servo_rotation_time + config.UDP_TX_DELAY
+            ready_margin = trigger_time - expected_ready_time
 
-            if (trigger_time - expected_ready_time) < min_ready_margin:
+            if ready_margin < min_ready_margin:
+                rejection_counts["ready_margin"] += 1
+                best_failed_ready_margin = max(best_failed_ready_margin, ready_margin)
                 continue
 
-            # print("_make_best_valid_intercept_plan_from_candidates E") # FOR DEBUG ONLY
             # 6. Create the plan and compute its cost
-
             plan = Plan(
                 track_id=tracker.track.id,
                 plan_type=plan_type,
@@ -633,18 +644,32 @@ class Platform:
             )
 
             cost = self._plan_cost(now, plan, cost_weights, min_ready_margin) # Todo: determine what to do with infinite cost
-    
+
             # 7. Replace the best plan if new one is better
-
             if cost < best_cost: # also ensures np.inf cost doesn't pass a plan
-                
-                # print("_make_best_valid_intercept_plan_from_candidates F") # FOR DEBUG ONLY
-
                 best_cost = cost
                 best_plan = plan
+            elif not np.isfinite(cost):
+                rejection_counts["cost"] += 1
 
-        
-        return best_plan is not None, best_plan   
+        if debug_rejections and best_plan is None:
+            ready_detail = ""
+            if rejection_counts["ready_margin"] > 0 and np.isfinite(best_failed_ready_margin):
+                ready_detail = f" | best ready margin {best_failed_ready_margin*1000:.1f} ms (need {min_ready_margin*1000:.1f})"
+
+            print(
+                f"INTERCEPT WINDOW FAILED | "
+                f"backward={rejection_counts['backward']} | "
+                f"prediction={rejection_counts['prediction']} | "
+                f"aim={rejection_counts['aim']} | "
+                f"missed_trigger={rejection_counts['missed_trigger']} | "
+                f"ready_margin={rejection_counts['ready_margin']} | "
+                f"cost={rejection_counts['cost']}"
+                f"{ready_detail}"
+            ) # FOR DEBUG ONLY
+
+        return best_plan is not None, best_plan
+
 
     def _object_position_to_servo_angles_and_flight_time(self, position: np.ndarray) -> tuple[bool, np.ndarray | None, float | None]:
         """
@@ -929,16 +954,17 @@ class Platform:
         if error_norm > 1.0:
             print(f"PLAN INVALID | error={position_error} m | norm={error_norm:.2f}") # FOR DEBUG ONLY
 
-        track_position = np.array([tracker.track.x, tracker.track.y, tracker.track.z]) # FOR DEBUG ONLY
-        track_velocity = np.array([tracker.track.dx, tracker.track.dy, tracker.track.dz]) # FOR DEBUG ONLY
-        print(
-            f"PLAN INVALID | "
-            f"dt={dt:.3f}s | "
-            f"pos={track_position} | "
-            f"vel={track_velocity} | "
-            f"vel*dt={track_velocity*dt} | "
-            f"error={position_error} | "
-            f"norm={error_norm:.2f}"
-        ) # FOR DEBUG ONLY
+        # track_position = np.array([tracker.track.x, tracker.track.y, tracker.track.z]) # FOR DEBUG ONLY
+        # track_velocity = np.array([tracker.track.dx, tracker.track.dy, tracker.track.dz]) # FOR DEBUG ONLY
+        # print(
+        #     f"PLAN INVALID | "
+        #     f"dt={dt:.3f}s | "
+        #     f"pos={track_position} | "
+        #     f"vel={track_velocity} | "
+        #     f"vel*dt={track_velocity*dt} | "
+        #     f"error={position_error} | "
+        #     f"norm={error_norm:.2f}"
+        # ) # FOR DEBUG ONLY
         
         return error_norm <= 1.0
+        
