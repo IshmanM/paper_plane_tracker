@@ -11,8 +11,8 @@ from src.primary.platform_geometry_spec import PlatformGeometrySpecId, PlatformG
 from src.primary.camera_to_platform_calibration import CameraToPlatformCalibration
 
 
-SERVO_SETTLING_TIME = 0.1 # seconds
-SERVO_ROTATION_TIME_MARGIN = 0.05 # seconds
+SERVO_SETTLING_TIME = 0.15 # seconds
+SERVO_ROTATION_TIME_MARGIN = 0.00 # seconds. an extra margin.
 
 
 SEARCH_CENTER_PAN = 90.0 # degrees
@@ -20,8 +20,8 @@ SEARCH_PAN_AMPLITUDE = 75.0 # degrees
 SEARCH_FREQUENCY = 0.2 # hz
 
 
-TRIGGER_TIME_LOWER_THRESHOLD = -0.25 # seconds
-TRIGGER_TIME_UPPER_THRESHOLD = 0.50 # seconds
+TRIGGER_TIME_LOWER_THRESHOLD = 0.040 # seconds. allow up to this much time late
+TRIGGER_TIME_UPPER_THRESHOLD = 0.020 # seconds. allow up to this much time early
 
 FIRST_INTERCEPT_MAX_NUM_CANDIDATES = 10 
 FIRST_INTERCEPT_MAX_LOOKAHEAD = 2.5 # seconds
@@ -29,7 +29,8 @@ FIRST_INTERCEPT_MAX_LOOKAHEAD = 2.5 # seconds
 SUBSEQUENT_INTERCEPT_MAX_NUM_CANDIDATES = 5 
 SUBSEQUENT_INTERCEPT_MAX_LOOKAHEAD = 0.5 # seconds
 
-TRIGGER_DELAY = 0.1 # seconds
+# make sure this is > FOAM_TRIGGER_HOLD_DELAY + FOAM_RESET_HOLD_DELAY from the endpoint 
+TRIGGER_DELAY = 0.060 # seconds
 
 GRAVITY = 9.81  # m/s^2
 
@@ -338,7 +339,7 @@ class Platform:
             trigger_time = self.active_plan.trigger_time
         
         dt = trigger_time - now
-        return TRIGGER_TIME_LOWER_THRESHOLD <= dt <= TRIGGER_TIME_UPPER_THRESHOLD
+        return -TRIGGER_TIME_LOWER_THRESHOLD <= dt <= TRIGGER_TIME_UPPER_THRESHOLD
 
 
     def _planning_servo_angles(self) -> np.ndarray:
@@ -804,16 +805,15 @@ class Platform:
 
     def _estimate_servo_rotation_time(self, q_from: np.ndarray, q_to: np.ndarray):
         """
-        Simple conservative servo motion-time estimate.
+        Conservative estimate of time until the servos are aimed and settled.
 
-        This does NOT exactly simulate _cmd_filter().
-        Instead, it uses a reduced effective servo speed plus a fixed margin.
-
-        Pan/tilt move simultaneously, so total rotation time is the max joint time.
+        Accounts approximately for command speed limiting, exponential command smoothing,
+        and mechanical settling. Pan/tilt move simultaneously, so the slowest joint determines
+        the total time.
         """
-        
+
         if q_from.shape != q_to.shape or q_from.shape != (config.NUM_SERVOS,):
-           raise ValueError("q_from or q_to shape does not match NUM_SERVOS") 
+            raise ValueError("q_from or q_to shape does not match NUM_SERVOS")
 
         if not np.all(np.isfinite(q_from)) or not np.all(np.isfinite(q_to)):
             raise ValueError("q_from or q_to has non-finite values")
@@ -822,13 +822,24 @@ class Platform:
         q_to = np.asarray(q_to, dtype=float).reshape(-1).copy()
         dq = np.abs(q_to - q_from)
 
+        # Motion inside the deadband will not produce a new servo command.
         deadband = np.asarray(config.SERVO_DEADBAND, dtype=float).copy()
-        if np.all(dq <= deadband):
+        moving = dq > deadband
+        if not np.any(moving):
             return 0.0
-        
+
+        # Minimum travel time imposed by the command-side servo speed limits.
         servo_speeds = np.asarray(config.MAX_SERVO_SPEEDS, dtype=float).copy()
-        rotation_time = float(np.max(dq/servo_speeds))
-        
+        joint_times = dq/servo_speeds
+
+        # Approximate additional time for the exponentially smoothed command to decay
+        # from the initial error dq to the deadband: t = tau*ln(dq/deadband).
+        # Adding this to the speed-limit time intentionally gives a conservative estimate.
+        if config.CMD_SMOOTHING_TAU > 0.0:
+            joint_times[moving] += config.CMD_SMOOTHING_TAU*np.log(dq[moving]/deadband[moving])
+
+        # Joints move together, so wait for the slowest one, then allow mechanical settling.
+        rotation_time = float(np.max(joint_times))
         return rotation_time + SERVO_SETTLING_TIME + SERVO_ROTATION_TIME_MARGIN
 
     

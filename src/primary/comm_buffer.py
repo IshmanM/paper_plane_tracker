@@ -13,8 +13,6 @@ from src.comm.protocol import (
 
 
 
-CMD_SMOOTHING_TAU = 0.05 # seconds
-
 class CommBuffer:
     def __init__(self):
         self._lock = threading.Lock()
@@ -378,7 +376,7 @@ def compute_filtered_cmd_servo_angles(active_plan: Plan, platform_mode: Platform
             #
             # alpha near 1.0 -> follows goal quickly
             # alpha near 0.0 -> very smooth / slow response
-            tau = CMD_SMOOTHING_TAU
+            tau = config.CMD_SMOOTHING_TAU
             if tau <= 0.0:
                 q_goal = q_raw.copy()
             else:

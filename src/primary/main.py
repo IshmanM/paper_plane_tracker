@@ -28,6 +28,19 @@ from src.comm.network_config import (
 WINDOW_NAME = "Webcam Feed"
 DISPLAY_SCALES = (1.0, 1.5, 2.0)
 
+OBJECT_VISION_SPEC_IDS = (
+    ObjectVisionSpecId.TENNIS_BALL_DEFAULT,  # 1
+    ObjectVisionSpecId.ARUCO_MARKER_1,       # 2
+    ObjectVisionSpecId.PAPER_PLANE_SHAPES_1, # 3
+)
+
+TRACKER_KWARGS = dict(
+    min_hits=3,
+    max_missed_on_confirmed=15,
+    max_missed_on_tentative=1,
+    # params...
+)
+
 
 def drawDisplayText(image: np.ndarray, text: str, position: tuple[int, int], color: tuple[int, int, int], display_scale: float) -> None:
     """Draw HUD text after display scaling so the text itself remains sharp."""
@@ -41,10 +54,7 @@ def drawDisplayText(image: np.ndarray, text: str, position: tuple[int, int], col
 
 
 if __name__ == "__main__":
-    # object_vision_spec_id = ObjectVisionSpecId.TENNIS_BALL_DEFAULT
     object_vision_spec_id = ObjectVisionSpecId.ARUCO_MARKER_1
-    # object_vision_spec_id = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
-
     platform_geometry_spec_id = PlatformGeometrySpecId.PLATFORM_1
 
     camera_calibration = CameraCalibration(config.CAMERA_CALIBRATION_PATH, config.FRAME_W, config.FRAME_H)
@@ -74,12 +84,7 @@ if __name__ == "__main__":
     if not cap.isOpened():
         raise RuntimeError("Could not open camera.")
 
-    tracker = SingleObjectTracker(
-        min_hits=3,
-        max_missed_on_confirmed=15,
-        max_missed_on_tentative=1,
-        # params...
-    )
+    tracker = SingleObjectTracker(**TRACKER_KWARGS)
 
     comm_buffer = CommBuffer()
     platform = Platform(
@@ -120,7 +125,11 @@ if __name__ == "__main__":
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, config.FRAME_W, config.FRAME_H)
 
-    print("Tab: display size | P: pause all | R: resume tracker | L/O: platform off/on | H/F: triggering | S: screenshot | Q/Esc: quit")
+    print(
+        "1: tennis ball | 2: ArUco | 3: paper plane | Tab: display size | "
+        "P: pause all | R: resume tracker | L/O: platform off/on | "
+        "H/F: triggering | S: screenshot | Q/Esc: quit"
+    )
 
     try:
         while cap.isOpened():
@@ -176,9 +185,26 @@ if __name__ == "__main__":
             # Render text after resize rather than scaling already-rendered text.
             drawDisplayText(display_frame, detection_label, (10, 20), (0, 255, 0), display_scale)
             drawDisplayText(display_frame, track_label, (10, 50), (0, 0, 255), display_scale)
+            drawDisplayText(display_frame, f"Object: {object_vision_spec_id.name}", (10, 80), (255, 255, 0), display_scale)
 
             if tracker_paused:
-                drawDisplayText(display_frame, "TRACKER PAUSED", (10, 80), (0, 0, 255), display_scale)
+                drawDisplayText(display_frame, "TRACKER PAUSED", (10, 110), (0, 0, 255), display_scale)
+
+            # Controls.
+            drawDisplayText(
+                display_frame,
+                "1 Tennis | 2 ArUco | 3 Plane | Tab Size",
+                (10, config.FRAME_H - 35),
+                (255, 255, 255),
+                display_scale,
+            )
+            drawDisplayText(
+                display_frame,
+                "P Pause | R Resume | L/O Platform | H/F Trigger | S Screenshot | Q/Esc Quit",
+                (10, config.FRAME_H - 15),
+                (255, 255, 255),
+                display_scale,
+            )
 
             cv2.imshow(WINDOW_NAME, display_frame)
             key = cv2.waitKey(1) & 0xFF
@@ -194,6 +220,25 @@ if __name__ == "__main__":
                 platform.turn_off()
                 stop_event.set()
                 break
+
+            # 1-3 = change object vision spec.
+            elif ord("1") <= key < ord("1") + len(OBJECT_VISION_SPEC_IDS):
+                new_object_vision_spec_id = OBJECT_VISION_SPEC_IDS[key - ord("1")]
+
+                if new_object_vision_spec_id != object_vision_spec_id:
+                    # Previous track/plan is not meaningful for a different object model.
+                    platform.turn_off()
+                    platform_paused = True
+
+                    object_vision_spec_id = new_object_vision_spec_id
+                    tracker = SingleObjectTracker(**TRACKER_KWARGS)
+
+                    last_detection_px_w = 0
+                    last_detection_px_h = 0
+                    detection_label = "No detection"
+                    track_label = "Dead track"
+
+                    print(f"Object vision spec: {object_vision_spec_id.name} | tracker reset | platform OFF")
 
             # Tab = cycle display scale only.
             elif key == 9:

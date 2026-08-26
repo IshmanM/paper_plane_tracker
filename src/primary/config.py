@@ -47,6 +47,8 @@ CAMERA_FOCUS = 0  # tune
 
 UDP_TX_DELAY = 0.001 # seconds
 
+CMD_SMOOTHING_TAU = 0.05 # seconds. used in comm_buffer.py
+
 SERVO_NAMES = ("pan", "tilt")
 NUM_SERVOS = len(SERVO_NAMES)
 SERVO_IDX = {
