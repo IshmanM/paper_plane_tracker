@@ -5,7 +5,7 @@ import cv2
 import numpy as np
 
 import src.primary.config as config
-from src.primary.camera_calibration import CameraCalibration
+from src.primary.camera.camera_calibration import CameraCalibration
 
 
 IMAGE_DIRECTORY = Path("images/camera_calibration")
