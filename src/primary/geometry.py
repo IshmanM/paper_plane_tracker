@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import cv2
 
-from src.primary.camera_calibration import CameraCalibration
+from src.primary.camera.camera_calibration import CameraCalibration
 
 if TYPE_CHECKING:
     from src.primary.camera_to_platform_calibration import CameraToPlatformCalibration

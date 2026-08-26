@@ -4,7 +4,7 @@ from enum import Enum, auto
 
 from src.primary.detection import Measurement
 from src.primary.geometry import estimateObjectImagePosition 
-from src.primary.camera_calibration import CameraCalibration
+from src.primary.camera.camera_calibration import CameraCalibration
 
 class TrackStatus(Enum):
     TENTATIVE = auto()

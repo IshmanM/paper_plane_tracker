@@ -10,7 +10,7 @@ import numpy as np
 
 import src.primary.config as config
 import src.endpoint.config as endpoint_config
-from src.primary.camera_calibration import CameraCalibration
+from src.primary.camera.camera_calibration import CameraCalibration
 from src.primary.detection import detectSingleObject, drawDetection
 from src.primary.object_vision_spec import ObjectVisionSpecId
 from src.primary.camera_to_platform_calibration import servoAnglesToPlatformYawElevation

@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 import src.primary.config as config
-from src.primary.camera_calibration import CameraCalibration
+from src.primary.camera.camera_calibration import CameraCalibration
 from src.primary.detection import detectSingleObject, drawDetection
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectVisionSpecId
 

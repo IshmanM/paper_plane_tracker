@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import os
 import threading
-from src.primary.camera_calibration import CameraCalibration
+from src.primary.camera.camera_calibration import CameraCalibration
 from src.primary.camera_to_platform_calibration import CameraToPlatformCalibration
 from src.primary.tracking import TrackStatus, SingleObjectTracker, drawTrack
 from src.primary.detection import detectSingleObject, drawDetection

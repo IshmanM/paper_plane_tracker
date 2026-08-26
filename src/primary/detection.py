@@ -3,7 +3,7 @@ import numpy as np
 from collections import Counter
 from itertools import combinations
 
-from src.primary.camera_calibration import CameraCalibration
+from src.primary.camera.camera_calibration import CameraCalibration
 from src.primary.geometry import estimateObjectWorldPosition
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec, ObjectVisionSpecId
 from src.primary.color import COLOR_SPECS, ColorId

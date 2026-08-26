@@ -1,0 +1,1 @@
+#this file is for eventual camera/camera settings modularization + auto control
