@@ -52,7 +52,10 @@ USE_HIGH_ARC = False
 MIN_FIRST_INTERCEPT_READY_MARGIN = 0.020 # seconds
 MIN_SUBSEQUENT_INTERCEPT_READY_MARGIN = 0.010 # seconds
 
-ACTIVE_PLAN_INTERCEPT_POSITION_TOLERANCES = np.array([0.03, 0.03, 0.06], dtype=float) # x, y, z meters
+ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES = np.zeros(config.NUM_SERVOS, dtype=float)
+ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES[config.SERVO_IDX["pan"]] = 1.25 # degrees
+ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES[config.SERVO_IDX["tilt"]] = 1.0 # degrees
+ACTIVE_PLAN_FLIGHT_TIME_TOLERANCE = 0.010 # seconds
 
 
 # If now is inside _close_to_trigger_time(...), treat time-to-trigger cost as ideal.
@@ -918,53 +921,53 @@ class Platform:
     
     def _active_plan_still_valid(self, tracker: SingleObjectTracker, now) -> bool:
         """
-        Still valid if the anticipated intercept location at the intercept time is within the some threshold of the plan
-       
-        If now is still _close_to_trigger_time, still valid as long as the intercept point adds up
-            (of course now can be any amount of time earlier than the trigger_time)
-        
+        Still valid if the updated prediction at the planned intercept time does not
+        materially change either the required servo angles or foam flight time.
+
         ToDo (not now, but maybe later): add additional validity checks
         """
-
 
         dt = self.active_plan.intercept_time - tracker.track.state_time
         if dt <= 0.0:
             return False
-        
+
         if self.active_plan.trigger_time < now and not self._close_to_trigger_time(now):
-
             print(f"PLAN INVALID: missed trigger by {(now - self.active_plan.trigger_time)*1000:.1f} ms") # FOR DEBUG ONLY
-
             return False
-        
-        current_intercept_prediction = np.asarray(tracker.predict(dt)[:3], dtype=float).reshape(-1).copy()
-        if not np.all(np.isfinite(current_intercept_prediction)):
+
+        current_intercept_position_world = np.asarray(tracker.predict(dt)[:3], dtype=float).reshape(-1).copy()
+        if not np.all(np.isfinite(current_intercept_position_world)):
             return False
-        
-        planned_intercept_prediction = np.asarray(self.active_plan.intercept_position, dtype=float).reshape(-1).copy()
 
-        tolerances = np.asarray(ACTIVE_PLAN_INTERCEPT_POSITION_TOLERANCES, dtype=float).reshape(-1).copy()
-        if np.any(tolerances <= 0.0):
-            raise ValueError("ACTIVE_PLAN_INTERCEPT_POSITION_TOLERANCES must be > 0")
+        current_intercept_position_platform = estimateObjectPlatformPosition(
+            current_intercept_position_world, self.camera_to_platform_calibration
+        )
 
-        position_error = current_intercept_prediction - planned_intercept_prediction
-        normalized_error = position_error/tolerances
-        error_norm = np.linalg.norm(normalized_error)
+        aim_valid, current_servo_angles, current_foam_flight_time = self._object_position_to_servo_angles_and_flight_time(
+            current_intercept_position_platform
+        )
+        if not aim_valid:
+            return False
 
-        if error_norm > 1.0:
-            print(f"PLAN INVALID | error={position_error} m | norm={error_norm:.2f}") # FOR DEBUG ONLY
+        planned_servo_angles = np.asarray(self.active_plan.raw_servo_angles, dtype=float).reshape(-1).copy()
+        servo_angle_tolerances = np.asarray(ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES, dtype=float).reshape(-1).copy()
 
-        # track_position = np.array([tracker.track.x, tracker.track.y, tracker.track.z]) # FOR DEBUG ONLY
-        # track_velocity = np.array([tracker.track.dx, tracker.track.dy, tracker.track.dz]) # FOR DEBUG ONLY
-        # print(
-        #     f"PLAN INVALID | "
-        #     f"dt={dt:.3f}s | "
-        #     f"pos={track_position} | "
-        #     f"vel={track_velocity} | "
-        #     f"vel*dt={track_velocity*dt} | "
-        #     f"error={position_error} | "
-        #     f"norm={error_norm:.2f}"
-        # ) # FOR DEBUG ONLY
-        
-        return error_norm <= 1.0
-        
+        if np.any(servo_angle_tolerances <= 0.0):
+            raise ValueError("ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES must be > 0")
+
+        servo_angle_error = current_servo_angles - planned_servo_angles
+
+        planned_foam_flight_time = self.active_plan.intercept_time - self.active_plan.trigger_time - TRIGGER_DELAY
+        foam_flight_time_error = current_foam_flight_time - planned_foam_flight_time
+
+        servo_angles_still_valid = np.all(np.abs(servo_angle_error) <= servo_angle_tolerances)
+        foam_flight_time_still_valid = abs(foam_flight_time_error) <= ACTIVE_PLAN_FLIGHT_TIME_TOLERANCE
+
+        if not servo_angles_still_valid or not foam_flight_time_still_valid:
+            print(
+                f"PLAN INVALID | "
+                f"servo error={servo_angle_error} deg | "
+                f"flight time error={foam_flight_time_error*1000:.1f} ms"
+            ) # FOR DEBUG ONLY
+
+        return servo_angles_still_valid and foam_flight_time_still_valid
