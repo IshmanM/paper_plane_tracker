@@ -193,14 +193,12 @@ class Platform:
                     f"ready->trigger {plan.trigger_time - plan.ready_time:.3f}s"
                 ) # FOR DEBUG ONLY
 
-                # print("made it to A") # FOR DEBUG ONLY
             else:
                 self.active_plan = self._make_search_plan(now)
                 self.first_intercept_anchor_time = None
                 self.first_intercept_original_trigger_time = None
                 self.mode = PlatformMode.SEARCHING
 
-                # print("made it to B") # FOR DEBUG ONLY
         
             
         if self.mode == PlatformMode.SLEWING_TO_LEAD:
@@ -255,9 +253,7 @@ class Platform:
             if valid_plan_computed:
                 self.active_plan = plan
 
-                # print("made it to E") # FOR DEBUG ONLY
             else:
-                # print("made it to F") # FOR DEBUG ONLY
                 valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now)
                 if valid_plan_computed: # tbh this case probably wont ever happen
                     self.active_plan = plan
