@@ -309,19 +309,31 @@ class SingleObjectTracker:
             return
 
         first = self.track.last_hit_measurement
-        raw_velocity = np.array([
+        measured_velocity = np.array([
             (measurement.x - first.x)/dt,
             (measurement.y - first.y)/dt,
             (measurement.z - first.z)/dt
         ], dtype=float)
 
         # Clip XY by vector magnitude so diagonal motion cannot exceed the intended lateral speed cap.
-        xy_speed = float(np.linalg.norm(raw_velocity[:2]))
+        xy_speed = float(np.linalg.norm(measured_velocity[:2]))
         if xy_speed > self.max_initial_xy_speed_m_s:
-            raw_velocity[:2] *= self.max_initial_xy_speed_m_s/xy_speed
-        raw_velocity[2] = np.clip(raw_velocity[2], -self.max_initial_z_speed_m_s, self.max_initial_z_speed_m_s)
+            measured_velocity[:2] *= self.max_initial_xy_speed_m_s/xy_speed
+        measured_velocity[2] = np.clip(measured_velocity[2], -self.max_initial_z_speed_m_s, self.max_initial_z_speed_m_s)
 
-        self.track.state[DX:DZ + 1] = raw_velocity
+        # Fuse the two-frame velocity estimate with the KF velocity according to their uncertainties.
+        # Shorter frame spacing makes the finite-difference velocity noisier through the 1/dt^2 term.
+        measured_velocity_variance = 2.0*np.array([
+            self.sigma_meas_x**2,
+            self.sigma_meas_y**2,
+            self.sigma_meas_z**2
+        ], dtype=float)/(dt*dt)
+        prior_velocity = self.track.state[DX:DZ + 1].copy()
+        prior_velocity_variance = np.diag(self.track.covariance[DX:DZ + 1, DX:DZ + 1]).copy()
+        velocity_gain = prior_velocity_variance/(prior_velocity_variance + measured_velocity_variance)
+
+        self.track.state[DX:DZ + 1] = prior_velocity + velocity_gain*(measured_velocity - prior_velocity)
+        # Do not reduce covariance: this velocity estimate reuses the same two position measurements.
         self.track.initial_velocity_initialized = True
 
 
