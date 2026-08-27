@@ -20,9 +20,9 @@ SERVO_ROTATION_TIME_MARGIN = 0.00 # seconds. an extra margin.
 
 SEARCH_CENTER_PAN = 100.0 # degrees
 SEARCH_PAN_AMPLITUDE = 25.0 # degrees
-SEARCH_FREQUENCY = 0.5 # hz
+SEARCH_FREQUENCY = 0.2 # hz
 
-PRE_SLEW_LOOKAHEAD = 0.100 # seconds
+PRE_SLEW_LOOKAHEAD = 0.100 # seconds. TODO: adjust this
 
 
 TRIGGER_TIME_LOWER_THRESHOLD = 0.040 # seconds. allow up to this much time late

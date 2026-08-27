@@ -63,7 +63,7 @@ SERVO_IDX = {
 
 DEFAULT_SERVO_ANGLES = np.zeros(NUM_SERVOS, dtype=float)
 DEFAULT_SERVO_ANGLES[SERVO_IDX["pan"]] = 90.0 # degrees
-DEFAULT_SERVO_ANGLES[SERVO_IDX["tilt"]] = 60.0 # degrees
+DEFAULT_SERVO_ANGLES[SERVO_IDX["tilt"]] = 75.0 # degrees
 
 FORWARD_SERVO_ANGLES = np.zeros(NUM_SERVOS, dtype=float)
 FORWARD_SERVO_ANGLES[SERVO_IDX["pan"]] = 90.0 # degrees

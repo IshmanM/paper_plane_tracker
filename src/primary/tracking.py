@@ -125,7 +125,12 @@ class SingleObjectTracker:
         sigma_meas_x: float = 0.05,
         sigma_meas_y: float = 0.05,
         sigma_meas_z: float = 0.20,
-        gate_threshold: float = 0.25,
+        tentative_max_gate_angular_error_deg: float = 8.0,
+        tentative_min_gate_range_error_m: float = 0.30,
+        tentative_gate_range_error_fraction: float = 0.25,
+        confirmed_max_gate_angular_error_deg: float = 8.0,
+        confirmed_min_gate_range_error_m: float = 0.15,
+        confirmed_gate_range_error_fraction: float = 0.15,
     ):
         self.track = None
         self.next_track_id = 0
@@ -139,17 +144,50 @@ class SingleObjectTracker:
         self.sigma_meas_x = sigma_meas_x # meters
         self.sigma_meas_y = sigma_meas_y # meters
         self.sigma_meas_z = sigma_meas_z # meters
-        self.gate_threshold = gate_threshold
+
+        # Camera-aware outlier gate. Keep tentative gating permissive while velocity is still
+        # immature, then tighten once the track is confirmed.
+        self.tentative_max_gate_angular_error_deg = tentative_max_gate_angular_error_deg
+        self.tentative_min_gate_range_error_m = tentative_min_gate_range_error_m
+        self.tentative_gate_range_error_fraction = tentative_gate_range_error_fraction
+        self.confirmed_max_gate_angular_error_deg = confirmed_max_gate_angular_error_deg
+        self.confirmed_min_gate_range_error_m = confirmed_min_gate_range_error_m
+        self.confirmed_gate_range_error_fraction = confirmed_gate_range_error_fraction
 
 
-    def _gating_distance(self, measurement: Measurement):
+    def _measurement_passes_gate(self, measurement: Measurement) -> bool:
         if self.track is None:
-            raise ValueError("Cannot compute gating distance without an active track.")
+            raise ValueError("Cannot gate measurement without an active track.")
 
-        # Squared Euclidean distance
+        predicted_position = np.asarray(self.track.state[:3], dtype=float)
         measurement_position = np.array([measurement.x, measurement.y, measurement.z], dtype=float)
-        diff = measurement_position - self.track.state[:3]
-        return float(diff @ diff)
+
+        if not np.all(np.isfinite(predicted_position)) or not np.all(np.isfinite(measurement_position)):
+            return False
+
+        predicted_range = float(np.linalg.norm(predicted_position))
+        measurement_range = float(np.linalg.norm(measurement_position))
+        if predicted_range <= 1e-9 or measurement_range <= 1e-9:
+            return False
+
+        cos_angular_error = float(np.dot(predicted_position, measurement_position)/(predicted_range*measurement_range))
+        angular_error_deg = float(np.rad2deg(np.arccos(np.clip(cos_angular_error, -1.0, 1.0))))
+
+        if self.track.confirmed:
+            max_angular_error_deg = self.confirmed_max_gate_angular_error_deg
+            min_range_error_m = self.confirmed_min_gate_range_error_m
+            range_error_fraction = self.confirmed_gate_range_error_fraction
+        else:
+            max_angular_error_deg = self.tentative_max_gate_angular_error_deg
+            min_range_error_m = self.tentative_min_gate_range_error_m
+            range_error_fraction = self.tentative_gate_range_error_fraction
+
+        range_error = abs(measurement_range - predicted_range)
+        max_range_error = max(min_range_error_m, range_error_fraction*predicted_range)
+
+        # TODO later: consider Mahalanobis gating using the KF innovation covariance.
+        # TODO later: consider range-dependent measurement covariance R, especially sigma_meas_z.
+        return angular_error_deg <= max_angular_error_deg and range_error <= max_range_error
 
 
     def _prediction_update(self, dt):
@@ -288,7 +326,7 @@ class SingleObjectTracker:
             dt = frame_time - self.track.state_time
             self._prediction_update(dt)
 
-            if (not object_detected) or (self._gating_distance(measurement) > self.gate_threshold):
+            if (not object_detected) or (not self._measurement_passes_gate(measurement)):
                 self.track.mark_missed()
                 max_missed = self.max_missed_on_confirmed if self.track.confirmed else self.max_missed_on_tentative
 
