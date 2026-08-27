@@ -22,6 +22,8 @@ SEARCH_CENTER_PAN = 100.0 # degrees
 SEARCH_PAN_AMPLITUDE = 25.0 # degrees
 SEARCH_FREQUENCY = 0.5 # hz
 
+PRE_SLEW_LOOKAHEAD = 0.100 # seconds
+
 
 TRIGGER_TIME_LOWER_THRESHOLD = 0.040 # seconds. allow up to this much time late
 TRIGGER_TIME_UPPER_THRESHOLD = 0.020 # seconds. allow up to this much time early
@@ -107,7 +109,7 @@ class Platform:
     ):
         self.mode = PlatformMode.OFF
         self.active_plan = self._make_off_plan(now=time.perf_counter())
-        self.first_intercept_anchor_time = None
+        self.first_intercept_anchor_intercept_time  = None
         self.first_intercept_original_trigger_time = None
 
         self.triggering_halted = True # Forcing parameter
@@ -131,13 +133,13 @@ class Platform:
     def _tracker_is_usable(self, tracker: SingleObjectTracker):
         if tracker is None:
             raise ValueError("None type Tracker passed to Platform")
-        
-        if tracker.track_status == TrackStatus.CONFIRMED and (tracker.track is None or tracker.track.state_time is None or tracker.track.id is None):
-            raise ValueError("Tracker with CONFIRMED track_status but None type Track or Track.state_time or Track.id passed to Platform")
 
-        if tracker.track_status in {TrackStatus.TENTATIVE, TrackStatus.DEAD}:
+        if tracker.track_status in {TrackStatus.TENTATIVE, TrackStatus.CONFIRMED} and (tracker.track is None or tracker.track.state_time is None or tracker.track.id is None):
+            raise ValueError("Tracker with TENTATIVE/CONFIRMED track_status but None type Track or Track.state_time or Track.id passed to Platform")
+
+        if tracker.track_status == TrackStatus.DEAD:
             return False
-        
+
         return True
 
 
@@ -157,7 +159,7 @@ class Platform:
 
         if not self._tracker_is_usable(tracker):
             self.active_plan = self._make_search_plan(now)
-            self.first_intercept_anchor_time = None
+            self.first_intercept_anchor_intercept_time  = None
             self.first_intercept_original_trigger_time = None
             self.mode = PlatformMode.SEARCHING
 
@@ -168,16 +170,42 @@ class Platform:
             )
             return
         
-        ########## 1. TRACK ID SWITCH GUARD ########################
+        ########## 1. TENTATIVE TRACK PRE-SLEW #####################
+
+        if tracker.track_status == TrackStatus.TENTATIVE:
+            valid_plan_computed, plan = self._make_pre_slew_plan(tracker, now)
+
+            if valid_plan_computed:
+                self.active_plan = plan
+                self.mode = PlatformMode.PRE_SLEWING_TO_LEAD
+            else:
+                self.active_plan = self._make_search_plan(now)
+                self.mode = PlatformMode.SEARCHING
+
+            self.first_intercept_anchor_intercept_time  = None
+            self.first_intercept_original_trigger_time = None
+
+            self.comm_buffer.set_platform_snapshot(
+                active_plan=self.active_plan,
+                platform_mode=self.mode,
+                triggering_halted=self.triggering_halted
+            )
+            return
+
+        # Once the track is confirmed, immediately proceed into normal first-intercept planning.
+        if self.mode == PlatformMode.PRE_SLEWING_TO_LEAD:
+            self.mode = PlatformMode.SEARCHING
+
+        ########## 2. TRACK ID SWITCH GUARD ########################
 
         if (self.mode != PlatformMode.SEARCHING and self.active_plan.track_id != tracker.track.id):
             self.active_plan = self._make_search_plan(now)
-            self.first_intercept_anchor_time = None
+            self.first_intercept_anchor_intercept_time  = None
             self.first_intercept_original_trigger_time = None
             self.mode = PlatformMode.SEARCHING
             # Don't return. Let SEARCHING immediately try to acquire the new track
         
-        ########## 2. MODE LOGIC ##################################
+        ########## 3. MODE LOGIC ##################################
 
         if self.mode == PlatformMode.SEARCHING:
             
@@ -185,7 +213,7 @@ class Platform:
             
             if valid_plan_computed:
                 self.active_plan = plan
-                self.first_intercept_anchor_time = plan.intercept_time
+                self.first_intercept_anchor_intercept_time  = plan.intercept_time
                 self.first_intercept_original_trigger_time = plan.trigger_time
                 self.mode = PlatformMode.SLEWING_TO_LEAD
 
@@ -198,7 +226,7 @@ class Platform:
 
             else:
                 self.active_plan = self._make_search_plan(now)
-                self.first_intercept_anchor_time = None
+                self.first_intercept_anchor_intercept_time  = None
                 self.first_intercept_original_trigger_time = None
                 self.mode = PlatformMode.SEARCHING
 
@@ -207,7 +235,7 @@ class Platform:
         if self.mode == PlatformMode.SLEWING_TO_LEAD:
             
             if not self._active_plan_still_valid(tracker, now):
-                valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now, fixed_intercept_time=self.first_intercept_anchor_time)
+                valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now, fixed_intercept_time=self.first_intercept_anchor_intercept_time )
 
                 if valid_plan_computed:
                     trigger_delay_added = plan.trigger_time - self.active_plan.trigger_time
@@ -229,7 +257,7 @@ class Platform:
                         trigger_delay_added = plan.trigger_time - self.active_plan.trigger_time
                         total_trigger_delay = plan.trigger_time - self.first_intercept_original_trigger_time
                         self.active_plan = plan
-                        self.first_intercept_anchor_time = plan.intercept_time
+                        self.first_intercept_anchor_intercept_time  = plan.intercept_time
                         print(
                             f"REPLACED FIRST PLAN, FROM SCRATCH | "
                             f"trigger in {plan.trigger_time - now:.3f}s | "
@@ -238,7 +266,7 @@ class Platform:
                         ) # FOR DEBUG ONLY
                     else:
                         self.active_plan = self._make_search_plan(now)
-                        self.first_intercept_anchor_time = None
+                        self.first_intercept_anchor_intercept_time  = None
                         self.first_intercept_original_trigger_time = None
                         self.mode = PlatformMode.SEARCHING
             
@@ -260,17 +288,17 @@ class Platform:
                 valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now)
                 if valid_plan_computed: # tbh this case probably wont ever happen
                     self.active_plan = plan
-                    self.first_intercept_anchor_time = plan.intercept_time
+                    self.first_intercept_anchor_intercept_time  = plan.intercept_time
                     self.first_intercept_original_trigger_time = plan.trigger_time
                     self.mode = PlatformMode.SLEWING_TO_LEAD
                 else:
                     self.active_plan = self._make_search_plan(now)
-                    self.first_intercept_anchor_time = None
+                    self.first_intercept_anchor_intercept_time  = None
                     self.first_intercept_original_trigger_time = None
                     self.mode = PlatformMode.SEARCHING
 
     
-        ########## 3. CMD OUTPUT ##############################
+        ########## 4. CMD OUTPUT ##############################
         
         # Output to the buffer
         self.comm_buffer.set_platform_snapshot(
@@ -290,7 +318,7 @@ class Platform:
         now = time.perf_counter()
 
         self.active_plan = self._make_off_plan(now)
-        self.first_intercept_anchor_time = None
+        self.first_intercept_anchor_intercept_time  = None
         self.first_intercept_original_trigger_time = None
         self.mode = PlatformMode.OFF
         self.triggering_halted = True
@@ -311,7 +339,7 @@ class Platform:
         now = time.perf_counter()
 
         self.active_plan = self._make_search_plan(now)
-        self.first_intercept_anchor_time = None
+        self.first_intercept_anchor_intercept_time  = None
         self.first_intercept_original_trigger_time = None
         self.mode = PlatformMode.SEARCHING
         
@@ -374,6 +402,37 @@ class Platform:
             estimate_time=None,
             ready_time=None,
             intercept_position=None,
+            intercept_time=None,
+            trigger_time=None
+        )
+
+
+    def _make_pre_slew_plan(self, tracker: SingleObjectTracker, now) -> tuple[bool, Plan | None]:
+        """
+        Aim a tentative track a short time into the future without creating a firing schedule.
+        """
+
+        prediction_time = now + PRE_SLEW_LOOKAHEAD
+        dt = prediction_time - tracker.track.state_time
+        if dt <= 0.0:
+            return False, None
+
+        object_position_world = np.asarray(tracker.predict(dt)[:3], dtype=float).reshape(-1).copy()
+        if not np.all(np.isfinite(object_position_world)):
+            return False, None
+
+        object_position_platform = estimateObjectPlatformPosition(object_position_world, self.camera_to_platform_calibration)
+        aim_valid, raw_servo_angles, _ = self._object_position_to_servo_angles_and_flight_time(object_position_platform)
+        if not aim_valid:
+            return False, None
+
+        return True, Plan(
+            track_id=tracker.track.id,
+            plan_type=PlanType.PRE_SLEW, # PRE_SLEWING_TO_LEAD cannot trigger
+            raw_servo_angles=raw_servo_angles,
+            estimate_time=tracker.track.state_time,
+            ready_time=None,
+            intercept_position=object_position_world,
             intercept_time=None,
             trigger_time=None
         )

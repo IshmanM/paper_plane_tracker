@@ -82,8 +82,8 @@ SERVO_DEADBAND[SERVO_IDX["pan"]] = 0.1 # degrees
 SERVO_DEADBAND[SERVO_IDX["tilt"]] = 0.1 # degrees
 
 MAX_SERVO_SPEEDS = np.zeros(NUM_SERVOS, dtype=float)
-MAX_SERVO_SPEEDS[SERVO_IDX["pan"]] = 390.0 # degrees/s
-MAX_SERVO_SPEEDS[SERVO_IDX["tilt"]] = 360.0 # degrees/s
+MAX_SERVO_SPEEDS[SERVO_IDX["pan"]] = 390.0 # degrees/s. TODO: slow this if too fast
+MAX_SERVO_SPEEDS[SERVO_IDX["tilt"]] = 360.0 # degrees/s TODO: slow this if too fast
 
 # # Calibration biases after testing. <--Todo: maybe remove. this might be duplicate of the trim offset oon the endpoint side.
 # SERVO_BIASES = np.zeros(NUM_SERVOS, dtype=float)

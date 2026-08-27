@@ -7,6 +7,7 @@ import time
 class PlanType(Enum):
     OFF = auto()
     SEARCH = auto()
+    PRE_SLEW = auto()
     FIRST_INTERCEPT = auto()
     SUBSEQUENT_INTERCEPT = auto()
 
