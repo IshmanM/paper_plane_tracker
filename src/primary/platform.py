@@ -61,6 +61,14 @@ ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES = np.zeros(config.NUM_SERVOS, dtype=float)
 ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES[config.SERVO_IDX["pan"]] = 1.25 # degrees
 ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES[config.SERVO_IDX["tilt"]] = 1.25 # degrees
 ACTIVE_PLAN_FLIGHT_TIME_TOLERANCE = 0.010 # seconds
+ACTIVE_PLAN_UNCERTAINTY_SIGMA_MULTIPLIER = 1.5
+
+# Loose trigger-certainty limits. Planning/aiming continues when these are exceeded; only triggering is suppressed.
+MAX_TRIGGER_TRANSVERSE_UNCERTAINTY_M = 0.10
+MAX_TRIGGER_RANGE_UNCERTAINTY_M = 0.30
+
+# Cap used only by uncertainty-aware active-plan validity below.
+MAX_ACTIVE_PLAN_ANGULAR_UNCERTAINTY_DEG = 3.0
 
 
 # If now is inside _close_to_trigger_time(...), treat time-to-trigger cost as ideal.
@@ -113,6 +121,7 @@ class Platform:
         self.first_intercept_original_trigger_time = None
 
         self.triggering_halted = True # Forcing parameter
+        self.track_certain = False
 
         self.comm_buffer = comm_buffer
         self.comm_buffer.set_platform_snapshot(
@@ -148,6 +157,7 @@ class Platform:
         
         # Nothing updates if OFF
         if self.mode == PlatformMode.OFF:
+            self.track_certain = False
             self.comm_buffer.set_platform_snapshot(
                 active_plan=self.active_plan,
                 platform_mode=self.mode,
@@ -158,6 +168,7 @@ class Platform:
         ########## 0. UNIVERSAL TRACKER VALIDITY GUARD #############
 
         if not self._tracker_is_usable(tracker):
+            self.track_certain = False
             self.active_plan = self._make_search_plan(now)
             self.first_intercept_anchor_intercept_time  = None
             self.first_intercept_original_trigger_time = None
@@ -170,6 +181,21 @@ class Platform:
             )
             return
         
+        track_range = float(np.linalg.norm(tracker.track.state[:3]))
+        transverse_uncertainty_m = (
+            track_range*np.deg2rad(tracker.track.angular_uncertainty_deg)
+            if tracker.track.angular_uncertainty_deg is not None and np.isfinite(tracker.track.angular_uncertainty_deg)
+            else np.inf
+        )
+        self.track_certain = (
+            tracker.track_status == TrackStatus.CONFIRMED
+            and np.isfinite(transverse_uncertainty_m)
+            and transverse_uncertainty_m <= MAX_TRIGGER_TRANSVERSE_UNCERTAINTY_M
+            and tracker.track.range_uncertainty_m is not None
+            and np.isfinite(tracker.track.range_uncertainty_m)
+            and tracker.track.range_uncertainty_m <= MAX_TRIGGER_RANGE_UNCERTAINTY_M
+        )
+
         ########## 1. TENTATIVE TRACK PRE-SLEW #####################
 
         if tracker.track_status == TrackStatus.TENTATIVE:
@@ -206,6 +232,12 @@ class Platform:
             # Don't return. Let SEARCHING immediately try to acquire the new track
         
         ########## 3. MODE LOGIC ##################################
+
+        # FOLLOWING_LEAD is trigger-capable in comm_buffer.should_trigger().
+        # If certainty degrades, keep the manual triggering_halted state untouched and
+        # temporarily return to the non-triggering SLEWING_TO_LEAD mode.
+        if self.mode == PlatformMode.FOLLOWING_LEAD and not self.track_certain:
+            self.mode = PlatformMode.SLEWING_TO_LEAD
 
         if self.mode == PlatformMode.SEARCHING:
             
@@ -271,7 +303,7 @@ class Platform:
                         self.mode = PlatformMode.SEARCHING
             
             # if (and not elif) incase the new best first intercept plan somehow chooses a point that the platform is already pointed toward
-            if (self.mode == PlatformMode.SLEWING_TO_LEAD and self._close_to_trigger_time(now)):
+            if (self.mode == PlatformMode.SLEWING_TO_LEAD and self._close_to_trigger_time(now) and self.track_certain):
 
                 print(f"ENTER FOLLOWING | trigger error {(now - self.active_plan.trigger_time)*1000:.1f} ms") # FOR DEBUG ONLY
 
@@ -322,6 +354,7 @@ class Platform:
         self.first_intercept_original_trigger_time = None
         self.mode = PlatformMode.OFF
         self.triggering_halted = True
+        self.track_certain = False
 
         self.comm_buffer.set_platform_snapshot(
             active_plan=self.active_plan,
@@ -1015,6 +1048,14 @@ class Platform:
         planned_servo_angles = np.asarray(self.active_plan.raw_servo_angles, dtype=float).reshape(-1).copy()
         servo_angle_tolerances = np.asarray(ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES, dtype=float).reshape(-1).copy()
 
+        angular_uncertainty = tracker.track.angular_uncertainty_deg
+        if angular_uncertainty is not None and np.isfinite(angular_uncertainty):
+            angular_uncertainty = min(angular_uncertainty, MAX_ACTIVE_PLAN_ANGULAR_UNCERTAINTY_DEG)
+            servo_angle_tolerances = np.maximum(
+                servo_angle_tolerances,
+                ACTIVE_PLAN_UNCERTAINTY_SIGMA_MULTIPLIER*angular_uncertainty
+            )
+
         if np.any(servo_angle_tolerances <= 0.0):
             raise ValueError("ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES must be > 0")
 
@@ -1023,8 +1064,17 @@ class Platform:
         planned_foam_flight_time = self.active_plan.intercept_time - self.active_plan.trigger_time - TRIGGER_DELAY
         foam_flight_time_error = current_foam_flight_time - planned_foam_flight_time
 
+        flight_time_tolerance = ACTIVE_PLAN_FLIGHT_TIME_TOLERANCE
+        range_uncertainty = tracker.track.range_uncertainty_m
+        if range_uncertainty is not None and np.isfinite(range_uncertainty):
+            range_uncertainty = min(range_uncertainty, MAX_TRIGGER_RANGE_UNCERTAINTY_M)
+            flight_time_tolerance = max(
+                flight_time_tolerance,
+                ACTIVE_PLAN_UNCERTAINTY_SIGMA_MULTIPLIER*range_uncertainty/FOAM_PROTRUSION_SPEED
+            )
+
         servo_angles_still_valid = np.all(np.abs(servo_angle_error) <= servo_angle_tolerances)
-        foam_flight_time_still_valid = abs(foam_flight_time_error) <= ACTIVE_PLAN_FLIGHT_TIME_TOLERANCE
+        foam_flight_time_still_valid = abs(foam_flight_time_error) <= flight_time_tolerance
 
         if not servo_angles_still_valid or not foam_flight_time_still_valid:
             print(
