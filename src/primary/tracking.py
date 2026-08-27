@@ -115,20 +115,49 @@ def drawTrack(frame: np.ndarray, track, px_w: float, px_h: float, camera_calibra
 # eventually need to make this tracker class derived from some base class,
 # and use the base class in platform.py definitions
 
+
+# TODO: Replace the fixed angular/range measurement gate with a dynamic uncertainty-aware gate.
+# Current tradeoff:
+# - A loose angular gate (e.g. 15-20 deg) preserves legitimate fast motion, sudden turns, and
+#   acquisition of objects whose bearing changes quickly between frames. However, it also lets
+#   unexpected measurements strongly correct the KF, which can make the estimated velocity and
+#   future position change substantially frame-to-frame. That prediction churn can repeatedly
+#   invalidate intercept plans and add large trigger delays.
+# - A tight angular gate (e.g. 4 deg) produces much more stable KF predictions and substantially
+#   fewer plan invalidations/replans. In the 4-deg sudden-stop tests this corresponded to very low
+#   first-intercept latency (~77 ms average added replan delay, ~174 ms average total
+#   FIRST PLAN->FOLLOWING latency, ~124 ms median total latency). However, part of that improvement
+#   may be a selection effect: genuinely fast/maneuvering measurements can be rejected, so a track
+#   may only become/remain usable once its motion is predictable enough to fit inside the tight gate.
+#   This is especially undesirable for eventual paper-plane tracking, where large legitimate angular
+#   residuals can occur at 2-4 m during fast transverse motion or maneuvering.
+# - A gate rejection should therefore mean "do not trust this measurement for this update", NOT
+#   immediately "the track is dead". Predict through isolated rejected/missing frames and only kill
+#   or reinitialize after repeated failures.
+# Desired solution:
+# - Make the allowed residual depend on the KF's predicted uncertainty rather than using one fixed
+#   angle/range threshold. Tight, well-established tracks should automatically get tight gates;
+#   uncertain, newly acquired, rapidly maneuvering, or temporarily missed tracks should get wider gates.
+# - Prefer a camera-aware formulation separating bearing/angular uncertainty from range uncertainty,
+#   since monocular range is much noisier than image bearing and XYZ errors are coupled through depth.
+# - Eventually derive predicted angular/range uncertainty from the KF covariance P, combine it with
+#   measurement uncertainty, and gate normalized residuals (or use an equivalent Mahalanobis test).
+# - Keep reasonable absolute minimum/maximum bounds so covariance cannot make the gate absurdly tight
+#   or arbitrarily permissive.
 class SingleObjectTracker:
     def __init__(
         self,
         min_hits: int = 3,
         max_missed_on_confirmed: int = 5,
         max_missed_on_tentative: int = 1,
-        sigma_accel: float = 2.0,
+        sigma_accel: float = 3.0,
         sigma_meas_x: float = 0.05,
         sigma_meas_y: float = 0.05,
         sigma_meas_z: float = 0.20,
-        tentative_max_gate_angular_error_deg: float = 8.0,
+        tentative_max_gate_angular_error_deg: float = 4.0, # originally 8
         tentative_min_gate_range_error_m: float = 0.30,
         tentative_gate_range_error_fraction: float = 0.25,
-        confirmed_max_gate_angular_error_deg: float = 8.0,
+        confirmed_max_gate_angular_error_deg: float = 4.0, # originally 8
         confirmed_min_gate_range_error_m: float = 0.15,
         confirmed_gate_range_error_fraction: float = 0.15,
     ):
@@ -326,7 +355,10 @@ class SingleObjectTracker:
             dt = frame_time - self.track.state_time
             self._prediction_update(dt)
 
-            if (not object_detected) or (not self._measurement_passes_gate(measurement)):
+            predicted_state = self.track.state.copy() # FOR DEBUG ONLY
+            measurement_passes_gate = object_detected and self._measurement_passes_gate(measurement)
+
+            if not measurement_passes_gate:
                 self.track.mark_missed()
                 max_missed = self.max_missed_on_confirmed if self.track.confirmed else self.max_missed_on_tentative
 
@@ -340,6 +372,18 @@ class SingleObjectTracker:
             else:
                 self.track.mark_hit(measurement, self.min_hits)
                 self._measurement_update(measurement)
+
+            if self.track is not None and self.track.confirmed: # FOR DEBUG ONLY
+                measurement_text = (
+                    f"[{measurement.x:.3f}, {measurement.y:.3f}, {measurement.z:.3f}]"
+                    if object_detected else "NONE"
+                )
+                print(
+                    f"KF | dt={dt*1000:.1f} ms | "
+                    f"pred pos={predicted_state[:3]} vel={predicted_state[3:]} | "
+                    f"meas={measurement_text} {'ACCEPT' if measurement_passes_gate else 'REJECT'} | "
+                    f"corr pos={self.track.state[:3]} vel={self.track.state[3:]}"
+                ) # FOR DEBUG ONLY
 
             self.track.state_time = frame_time
 
