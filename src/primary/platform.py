@@ -67,9 +67,6 @@ ACTIVE_PLAN_UNCERTAINTY_SIGMA_MULTIPLIER = 1.5
 MAX_TRIGGER_TRANSVERSE_UNCERTAINTY_M = 0.10
 MAX_TRIGGER_RANGE_UNCERTAINTY_M = 0.30
 
-# Cap used only by uncertainty-aware active-plan validity below.
-MAX_ACTIVE_PLAN_ANGULAR_UNCERTAINTY_DEG = 3.0
-
 
 # If now is inside _close_to_trigger_time(...), treat time-to-trigger cost as ideal.
 PLAN_COST_NOW_TRIGGER_TIME_COST = 0.0
@@ -1050,7 +1047,6 @@ class Platform:
 
         angular_uncertainty = tracker.track.angular_uncertainty_deg
         if angular_uncertainty is not None and np.isfinite(angular_uncertainty):
-            angular_uncertainty = min(angular_uncertainty, MAX_ACTIVE_PLAN_ANGULAR_UNCERTAINTY_DEG)
             servo_angle_tolerances = np.maximum(
                 servo_angle_tolerances,
                 ACTIVE_PLAN_UNCERTAINTY_SIGMA_MULTIPLIER*angular_uncertainty
