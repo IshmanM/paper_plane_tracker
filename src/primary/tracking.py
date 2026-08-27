@@ -48,6 +48,9 @@ class Track:
 
         self.hit_streak = 1
         self.missed_streak = 0
+        self.gate_rejected_streak = 0
+        self.last_gate_rejected_measurement = None
+        self.last_gate_rejected_time = None
         self.confirmed = False if min_hits > 1 else True
 
         self.last_hit_measurement = initial_measurement
@@ -161,6 +164,7 @@ class SingleObjectTracker:
         confirmed_gate_range_error_fraction: float = 0.15,
         max_initial_xy_speed_m_s: float = 8.0, # above expected ~6 m/s paper-plane speed
         max_initial_z_speed_m_s: float = 4.0, # tighter because monocular depth is much noisier
+        max_gate_rejected_streak: int = 2, # reacquire after this many mutually consistent rejected detections
     ):
         self.track = None
         self.next_track_id = 0
@@ -192,6 +196,7 @@ class SingleObjectTracker:
         # a ~6 m/s plane; depth is clipped harder because apparent-size noise makes dz much less reliable.
         self.max_initial_xy_speed_m_s = max_initial_xy_speed_m_s
         self.max_initial_z_speed_m_s = max_initial_z_speed_m_s
+        self.max_gate_rejected_streak = max_gate_rejected_streak
 
 
     @staticmethod
@@ -479,11 +484,43 @@ class SingleObjectTracker:
             predicted_state = self.track.state.copy() # FOR DEBUG ONLY
             if object_detected:
                 measurement_passes_gate = self._measurement_passes_gate(measurement)
+
+                if not measurement_passes_gate:
+                    previous_rejected = self.track.last_gate_rejected_measurement
+                    previous_rejected_time = self.track.last_gate_rejected_time
+                    rejected_measurements_consistent = False
+
+                    if previous_rejected is not None and previous_rejected_time is not None:
+                        rejected_dt = frame_time - previous_rejected_time
+                        if rejected_dt > 1e-6:
+                            rejected_velocity = np.array([
+                                (measurement.x - previous_rejected.x)/rejected_dt,
+                                (measurement.y - previous_rejected.y)/rejected_dt,
+                                (measurement.z - previous_rejected.z)/rejected_dt
+                            ], dtype=float)
+                            rejected_measurements_consistent = (
+                                np.linalg.norm(rejected_velocity[:2]) <= self.max_initial_xy_speed_m_s
+                                and abs(rejected_velocity[2]) <= self.max_initial_z_speed_m_s
+                            )
+
+                    self.track.gate_rejected_streak = self.track.gate_rejected_streak + 1 if rejected_measurements_consistent else 1
+                    self.track.last_gate_rejected_measurement = measurement
+                    self.track.last_gate_rejected_time = frame_time
+                else:
+                    self.track.gate_rejected_streak = 0
+                    self.track.last_gate_rejected_measurement = None
+                    self.track.last_gate_rejected_time = None
             else:
                 self.track.innovation_mahalanobis = None
+                self.track.gate_rejected_streak = 0
+                self.track.last_gate_rejected_measurement = None
+                self.track.last_gate_rejected_time = None
                 measurement_passes_gate = False
 
-            if not measurement_passes_gate:
+            if object_detected and not measurement_passes_gate and self.track.gate_rejected_streak >= self.max_gate_rejected_streak:
+                print(f"TRACK REACQUIRED | {self.track.gate_rejected_streak} mutually consistent gate rejections") # FOR DEBUG ONLY
+                self._create_track(measurement, initial_time=frame_time)
+            elif not measurement_passes_gate:
                 self.track.mark_missed()
                 max_missed = self.max_missed_on_confirmed if self.track.confirmed else self.max_missed_on_tentative
 
