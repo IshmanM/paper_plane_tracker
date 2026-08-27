@@ -21,7 +21,7 @@ MAX_TRACK_ID = 2**32 - 1 # max uint32 number
 class Track:
 
     def __init__(self, initial_measurement: Measurement, initial_time, min_hits: int, track_id=0,
-                 sigma_x=0.1, sigma_y=0.1, sigma_z=0.2, sigma_dx=2.0, sigma_dy=2.0, sigma_dz=2.0,
+                 sigma_x=0.1, sigma_y=0.1, sigma_z=0.2, sigma_dx=1.0, sigma_dy=1.0, sigma_dz=1.0,
                  horizontal_angular_uncertainty_deg=None, vertical_angular_uncertainty_deg=None,
                  angular_uncertainty_deg=None, range_uncertainty_m=None, innovation_mahalanobis=None):
 
@@ -104,17 +104,7 @@ class Track:
 
 
 def drawTrack(frame: np.ndarray, track, px_w: float, px_h: float, camera_calibration: CameraCalibration) -> None:
-    if track.z <= 1e-6:
-        return
-
     track_u, track_v = estimateObjectImagePosition(track.x, track.y, track.z, camera_calibration)
-    if not np.isfinite(track_u) or not np.isfinite(track_v):
-        return
-
-    frame_h, frame_w = frame.shape[:2]
-    if track_u < -2*frame_w or track_u > 3*frame_w or track_v < -2*frame_h or track_v > 3*frame_h:
-        return # projected track is far outside the drawable image
-
     track_center = (int(round(track_u)), int(round(track_v)))
 
     cv2.rectangle(frame, (int(round(track_u - px_w / 2)), int(round(track_v - px_h / 2))),
@@ -130,6 +120,7 @@ def drawTrack(frame: np.ndarray, track, px_w: float, px_h: float, camera_calibra
         arrow_end = (int(round(track_u + arrow_length_px * direction[0])),
                      int(round(track_v + arrow_length_px * direction[1])))
         cv2.arrowedLine(frame, track_center, arrow_end, color=(0, 0, 255), thickness=2, tipLength=0.25)
+
 
 # eventually need to make this tracker class derived from some base class,
 # and use the base class in platform.py definitions
@@ -458,10 +449,10 @@ class SingleObjectTracker:
                     if object_detected else "NONE"
                 )
                 gate_text = (
-                    f"maha_dist={self.track.innovation_mahalanobis:.2f} "
+                    f"maha={self.track.innovation_mahalanobis:.2f} "
                     f"ang_sigma={self.track.angular_uncertainty_deg:.2f}deg "
                     f"range_sigma={self.track.range_uncertainty_m:.3f}m"
-                    if self.track.innovation_mahalanobis is not None else "maha_dist=NONE"
+                    if self.track.innovation_mahalanobis is not None else "maha=NONE"
                 )
                 print(
                     f"KF | dt={dt*1000:.1f} ms | "

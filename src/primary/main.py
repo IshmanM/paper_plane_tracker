@@ -35,7 +35,7 @@ OBJECT_VISION_SPEC_IDS = (
 )
 
 TRACKER_KWARGS = dict(
-    min_hits=3,
+    min_hits=3, # originally 3
     max_missed_on_confirmed=15,
     max_missed_on_tentative=1, #todo: try 0
     # params...
