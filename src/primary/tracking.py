@@ -21,7 +21,7 @@ MAX_TRACK_ID = 2**32 - 1 # max uint32 number
 class Track:
 
     def __init__(self, initial_measurement: Measurement, initial_time, min_hits: int, track_id=0,
-                 sigma_x=0.1, sigma_y=0.1, sigma_z=0.2, sigma_dx=1.0, sigma_dy=1.0, sigma_dz=1.0,
+                 sigma_x=0.1, sigma_y=0.1, sigma_z=0.2, sigma_dx=1.0, sigma_dy=1.0, sigma_dz=1.5,
                  horizontal_angular_uncertainty_deg=None, vertical_angular_uncertainty_deg=None,
                  angular_uncertainty_deg=None, range_uncertainty_m=None, innovation_mahalanobis=None):
 
@@ -33,6 +33,7 @@ class Track:
             0.0, 0.0, 0.0
         ], dtype=float)
         self.state_time = initial_time # time current KF state represents
+        self.first_detection_time = initial_time # time first detection created this track
 
         # Need to tune starting covariance...
         # Note smaller initial sigma/covariance indicates higher initial position certainty
@@ -50,6 +51,7 @@ class Track:
         self.confirmed = False if min_hits > 1 else True
 
         self.last_hit_measurement = initial_measurement
+        self.initial_velocity_initialized = False
 
         # Camera-space uncertainty/innovation diagnostics; useful to Platform later without inventing
         # a generic confidence score. The tracker fills these from the current KF covariance.
@@ -104,7 +106,17 @@ class Track:
 
 
 def drawTrack(frame: np.ndarray, track, px_w: float, px_h: float, camera_calibration: CameraCalibration) -> None:
+    if track.z <= 1e-6:
+        return
+
     track_u, track_v = estimateObjectImagePosition(track.x, track.y, track.z, camera_calibration)
+    if not np.isfinite(track_u) or not np.isfinite(track_v):
+        return
+
+    frame_h, frame_w = frame.shape[:2]
+    if track_u < -2*frame_w or track_u > 3*frame_w or track_v < -2*frame_h or track_v > 3*frame_h:
+        return # projected track is far outside the drawable image
+
     track_center = (int(round(track_u)), int(round(track_v)))
 
     cv2.rectangle(frame, (int(round(track_u - px_w / 2)), int(round(track_v - px_h / 2))),
@@ -120,7 +132,6 @@ def drawTrack(frame: np.ndarray, track, px_w: float, px_h: float, camera_calibra
         arrow_end = (int(round(track_u + arrow_length_px * direction[0])),
                      int(round(track_v + arrow_length_px * direction[1])))
         cv2.arrowedLine(frame, track_center, arrow_end, color=(0, 0, 255), thickness=2, tipLength=0.25)
-
 
 # eventually need to make this tracker class derived from some base class,
 # and use the base class in platform.py definitions
@@ -148,6 +159,8 @@ class SingleObjectTracker:
         tentative_gate_range_error_fraction: float = 0.25,
         confirmed_min_gate_range_error_m: float = 0.15,
         confirmed_gate_range_error_fraction: float = 0.15,
+        max_initial_xy_speed_m_s: float = 8.0, # above expected ~6 m/s paper-plane speed
+        max_initial_z_speed_m_s: float = 4.0, # tighter because monocular depth is much noisier
     ):
         self.track = None
         self.next_track_id = 0
@@ -174,6 +187,11 @@ class SingleObjectTracker:
         self.tentative_gate_range_error_fraction = tentative_gate_range_error_fraction
         self.confirmed_min_gate_range_error_m = confirmed_min_gate_range_error_m
         self.confirmed_gate_range_error_fraction = confirmed_gate_range_error_fraction
+
+        # Initial velocity comes from the first two accepted detections. XY gets enough headroom for
+        # a ~6 m/s plane; depth is clipped harder because apparent-size noise makes dz much less reliable.
+        self.max_initial_xy_speed_m_s = max_initial_xy_speed_m_s
+        self.max_initial_z_speed_m_s = max_initial_z_speed_m_s
 
 
     @staticmethod
@@ -280,6 +298,31 @@ class SingleObjectTracker:
         return (mahalanobis_sq <= mahalanobis_sq_threshold
                 and angular_error_deg <= self.max_gate_angular_error_deg
                 and range_error <= max_range_error)
+
+
+    def _initialize_velocity_from_second_hit(self, measurement: Measurement, frame_time):
+        if self.track is None or self.track.initial_velocity_initialized:
+            return
+
+        dt = frame_time - self.track.first_detection_time
+        if dt <= 1e-6:
+            return
+
+        first = self.track.last_hit_measurement
+        raw_velocity = np.array([
+            (measurement.x - first.x)/dt,
+            (measurement.y - first.y)/dt,
+            (measurement.z - first.z)/dt
+        ], dtype=float)
+
+        # Clip XY by vector magnitude so diagonal motion cannot exceed the intended lateral speed cap.
+        xy_speed = float(np.linalg.norm(raw_velocity[:2]))
+        if xy_speed > self.max_initial_xy_speed_m_s:
+            raw_velocity[:2] *= self.max_initial_xy_speed_m_s/xy_speed
+        raw_velocity[2] = np.clip(raw_velocity[2], -self.max_initial_z_speed_m_s, self.max_initial_z_speed_m_s)
+
+        self.track.state[DX:DZ + 1] = raw_velocity
+        self.track.initial_velocity_initialized = True
 
 
     def _prediction_update(self, dt):
@@ -440,8 +483,12 @@ class SingleObjectTracker:
                     else:
                         self._create_track(measurement, initial_time=frame_time)
             else:
-                self.track.mark_hit(measurement, self.min_hits)
+                was_confirmed = self.track.confirmed # FOR DEBUG ONLY
                 self._measurement_update(measurement)
+                self._initialize_velocity_from_second_hit(measurement, frame_time)
+                self.track.mark_hit(measurement, self.min_hits)
+                if not was_confirmed and self.track.confirmed:
+                    print(f"TRACK CONFIRMED | first detection->confirmed {(frame_time - self.track.first_detection_time)*1000:.1f} ms") # FOR DEBUG ONLY
 
             if self.track is not None and self.track.confirmed: # FOR DEBUG ONLY
                 measurement_text = (
@@ -449,10 +496,10 @@ class SingleObjectTracker:
                     if object_detected else "NONE"
                 )
                 gate_text = (
-                    f"maha={self.track.innovation_mahalanobis:.2f} "
+                    f"maha_dist={self.track.innovation_mahalanobis:.2f} "
                     f"ang_sigma={self.track.angular_uncertainty_deg:.2f}deg "
                     f"range_sigma={self.track.range_uncertainty_m:.3f}m"
-                    if self.track.innovation_mahalanobis is not None else "maha=NONE"
+                    if self.track.innovation_mahalanobis is not None else "maha_dist=NONE"
                 )
                 print(
                     f"KF | dt={dt*1000:.1f} ms | "
