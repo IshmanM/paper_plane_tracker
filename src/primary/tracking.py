@@ -342,65 +342,53 @@ class SingleObjectTracker:
         self.track.initial_velocity_initialized = True
 
 
-    def _prediction_update(self, dt):
-        """
-        Kalman prediction step.
-
-        Theory:
-            x_k_pred = F_k @ x_k_prev
-            P_k_pred = F_k @ P_k_prev @ F_k.T + Q_k
-
-        State:
-            [x, y, z, dx, dy, dz]
-
-        Mean motion assumes constant velocity. Q models unknown acceleration
-        that may come from gravity, aerodynamics, hand motion, etc.
-        """
-
-        if self.track is None:
-            raise ValueError("Cannot update without an active track.")
-
-        x_k_prev = self.track.state
-        P_k_prev = self.track.covariance
-
-        F_k = np.eye(6, dtype=float)
-        F_k[X, DX] = dt
-        F_k[Y, DY] = dt
-        F_k[Z, DZ] = dt
-
-        # Constant unknown acceleration over this timestep:
-        # position error ~= 0.5*a*dt^2, velocity error ~= a*dt
-        accel_variance = self.sigma_accel**2
-        dt2, dt3, dt4 = dt**2, dt**3, dt**4
-
-        Q_k = np.zeros((6, 6), dtype=float)
-        for position_index, velocity_index in ((X, DX), (Y, DY), (Z, DZ)):
-            Q_k[position_index, position_index] = 0.25 * dt4 * accel_variance
-            Q_k[position_index, velocity_index] = 0.5 * dt3 * accel_variance
-            Q_k[velocity_index, position_index] = 0.5 * dt3 * accel_variance
-            Q_k[velocity_index, velocity_index] = dt2 * accel_variance
-
-        x_k_pred = F_k @ x_k_prev
-        P_k_pred = F_k @ P_k_prev @ F_k.T + Q_k
-
-        self.track.state = x_k_pred
-        self.track.covariance = P_k_pred
-        self._update_track_camera_uncertainty()
-
-
-    def predict(self, dt):
-        # Not a Kalman update. Implemented for the Platform to call.
-        # Mean prediction remains constant velocity; acceleration is uncertainty, not a known input.
+    def _predict_state_and_covariance(self, dt):
+        """Non-mutating CV prediction shared by the KF update and Platform prediction."""
         if self.track is None:
             raise ValueError("Cannot predict without an active track.")
 
-        x_k_prev = self.track.state
         F_k = np.eye(6, dtype=float)
         F_k[X, DX] = dt
         F_k[Y, DY] = dt
         F_k[Z, DZ] = dt
 
-        return F_k @ x_k_prev
+        # Constant unknown acceleration over this timestep.
+        accel_variance = self.sigma_accel**2
+        dt2, dt3, dt4 = dt**2, dt**3, dt**4
+        Q_k = np.zeros((6, 6), dtype=float)
+        for position_index, velocity_index in ((X, DX), (Y, DY), (Z, DZ)):
+            Q_k[position_index, position_index] = 0.25*dt4*accel_variance
+            Q_k[position_index, velocity_index] = 0.5*dt3*accel_variance
+            Q_k[velocity_index, position_index] = 0.5*dt3*accel_variance
+            Q_k[velocity_index, velocity_index] = dt2*accel_variance
+
+        predicted_state = F_k @ self.track.state
+        predicted_covariance = F_k @ self.track.covariance @ F_k.T + Q_k
+        return predicted_state, predicted_covariance
+
+
+    def _prediction_update(self, dt):
+        """Kalman prediction step; mean is CV and Q models unknown acceleration."""
+        self.track.state, self.track.covariance = self._predict_state_and_covariance(dt)
+        self._update_track_camera_uncertainty()
+
+
+    def predict(self, dt, include_uncertainty=False):
+        # Non-mutating prediction for Platform. Default return stays backward-compatible.
+        predicted_state, predicted_covariance = self._predict_state_and_covariance(dt)
+        if not include_uncertainty:
+            return predicted_state
+
+        camera_measurement, J = self._camera_measurement_and_jacobian(predicted_state[:3])
+        if J is None:
+            return predicted_state, None, None
+
+        camera_covariance = J @ predicted_covariance[:3, :3] @ J.T
+        camera_covariance = 0.5*(camera_covariance + camera_covariance.T)
+        angular_sigma_rad = float(np.sqrt(max(camera_covariance[0, 0], camera_covariance[1, 1], 0.0)))
+        transverse_uncertainty_m = float(camera_measurement[2]*angular_sigma_rad) # worst bearing 1-sigma, expressed transversely
+        range_uncertainty_m = float(np.sqrt(max(camera_covariance[2, 2], 0.0)))
+        return predicted_state, transverse_uncertainty_m, range_uncertainty_m
 
 
     def _measurement_update(self, measurement: Measurement):

@@ -88,12 +88,16 @@ PLAN_COST_SERVO_ANGLE_SCALES[config.SERVO_IDX["tilt"]] = 30.0 # degrees
 # Normalize intercept-position changes for continuity cost.
 PLAN_COST_INTERCEPT_POSITION_SCALES = np.array([0.20, 0.20, 0.30], dtype=float)
 
+# No uncertainty penalty while comfortably inside the trigger-certainty limits.
+PLAN_COST_UNCERTAINTY_RISK_START_RATIO = 0.80
+
 
 FIRST_INTERCEPT_PLAN_COST_WEIGHTS = {
     "time": 1.0,
     "servo_motion": 0.25,
     "ready_margin": 0.0,
     "continuity": 0.0,
+    "uncertainty_risk": 0.15,
 }
 
 SUBSEQUENT_INTERCEPT_PLAN_COST_WEIGHTS = {
@@ -101,6 +105,7 @@ SUBSEQUENT_INTERCEPT_PLAN_COST_WEIGHTS = {
     "servo_motion": 0.50,
     "ready_margin": 0.0,
     "continuity": 0.75,
+    "uncertainty_risk": 0.25,
 }
 
 
@@ -178,19 +183,13 @@ class Platform:
             )
             return
         
-        track_range = float(np.linalg.norm(tracker.track.state[:3]))
-        transverse_uncertainty_m = (
-            track_range*np.deg2rad(tracker.track.angular_uncertainty_deg)
-            if tracker.track.angular_uncertainty_deg is not None and np.isfinite(tracker.track.angular_uncertainty_deg)
-            else np.inf
-        )
+        _, transverse_uncertainty_m, range_uncertainty_m = tracker.predict(0.0, include_uncertainty=True)
         self.track_certain = (
             tracker.track_status == TrackStatus.CONFIRMED
-            and np.isfinite(transverse_uncertainty_m)
+            and transverse_uncertainty_m is not None and np.isfinite(transverse_uncertainty_m)
             and transverse_uncertainty_m <= MAX_TRIGGER_TRANSVERSE_UNCERTAINTY_M
-            and tracker.track.range_uncertainty_m is not None
-            and np.isfinite(tracker.track.range_uncertainty_m)
-            and tracker.track.range_uncertainty_m <= MAX_TRIGGER_RANGE_UNCERTAINTY_M
+            and range_uncertainty_m is not None and np.isfinite(range_uncertainty_m)
+            and range_uncertainty_m <= MAX_TRIGGER_RANGE_UNCERTAINTY_M
         )
 
         ########## 1. TENTATIVE TRACK PRE-SLEW #####################
@@ -582,7 +581,7 @@ class Platform:
 
 
 
-    def _plan_cost(self, now, plan: Plan, weights: dict[str, float], min_ready_margin) -> float:
+    def _plan_cost(self, now, plan: Plan, weights: dict[str, float], min_ready_margin, uncertainty_ratio) -> float:
         """
             Generic plan cost.
 
@@ -656,12 +655,22 @@ class Platform:
                 position_scales = np.asarray(PLAN_COST_INTERCEPT_POSITION_SCALES, dtype=float).reshape(-1).copy()
                 continuity_cost = float(np.linalg.norm((p_new - p_old) / position_scales))
 
-        # 5. Total weighted cost
+        # 5. Uncertainty risk cost. It only grows near/beyond the trigger-certainty boundary,
+        # so normal later candidates are not simply charged a second time for being later.
+        if not np.isfinite(uncertainty_ratio):
+            return np.inf
+        uncertainty_risk_cost = 0.0
+        if uncertainty_ratio > PLAN_COST_UNCERTAINTY_RISK_START_RATIO:
+            uncertainty_risk_cost = ((uncertainty_ratio - PLAN_COST_UNCERTAINTY_RISK_START_RATIO)
+                                     /(1.0 - PLAN_COST_UNCERTAINTY_RISK_START_RATIO))**2
+
+        # 6. Total weighted cost
         cost = float(
             weights.get("time", 0.0) * time_to_trigger_cost
             + weights.get("servo_motion", 0.0) * servo_motion_cost
             + weights.get("ready_margin", 0.0) * ready_margin_cost
             + weights.get("continuity", 0.0) * continuity_cost
+            + weights.get("uncertainty_risk", 0.0) * uncertainty_risk_cost
         )
 
         if not np.isfinite(cost):
@@ -690,12 +699,20 @@ class Platform:
                 rejection_counts["backward"] += 1
                 continue
 
-            # 1. Predict object position at candidate intercept time.
+            # 1. Predict object position and uncertainty at candidate intercept time.
             # Todo: might eventually want to add different behavior for position outside the visible range
-            object_position_world = tracker.predict(dt)[:3].copy()
-            if not np.all(np.isfinite(object_position_world)):
+            predicted_state, transverse_uncertainty_m, range_uncertainty_m = tracker.predict(dt, include_uncertainty=True)
+            object_position_world = predicted_state[:3].copy()
+            if (not np.all(np.isfinite(object_position_world))
+                    or transverse_uncertainty_m is None or not np.isfinite(transverse_uncertainty_m)
+                    or range_uncertainty_m is None or not np.isfinite(range_uncertainty_m)):
                 rejection_counts["prediction"] += 1
                 continue
+
+            uncertainty_ratio = max(
+                transverse_uncertainty_m/MAX_TRIGGER_TRANSVERSE_UNCERTAINTY_M,
+                range_uncertainty_m/MAX_TRIGGER_RANGE_UNCERTAINTY_M
+            )
 
             # 2. Transform object position into platform frame.
             object_position_platform = estimateObjectPlatformPosition(object_position_world, self.camera_to_platform_calibration)
@@ -734,7 +751,7 @@ class Platform:
                 trigger_time=trigger_time
             )
 
-            cost = self._plan_cost(now, plan, cost_weights, min_ready_margin) # Todo: determine what to do with infinite cost
+            cost = self._plan_cost(now, plan, cost_weights, min_ready_margin, uncertainty_ratio) # Todo: determine what to do with infinite cost
 
             # 7. Replace the best plan if new one is better
             if cost < best_cost: # also ensures np.inf cost doesn't pass a plan
