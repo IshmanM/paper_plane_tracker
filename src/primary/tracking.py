@@ -21,7 +21,9 @@ MAX_TRACK_ID = 2**32 - 1 # max uint32 number
 class Track:
 
     def __init__(self, initial_measurement: Measurement, initial_time, min_hits: int, track_id=0,
-                 sigma_x=0.1, sigma_y=0.1, sigma_z=0.2, sigma_dx=1.0, sigma_dy=1.0, sigma_dz=1.0):
+                 sigma_x=0.1, sigma_y=0.1, sigma_z=0.2, sigma_dx=1.0, sigma_dy=1.0, sigma_dz=1.0,
+                 horizontal_angular_uncertainty_deg=None, vertical_angular_uncertainty_deg=None,
+                 angular_uncertainty_deg=None, range_uncertainty_m=None, innovation_mahalanobis=None):
 
         self.id = track_id # not useful until MOT
 
@@ -48,6 +50,14 @@ class Track:
         self.confirmed = False if min_hits > 1 else True
 
         self.last_hit_measurement = initial_measurement
+
+        # Camera-space uncertainty/innovation diagnostics; useful to Platform later without inventing
+        # a generic confidence score. The tracker fills these from the current KF covariance.
+        self.horizontal_angular_uncertainty_deg = horizontal_angular_uncertainty_deg
+        self.vertical_angular_uncertainty_deg = vertical_angular_uncertainty_deg
+        self.angular_uncertainty_deg = angular_uncertainty_deg
+        self.range_uncertainty_m = range_uncertainty_m
+        self.innovation_mahalanobis = innovation_mahalanobis
 
 
     def mark_hit(self, measurement, min_hits: int):
@@ -116,34 +126,8 @@ def drawTrack(frame: np.ndarray, track, px_w: float, px_h: float, camera_calibra
 # and use the base class in platform.py definitions
 
 
-# TODO: Replace the fixed angular/range measurement gate with a dynamic uncertainty-aware gate.
-# Current tradeoff:
-# - A loose angular gate (e.g. 15-20 deg) preserves legitimate fast motion, sudden turns, and
-#   acquisition of objects whose bearing changes quickly between frames. However, it also lets
-#   unexpected measurements strongly correct the KF, which can make the estimated velocity and
-#   future position change substantially frame-to-frame. That prediction churn can repeatedly
-#   invalidate intercept plans and add large trigger delays.
-# - A tight angular gate (e.g. 4 deg) produces much more stable KF predictions and substantially
-#   fewer plan invalidations/replans. In the 4-deg sudden-stop tests this corresponded to very low
-#   first-intercept latency (~77 ms average added replan delay, ~174 ms average total
-#   FIRST PLAN->FOLLOWING latency, ~124 ms median total latency). However, part of that improvement
-#   may be a selection effect: genuinely fast/maneuvering measurements can be rejected, so a track
-#   may only become/remain usable once its motion is predictable enough to fit inside the tight gate.
-#   This is especially undesirable for eventual paper-plane tracking, where large legitimate angular
-#   residuals can occur at 2-4 m during fast transverse motion or maneuvering.
-# - A gate rejection should therefore mean "do not trust this measurement for this update", NOT
-#   immediately "the track is dead". Predict through isolated rejected/missing frames and only kill
-#   or reinitialize after repeated failures.
-# Desired solution:
-# - Make the allowed residual depend on the KF's predicted uncertainty rather than using one fixed
-#   angle/range threshold. Tight, well-established tracks should automatically get tight gates;
-#   uncertain, newly acquired, rapidly maneuvering, or temporarily missed tracks should get wider gates.
-# - Prefer a camera-aware formulation separating bearing/angular uncertainty from range uncertainty,
-#   since monocular range is much noisier than image bearing and XYZ errors are coupled through depth.
-# - Eventually derive predicted angular/range uncertainty from the KF covariance P, combine it with
-#   measurement uncertainty, and gate normalized residuals (or use an equivalent Mahalanobis test).
-# - Keep reasonable absolute minimum/maximum bounds so covariance cannot make the gate absurdly tight
-#   or arbitrarily permissive.
+# Camera-aware gating compares bearing + range in normalized uncertainty units. This lets a stable
+# track gate tightly while prediction uncertainty naturally grows after motion uncertainty or misses.
 class SingleObjectTracker:
     def __init__(
         self,
@@ -154,10 +138,14 @@ class SingleObjectTracker:
         sigma_meas_x: float = 0.05,
         sigma_meas_y: float = 0.05,
         sigma_meas_z: float = 0.20,
-        tentative_max_gate_angular_error_deg: float = 4.0, # originally 8
+        tentative_gate_mahalanobis_sq_threshold: float = 16.27, # ~99.9% chi-square threshold, 3 DOF
+        confirmed_gate_mahalanobis_sq_threshold: float = 11.34, # ~99% chi-square threshold, 3 DOF
+        gate_measurement_angular_sigma_deg: float = 1.0,
+        gate_measurement_min_range_sigma_m: float = 0.05,
+        gate_measurement_range_sigma_fraction: float = 0.05,
+        max_gate_angular_error_deg: float = 20.0, # hard sanity cap even if KF covariance grows very large
         tentative_min_gate_range_error_m: float = 0.30,
         tentative_gate_range_error_fraction: float = 0.25,
-        confirmed_max_gate_angular_error_deg: float = 4.0, # originally 8
         confirmed_min_gate_range_error_m: float = 0.15,
         confirmed_gate_range_error_fraction: float = 0.15,
     ):
@@ -174,14 +162,67 @@ class SingleObjectTracker:
         self.sigma_meas_y = sigma_meas_y # meters
         self.sigma_meas_z = sigma_meas_z # meters
 
-        # Camera-aware outlier gate. Keep tentative gating permissive while velocity is still
-        # immature, then tighten once the track is confirmed.
-        self.tentative_max_gate_angular_error_deg = tentative_max_gate_angular_error_deg
+        # Gate measurement noise is expressed directly in camera bearing/range coordinates rather
+        # than inheriting the much noisier monocular-depth coupling in Cartesian x/y/z.
+        self.tentative_gate_mahalanobis_sq_threshold = tentative_gate_mahalanobis_sq_threshold
+        self.confirmed_gate_mahalanobis_sq_threshold = confirmed_gate_mahalanobis_sq_threshold
+        self.gate_measurement_angular_sigma_deg = gate_measurement_angular_sigma_deg
+        self.gate_measurement_min_range_sigma_m = gate_measurement_min_range_sigma_m
+        self.gate_measurement_range_sigma_fraction = gate_measurement_range_sigma_fraction
+        self.max_gate_angular_error_deg = max_gate_angular_error_deg
         self.tentative_min_gate_range_error_m = tentative_min_gate_range_error_m
         self.tentative_gate_range_error_fraction = tentative_gate_range_error_fraction
-        self.confirmed_max_gate_angular_error_deg = confirmed_max_gate_angular_error_deg
         self.confirmed_min_gate_range_error_m = confirmed_min_gate_range_error_m
         self.confirmed_gate_range_error_fraction = confirmed_gate_range_error_fraction
+
+
+    @staticmethod
+    def _camera_measurement_and_jacobian(position):
+        # Camera-space measurement h=[horizontal bearing, vertical bearing, range].
+        x, y, z = np.asarray(position, dtype=float)
+        horizontal_range_sq = x*x + z*z
+        horizontal_range = float(np.sqrt(horizontal_range_sq))
+        range_sq = horizontal_range_sq + y*y
+        object_range = float(np.sqrt(range_sq))
+        if horizontal_range <= 1e-9 or object_range <= 1e-9:
+            return None, None
+
+        camera_measurement = np.array([
+            np.arctan2(x, z),
+            np.arctan2(y, horizontal_range),
+            object_range
+        ], dtype=float)
+
+        # First-order projection of Cartesian position covariance into bearing/range covariance.
+        J = np.array([
+            [z/horizontal_range_sq, 0.0, -x/horizontal_range_sq],
+            [-x*y/(horizontal_range*range_sq), horizontal_range/range_sq, -z*y/(horizontal_range*range_sq)],
+            [x/object_range, y/object_range, z/object_range]
+        ], dtype=float)
+        return camera_measurement, J
+
+
+    def _update_track_camera_uncertainty(self):
+        if self.track is None:
+            return
+
+        _, J = self._camera_measurement_and_jacobian(self.track.state[:3])
+        if J is None:
+            self.track.horizontal_angular_uncertainty_deg = None
+            self.track.vertical_angular_uncertainty_deg = None
+            self.track.angular_uncertainty_deg = None
+            self.track.range_uncertainty_m = None
+            return
+
+        camera_covariance = J @ self.track.covariance[:3, :3] @ J.T
+        camera_covariance = 0.5*(camera_covariance + camera_covariance.T) # suppress numerical asymmetry
+
+        horizontal_sigma_deg = float(np.rad2deg(np.sqrt(max(camera_covariance[0, 0], 0.0))))
+        vertical_sigma_deg = float(np.rad2deg(np.sqrt(max(camera_covariance[1, 1], 0.0))))
+        self.track.horizontal_angular_uncertainty_deg = horizontal_sigma_deg
+        self.track.vertical_angular_uncertainty_deg = vertical_sigma_deg
+        self.track.angular_uncertainty_deg = max(horizontal_sigma_deg, vertical_sigma_deg)
+        self.track.range_uncertainty_m = float(np.sqrt(max(camera_covariance[2, 2], 0.0)))
 
 
     def _measurement_passes_gate(self, measurement: Measurement) -> bool:
@@ -190,33 +231,55 @@ class SingleObjectTracker:
 
         predicted_position = np.asarray(self.track.state[:3], dtype=float)
         measurement_position = np.array([measurement.x, measurement.y, measurement.z], dtype=float)
-
         if not np.all(np.isfinite(predicted_position)) or not np.all(np.isfinite(measurement_position)):
+            self.track.innovation_mahalanobis = np.inf
             return False
 
-        predicted_range = float(np.linalg.norm(predicted_position))
-        measurement_range = float(np.linalg.norm(measurement_position))
-        if predicted_range <= 1e-9 or measurement_range <= 1e-9:
+        predicted_camera_measurement, J = self._camera_measurement_and_jacobian(predicted_position)
+        measured_camera_measurement, _ = self._camera_measurement_and_jacobian(measurement_position)
+        if J is None or measured_camera_measurement is None:
+            self.track.innovation_mahalanobis = np.inf
             return False
 
+        predicted_range = predicted_camera_measurement[2]
+        measurement_range = measured_camera_measurement[2]
+
+        # Innovation is measured in two camera bearing angles plus radial range.
+        innovation = measured_camera_measurement - predicted_camera_measurement
+        innovation[:2] = (innovation[:2] + np.pi) % (2*np.pi) - np.pi
+
+        predicted_camera_covariance = J @ self.track.covariance[:3, :3] @ J.T
+        angular_sigma_rad = np.deg2rad(self.gate_measurement_angular_sigma_deg)
+        range_sigma_m = max(self.gate_measurement_min_range_sigma_m,
+                            self.gate_measurement_range_sigma_fraction*predicted_range)
+        measurement_camera_covariance = np.diag([angular_sigma_rad**2, angular_sigma_rad**2, range_sigma_m**2])
+        innovation_covariance = predicted_camera_covariance + measurement_camera_covariance
+        innovation_covariance = 0.5*(innovation_covariance + innovation_covariance.T)
+
+        try:
+            mahalanobis_sq = float(innovation @ np.linalg.solve(innovation_covariance, innovation))
+        except np.linalg.LinAlgError:
+            self.track.innovation_mahalanobis = np.inf
+            return False
+        self.track.innovation_mahalanobis = float(np.sqrt(max(mahalanobis_sq, 0.0)))
+
+        # Hard physical sanity caps stop a very uncertain/lost track from accepting arbitrary detections.
         cos_angular_error = float(np.dot(predicted_position, measurement_position)/(predicted_range*measurement_range))
         angular_error_deg = float(np.rad2deg(np.arccos(np.clip(cos_angular_error, -1.0, 1.0))))
-
         if self.track.confirmed:
-            max_angular_error_deg = self.confirmed_max_gate_angular_error_deg
+            mahalanobis_sq_threshold = self.confirmed_gate_mahalanobis_sq_threshold
             min_range_error_m = self.confirmed_min_gate_range_error_m
             range_error_fraction = self.confirmed_gate_range_error_fraction
         else:
-            max_angular_error_deg = self.tentative_max_gate_angular_error_deg
+            mahalanobis_sq_threshold = self.tentative_gate_mahalanobis_sq_threshold
             min_range_error_m = self.tentative_min_gate_range_error_m
             range_error_fraction = self.tentative_gate_range_error_fraction
 
         range_error = abs(measurement_range - predicted_range)
         max_range_error = max(min_range_error_m, range_error_fraction*predicted_range)
-
-        # TODO later: consider Mahalanobis gating using the KF innovation covariance.
-        # TODO later: consider range-dependent measurement covariance R, especially sigma_meas_z.
-        return angular_error_deg <= max_angular_error_deg and range_error <= max_range_error
+        return (mahalanobis_sq <= mahalanobis_sq_threshold
+                and angular_error_deg <= self.max_gate_angular_error_deg
+                and range_error <= max_range_error)
 
 
     def _prediction_update(self, dt):
@@ -262,6 +325,7 @@ class SingleObjectTracker:
 
         self.track.state = x_k_pred
         self.track.covariance = P_k_pred
+        self._update_track_camera_uncertainty()
 
 
     def predict(self, dt):
@@ -326,10 +390,12 @@ class SingleObjectTracker:
 
         self.track.state = x_k
         self.track.covariance = P_k
+        self._update_track_camera_uncertainty()
 
 
     def _create_track(self, measurement: Measurement, initial_time):
         self.track = Track(measurement, initial_time, self.min_hits, self.next_track_id)
+        self._update_track_camera_uncertainty()
         self.next_track_id = self.next_track_id + 1 if self.next_track_id < MAX_TRACK_ID else 0
 
 
@@ -356,7 +422,11 @@ class SingleObjectTracker:
             self._prediction_update(dt)
 
             predicted_state = self.track.state.copy() # FOR DEBUG ONLY
-            measurement_passes_gate = object_detected and self._measurement_passes_gate(measurement)
+            if object_detected:
+                measurement_passes_gate = self._measurement_passes_gate(measurement)
+            else:
+                self.track.innovation_mahalanobis = None
+                measurement_passes_gate = False
 
             if not measurement_passes_gate:
                 self.track.mark_missed()
@@ -378,11 +448,17 @@ class SingleObjectTracker:
                     f"[{measurement.x:.3f}, {measurement.y:.3f}, {measurement.z:.3f}]"
                     if object_detected else "NONE"
                 )
+                gate_text = (
+                    f"maha={self.track.innovation_mahalanobis:.2f} "
+                    f"ang_sigma={self.track.angular_uncertainty_deg:.2f}deg "
+                    f"range_sigma={self.track.range_uncertainty_m:.3f}m"
+                    if self.track.innovation_mahalanobis is not None else "maha=NONE"
+                )
                 print(
                     f"KF | dt={dt*1000:.1f} ms | "
                     f"pred pos={predicted_state[:3]} vel={predicted_state[3:]} | "
                     f"meas={measurement_text} {'ACCEPT' if measurement_passes_gate else 'REJECT'} | "
-                    f"corr pos={self.track.state[:3]} vel={self.track.state[3:]}"
+                    f"{gate_text} | corr pos={self.track.state[:3]} vel={self.track.state[3:]}"
                 ) # FOR DEBUG ONLY
 
             self.track.state_time = frame_time
