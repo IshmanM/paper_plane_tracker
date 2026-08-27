@@ -11,20 +11,23 @@ from src.primary.platform_geometry_spec import PlatformGeometrySpecId, PlatformG
 from src.primary.camera_to_platform_calibration import CameraToPlatformCalibration
 
 
-SERVO_SETTLING_TIME = 0.15 # seconds
+
+MAX_SERVO_SETTLING_TIME = 0.10 # seconds
+SERVO_ANGLE_CHANGE_FOR_MAX_SETTLING = 30.0 # degrees
+
 SERVO_ROTATION_TIME_MARGIN = 0.00 # seconds. an extra margin.
 
 
-SEARCH_CENTER_PAN = 90.0 # degrees
-SEARCH_PAN_AMPLITUDE = 75.0 # degrees
-SEARCH_FREQUENCY = 0.2 # hz
+SEARCH_CENTER_PAN = 100.0 # degrees
+SEARCH_PAN_AMPLITUDE = 25.0 # degrees
+SEARCH_FREQUENCY = 0.5 # hz
 
 
 TRIGGER_TIME_LOWER_THRESHOLD = 0.040 # seconds. allow up to this much time late
 TRIGGER_TIME_UPPER_THRESHOLD = 0.020 # seconds. allow up to this much time early
 
-FIRST_INTERCEPT_MAX_NUM_CANDIDATES = 76 
-FIRST_INTERCEPT_MAX_LOOKAHEAD = 2.5 # seconds
+FIRST_INTERCEPT_MAX_NUM_CANDIDATES = 51 
+FIRST_INTERCEPT_MAX_LOOKAHEAD = 0.5 # seconds
 
 FIRST_INTERCEPT_REFRESH_NUM_CANDIDATES = 10
 FIRST_INTERCEPT_REFRESH_HALF_WINDOW = 0.005 # seconds, +/- around previous intercept time
@@ -49,12 +52,12 @@ MIN_FORWARD_RANGE = 0.02  # m
 # Usually False for a turret. High arc is slower and less direct.
 USE_HIGH_ARC = False
 
-MIN_FIRST_INTERCEPT_READY_MARGIN = 0.020 # seconds
-MIN_SUBSEQUENT_INTERCEPT_READY_MARGIN = 0.010 # seconds
+MIN_FIRST_INTERCEPT_READY_MARGIN = 0.010 # seconds. TODO: decraese if viable
+MIN_SUBSEQUENT_INTERCEPT_READY_MARGIN = 0.005 # seconds
 
 ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES = np.zeros(config.NUM_SERVOS, dtype=float)
 ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES[config.SERVO_IDX["pan"]] = 1.25 # degrees
-ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES[config.SERVO_IDX["tilt"]] = 1.0 # degrees
+ACTIVE_PLAN_SERVO_ANGLE_TOLERANCES[config.SERVO_IDX["tilt"]] = 1.25 # degrees
 ACTIVE_PLAN_FLIGHT_TIME_TOLERANCE = 0.010 # seconds
 
 
@@ -82,14 +85,14 @@ PLAN_COST_INTERCEPT_POSITION_SCALES = np.array([0.20, 0.20, 0.30], dtype=float)
 FIRST_INTERCEPT_PLAN_COST_WEIGHTS = {
     "time": 1.0,
     "servo_motion": 0.25,
-    "ready_margin": 0.75,
+    "ready_margin": 0.0,
     "continuity": 0.0,
 }
 
 SUBSEQUENT_INTERCEPT_PLAN_COST_WEIGHTS = {
     "time": 0.35,
     "servo_motion": 0.50,
-    "ready_margin": 0.75,
+    "ready_margin": 0.0,
     "continuity": 0.75,
 }
 
@@ -622,7 +625,7 @@ class Platform:
 
             # 5. Estimate the ready time and whether its within margin
             servo_rotation_time = self._estimate_servo_rotation_time(q_from=q_start, q_to=q_raw)
-            expected_ready_time = now + servo_rotation_time + config.UDP_TX_DELAY
+            expected_ready_time = now + servo_rotation_time + config.CMD_THREAD_MAX_DELAY + config.UDP_TX_DELAY + config.ENDPOINT_CMD_MAX_DELAY
             ready_margin = trigger_time - expected_ready_time
 
             if ready_margin < min_ready_margin:
@@ -912,7 +915,12 @@ class Platform:
 
         # Joints move together, so wait for the slowest one, then allow mechanical settling.
         rotation_time = float(np.max(joint_times))
-        return rotation_time + SERVO_SETTLING_TIME + SERVO_ROTATION_TIME_MARGIN
+
+        # Estimate settling time as linear scaling up to a max
+        max_angle_change = float(np.max(dq))
+        settling_time = MAX_SERVO_SETTLING_TIME * min(max_angle_change / SERVO_ANGLE_CHANGE_FOR_MAX_SETTLING, 1.0)
+
+        return rotation_time + settling_time + SERVO_ROTATION_TIME_MARGIN
 
     
     def _active_plan_still_valid(self, tracker: SingleObjectTracker, now) -> bool:

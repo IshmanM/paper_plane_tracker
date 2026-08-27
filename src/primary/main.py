@@ -105,8 +105,9 @@ if __name__ == "__main__":
 
     # link = None # FOR DEBUG ONLY
 
+    cmd_frequency_hz = config.CMD_FREQUENCY_HZ
     stop_event = threading.Event()
-    cmd_thread = threading.Thread(target=cmd_thread_main, args=(comm_buffer, stop_event, link), daemon=True)
+    cmd_thread = threading.Thread(target=cmd_thread_main, args=(comm_buffer, stop_event, link, cmd_frequency_hz), daemon=True)
     cmd_thread.start()
 
     # os.makedirs("images/primary_main_screenshots", exist_ok=True)
