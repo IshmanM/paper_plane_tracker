@@ -103,7 +103,7 @@ FIRST_INTERCEPT_PLAN_COST_WEIGHTS = {
     "servo_motion": 0.25,
     "ready_margin": 0.15,
     "continuity": 0.0,
-    "uncertainty_risk": 0.15,
+    "uncertainty_risk": 0.20,
 }
 
 SUBSEQUENT_INTERCEPT_PLAN_COST_WEIGHTS = {
