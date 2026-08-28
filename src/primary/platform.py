@@ -79,10 +79,11 @@ PLAN_COST_TIME_SCALE = 0.5 # seconds
 # ready_margin_cost = 1 / (1 + surplus / scale)
 PLAN_COST_READY_MARGIN_SCALE = 0.05 # seconds
 
-# Normalize servo motion cost.
-PLAN_COST_SERVO_ANGLE_SCALES = np.zeros(config.NUM_SERVOS, dtype=float)
-PLAN_COST_SERVO_ANGLE_SCALES[config.SERVO_IDX["pan"]] = 45.0 # degrees
-PLAN_COST_SERVO_ANGLE_SCALES[config.SERVO_IDX["tilt"]] = 30.0 # degrees
+# Normalize servo motion by each servo's full usable angular range.
+PLAN_COST_SERVO_ANGLE_SCALES = (
+    np.asarray(config.MAX_SERVO_ANGLES, dtype=float)
+    - np.asarray(config.MIN_SERVO_ANGLES, dtype=float)
+)
 
 # Meters.
 # Normalize intercept-position changes for continuity cost.
@@ -91,11 +92,16 @@ PLAN_COST_INTERCEPT_POSITION_SCALES = np.array([0.20, 0.20, 0.30], dtype=float)
 # No uncertainty penalty while comfortably inside the trigger-certainty limits.
 PLAN_COST_UNCERTAINTY_RISK_START_RATIO = 0.80
 
+# Smoothstep reaches full uncertainty cost here. Initial value is based on current test data,
+# where earliest-feasible first-plan uncertainty ratios were roughly 1.9-4.4 (median ~2.9).
+# Tune this as more representative data is collected.
+PLAN_COST_UNCERTAINTY_RISK_FULL_RATIO = 4.0
+
 
 FIRST_INTERCEPT_PLAN_COST_WEIGHTS = {
     "time": 1.0,
     "servo_motion": 0.25,
-    "ready_margin": 0.00, # originally 0.0. weird tradeoffs happen as we go higher
+    "ready_margin": 0.15,
     "continuity": 0.0,
     "uncertainty_risk": 0.15,
 }
@@ -622,9 +628,11 @@ class Platform:
             q_ref = np.asarray(last_cmd_servo_angles, dtype=float).reshape(-1).copy()
 
         servo_scales = np.asarray(PLAN_COST_SERVO_ANGLE_SCALES, dtype=float).reshape(-1).copy()
+        if np.any(servo_scales <= 0.0):
+            raise ValueError("PLAN_COST_SERVO_ANGLE_SCALES must be > 0")
 
         servo_error = raw_servo_angles - q_ref
-        servo_motion_cost = float(np.linalg.norm(servo_error / servo_scales))
+        servo_motion_cost = float(np.clip(np.linalg.norm(servo_error / servo_scales), 0.0, 1.0))
 
         # 3. Ready margin cost
         
@@ -653,16 +661,23 @@ class Platform:
             # Just skip the continuity cost.
             if np.all(np.isfinite(p_old)):
                 position_scales = np.asarray(PLAN_COST_INTERCEPT_POSITION_SCALES, dtype=float).reshape(-1).copy()
-                continuity_cost = float(np.linalg.norm((p_new - p_old) / position_scales))
+                # TODO: once continuity-cost distributions are logged, replace this hard clip
+                # with a smoother saturation whose scale is tuned from observed plan data.
+                continuity_cost = float(np.clip(np.linalg.norm((p_new - p_old) / position_scales), 0.0, 1.0))
 
-        # 5. Uncertainty risk cost. It only grows near/beyond the trigger-certainty boundary,
-        # so normal later candidates are not simply charged a second time for being later.
+        # 5. Uncertainty risk cost. Smoothstep maps the tuned uncertainty-ratio interval to [0, 1]
+        # and saturates outside it, so the weight controls the maximum contribution.
         if not np.isfinite(uncertainty_ratio):
             return np.inf
-        uncertainty_risk_cost = 0.0
-        if uncertainty_ratio > PLAN_COST_UNCERTAINTY_RISK_START_RATIO:
-            uncertainty_risk_cost = ((uncertainty_ratio - PLAN_COST_UNCERTAINTY_RISK_START_RATIO)
-                                     /(1.0 - PLAN_COST_UNCERTAINTY_RISK_START_RATIO))**2
+        if PLAN_COST_UNCERTAINTY_RISK_FULL_RATIO <= PLAN_COST_UNCERTAINTY_RISK_START_RATIO:
+            raise ValueError("PLAN_COST_UNCERTAINTY_RISK_FULL_RATIO must be > PLAN_COST_UNCERTAINTY_RISK_START_RATIO")
+
+        uncertainty_risk_x = np.clip(
+            (uncertainty_ratio - PLAN_COST_UNCERTAINTY_RISK_START_RATIO)
+            /(PLAN_COST_UNCERTAINTY_RISK_FULL_RATIO - PLAN_COST_UNCERTAINTY_RISK_START_RATIO),
+            0.0, 1.0
+        )
+        uncertainty_risk_cost = float(uncertainty_risk_x**2 * (3.0 - 2.0*uncertainty_risk_x))
 
         # 6. Total weighted cost
         cost = float(
@@ -760,11 +775,14 @@ class Platform:
 
             if debug_full_first_search and np.isfinite(cost):
                 time_cost = PLAN_COST_NOW_TRIGGER_TIME_COST if trigger_time <= now else (trigger_time - now)/PLAN_COST_TIME_SCALE
-                servo_cost = float(np.linalg.norm((q_raw - q_start)/PLAN_COST_SERVO_ANGLE_SCALES))
+                servo_cost = float(np.clip(np.linalg.norm((q_raw - q_start)/PLAN_COST_SERVO_ANGLE_SCALES), 0.0, 1.0))
                 ready_margin_cost = 1.0/(1.0 + (ready_margin - min_ready_margin)/PLAN_COST_READY_MARGIN_SCALE)
-                uncertainty_cost = 0.0 if uncertainty_ratio <= PLAN_COST_UNCERTAINTY_RISK_START_RATIO else (
-                    (uncertainty_ratio - PLAN_COST_UNCERTAINTY_RISK_START_RATIO)/(1.0 - PLAN_COST_UNCERTAINTY_RISK_START_RATIO)
-                )**2
+                uncertainty_x = np.clip(
+                    (uncertainty_ratio - PLAN_COST_UNCERTAINTY_RISK_START_RATIO)
+                    /(PLAN_COST_UNCERTAINTY_RISK_FULL_RATIO - PLAN_COST_UNCERTAINTY_RISK_START_RATIO),
+                    0.0, 1.0
+                )
+                uncertainty_cost = float(uncertainty_x**2 * (3.0 - 2.0*uncertainty_x))
 
                 diag = (
                     (trigger_time - now)*1000.0, ready_margin*1000.0, cost,
