@@ -95,7 +95,7 @@ PLAN_COST_UNCERTAINTY_RISK_START_RATIO = 0.80
 # Smoothstep reaches full uncertainty cost here. Initial value is based on current test data,
 # where earliest-feasible first-plan uncertainty ratios were roughly 1.9-4.4 (median ~2.9).
 # Tune this as more representative data is collected.
-PLAN_COST_UNCERTAINTY_RISK_FULL_RATIO = 4.0
+PLAN_COST_UNCERTAINTY_RISK_FULL_RATIO = 6.0
 
 
 FIRST_INTERCEPT_PLAN_COST_WEIGHTS = {
