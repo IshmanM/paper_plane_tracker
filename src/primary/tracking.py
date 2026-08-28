@@ -538,11 +538,19 @@ class SingleObjectTracker:
                     f"range_sigma={self.track.range_uncertainty_m:.3f}m"
                     if self.track.innovation_mahalanobis is not None else "maha_dist=NONE"
                 )
+                state_correction = self.track.state - predicted_state
+                future_position_correction_300ms = state_correction[:3] + 0.300*state_correction[3:]
+                correction_text = (
+                    f"dpos={state_correction[:3]} ({np.linalg.norm(state_correction[:3]):.3f}m) "
+                    f"dvel={state_correction[3:]} ({np.linalg.norm(state_correction[3:]):.3f}m/s) "
+                    f"future300={future_position_correction_300ms} ({np.linalg.norm(future_position_correction_300ms):.3f}m)"
+                    if measurement_passes_gate else "dpos=NONE dvel=NONE future300=NONE"
+                )
                 print(
                     f"KF | dt={dt*1000:.1f} ms | "
                     f"pred pos={predicted_state[:3]} vel={predicted_state[3:]} | "
                     f"meas={measurement_text} {'ACCEPT' if measurement_passes_gate else 'REJECT'} | "
-                    f"{gate_text} | corr pos={self.track.state[:3]} vel={self.track.state[3:]}"
+                    f"{gate_text} | corr pos={self.track.state[:3]} vel={self.track.state[3:]} | {correction_text}"
                 ) # FOR DEBUG ONLY
 
             self.track.state_time = frame_time

@@ -99,7 +99,7 @@ PLAN_COST_UNCERTAINTY_RISK_FULL_RATIO = 6.0
 
 
 FIRST_INTERCEPT_PLAN_COST_WEIGHTS = {
-    "time": 1.0,
+    "time": 4.0, # originally 1.0
     "servo_motion": 0.25,
     "ready_margin": 0.15,
     "continuity": 0.0,
