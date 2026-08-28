@@ -12,7 +12,7 @@ from src.primary.camera_to_platform_calibration import CameraToPlatformCalibrati
 
 
 
-MAX_SERVO_SETTLING_TIME = 0.10 # seconds
+MAX_SERVO_SETTLING_TIME = 0.080 # seconds
 SERVO_ANGLE_CHANGE_FOR_MAX_SETTLING = 30.0 # degrees
 
 SERVO_ROTATION_TIME_MARGIN = 0.00 # seconds. an extra margin.
@@ -31,8 +31,8 @@ TRIGGER_TIME_UPPER_THRESHOLD = 0.020 # seconds. allow up to this much time early
 FIRST_INTERCEPT_MAX_NUM_CANDIDATES = 51 
 FIRST_INTERCEPT_MAX_LOOKAHEAD = 0.5 # seconds
 
-FIRST_INTERCEPT_REFRESH_NUM_CANDIDATES = 10
-FIRST_INTERCEPT_REFRESH_HALF_WINDOW = 0.005 # seconds, +/- around previous intercept time
+FIRST_INTERCEPT_REFRESH_NUM_CANDIDATES = 20
+FIRST_INTERCEPT_REFRESH_HALF_WINDOW = 0.010 # seconds, +/- around previous intercept time
 
 SUBSEQUENT_INTERCEPT_MAX_NUM_CANDIDATES = 5 
 SUBSEQUENT_INTERCEPT_MAX_LOOKAHEAD = 0.5 # seconds
@@ -95,7 +95,7 @@ PLAN_COST_UNCERTAINTY_RISK_START_RATIO = 0.80
 FIRST_INTERCEPT_PLAN_COST_WEIGHTS = {
     "time": 1.0,
     "servo_motion": 0.25,
-    "ready_margin": 0.0,
+    "ready_margin": 0.00, # TODO: try 0.10, 0.15
     "continuity": 0.0,
     "uncertainty_risk": 0.15,
 }

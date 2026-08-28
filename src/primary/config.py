@@ -45,14 +45,14 @@ CAMERA_AUTOFOCUS = False
 CAMERA_FOCUS = 0  # tune
 
 
-CMD_FREQUENCY_HZ = 60.0 # hz
+CMD_FREQUENCY_HZ = 120.0 # hz
 CMD_THREAD_MAX_DELAY = 1.0/CMD_FREQUENCY_HZ
 
 UDP_TX_DELAY = 0.0005 # seconds
 ENDPOINT_CMD_MAX_DELAY = 1.0/120.0 # 8.33 ms. change if endpoint slows
 
 
-CMD_SMOOTHING_TAU = 0.010 # seconds. used in comm_buffer.py
+CMD_SMOOTHING_TAU = 0.005 # seconds. used in comm_buffer.py
 
 
 SERVO_NAMES = ("pan", "tilt")
@@ -83,7 +83,7 @@ SERVO_DEADBAND[SERVO_IDX["tilt"]] = 0.1 # degrees
 
 MAX_SERVO_SPEEDS = np.zeros(NUM_SERVOS, dtype=float)
 MAX_SERVO_SPEEDS[SERVO_IDX["pan"]] = 390.0 # degrees/s. TODO: slow this if too fast
-MAX_SERVO_SPEEDS[SERVO_IDX["tilt"]] = 360.0 # degrees/s TODO: slow this if too fast
+MAX_SERVO_SPEEDS[SERVO_IDX["tilt"]] = 390.0 # degrees/s TODO: slow this if too fast
 
 # # Calibration biases after testing. <--Todo: maybe remove. this might be duplicate of the trim offset oon the endpoint side.
 # SERVO_BIASES = np.zeros(NUM_SERVOS, dtype=float)
