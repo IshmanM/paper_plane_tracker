@@ -66,7 +66,7 @@ ACTIVE_PLAN_UNCERTAINTY_SIGMA_MULTIPLIER = 1.5
 # Active-plan validity hysteresis. Moderate violations must persist; large violations invalidate immediately.
 ACTIVE_PLAN_VALIDITY_RECOVER_RATIO = 0.80
 ACTIVE_PLAN_VALIDITY_INVALID_RATIO = 1.00
-ACTIVE_PLAN_VALIDITY_HARD_INVALID_RATIO = 2.00
+ACTIVE_PLAN_VALIDITY_HARD_INVALID_RATIO = 2.00 # originally 2.0. TODO: maybe 2.5?
 ACTIVE_PLAN_INVALID_STREAK_REQUIRED = 2
 
 # Loose trigger-certainty limits. Planning/aiming continues when these are exceeded; only triggering is suppressed.
@@ -131,6 +131,7 @@ class Platform:
     ):
         self.mode = PlatformMode.OFF
         self.active_plan_invalid_streak = 0
+        self.active_plan_last_accepted_measurement_count = None
         self.active_plan = self._make_off_plan(now=time.perf_counter())
         self.first_intercept_anchor_intercept_time  = None
         self.first_intercept_original_trigger_time = None
@@ -186,6 +187,7 @@ class Platform:
             self.track_certain = False
             self.active_plan = self._make_search_plan(now)
             self.active_plan_invalid_streak = 0
+            self.active_plan_last_accepted_measurement_count = None
             self.first_intercept_anchor_intercept_time  = None
             self.first_intercept_original_trigger_time = None
             self.mode = PlatformMode.SEARCHING
@@ -214,10 +216,12 @@ class Platform:
             if valid_plan_computed:
                 self.active_plan = plan
                 self.active_plan_invalid_streak = 0
+                self.active_plan_last_accepted_measurement_count = None
                 self.mode = PlatformMode.PRE_SLEWING_TO_LEAD
             else:
                 self.active_plan = self._make_search_plan(now)
                 self.active_plan_invalid_streak = 0
+                self.active_plan_last_accepted_measurement_count = None
                 self.mode = PlatformMode.SEARCHING
 
             self.first_intercept_anchor_intercept_time  = None
@@ -239,6 +243,7 @@ class Platform:
         if (self.mode != PlatformMode.SEARCHING and self.active_plan.track_id != tracker.track.id):
             self.active_plan = self._make_search_plan(now)
             self.active_plan_invalid_streak = 0
+            self.active_plan_last_accepted_measurement_count = None
             self.first_intercept_anchor_intercept_time  = None
             self.first_intercept_original_trigger_time = None
             self.mode = PlatformMode.SEARCHING
@@ -259,6 +264,7 @@ class Platform:
             if valid_plan_computed:
                 self.active_plan = plan
                 self.active_plan_invalid_streak = 0
+                self.active_plan_last_accepted_measurement_count = None
                 self.first_intercept_anchor_intercept_time  = plan.intercept_time
                 self.first_intercept_original_trigger_time = plan.trigger_time
                 self.mode = PlatformMode.SLEWING_TO_LEAD
@@ -273,6 +279,7 @@ class Platform:
             else:
                 self.active_plan = self._make_search_plan(now)
                 self.active_plan_invalid_streak = 0
+                self.active_plan_last_accepted_measurement_count = None
                 self.first_intercept_anchor_intercept_time  = None
                 self.first_intercept_original_trigger_time = None
                 self.mode = PlatformMode.SEARCHING
@@ -289,6 +296,7 @@ class Platform:
                     total_trigger_delay = plan.trigger_time - self.first_intercept_original_trigger_time
                     self.active_plan = plan
                     self.active_plan_invalid_streak = 0
+                    self.active_plan_last_accepted_measurement_count = None
 
                     print(
                         f"REPLACED FIRST PLAN, INTERCEPT WINDOW | "
@@ -306,6 +314,7 @@ class Platform:
                         total_trigger_delay = plan.trigger_time - self.first_intercept_original_trigger_time
                         self.active_plan = plan
                         self.active_plan_invalid_streak = 0
+                        self.active_plan_last_accepted_measurement_count = None
                         self.first_intercept_anchor_intercept_time  = plan.intercept_time
                         print(
                             f"REPLACED FIRST PLAN, FROM SCRATCH | "
@@ -316,6 +325,7 @@ class Platform:
                     else:
                         self.active_plan = self._make_search_plan(now)
                         self.active_plan_invalid_streak = 0
+                        self.active_plan_last_accepted_measurement_count = None
                         self.first_intercept_anchor_intercept_time  = None
                         self.first_intercept_original_trigger_time = None
                         self.mode = PlatformMode.SEARCHING
@@ -334,18 +344,21 @@ class Platform:
             if valid_plan_computed:
                 self.active_plan = plan
                 self.active_plan_invalid_streak = 0
+                self.active_plan_last_accepted_measurement_count = None
 
             else:
                 valid_plan_computed, plan = self._make_best_valid_first_intercept_plan(tracker, now)
                 if valid_plan_computed: # tbh this case probably wont ever happen
                     self.active_plan = plan
                     self.active_plan_invalid_streak = 0
+                    self.active_plan_last_accepted_measurement_count = None
                     self.first_intercept_anchor_intercept_time  = plan.intercept_time
                     self.first_intercept_original_trigger_time = plan.trigger_time
                     self.mode = PlatformMode.SLEWING_TO_LEAD
                 else:
                     self.active_plan = self._make_search_plan(now)
                     self.active_plan_invalid_streak = 0
+                    self.active_plan_last_accepted_measurement_count = None
                     self.first_intercept_anchor_intercept_time  = None
                     self.first_intercept_original_trigger_time = None
                     self.mode = PlatformMode.SEARCHING
@@ -372,6 +385,7 @@ class Platform:
 
         self.active_plan = self._make_off_plan(now)
         self.active_plan_invalid_streak = 0
+        self.active_plan_last_accepted_measurement_count = None
         self.first_intercept_anchor_intercept_time  = None
         self.first_intercept_original_trigger_time = None
         self.mode = PlatformMode.OFF
@@ -395,6 +409,7 @@ class Platform:
 
         self.active_plan = self._make_search_plan(now)
         self.active_plan_invalid_streak = 0
+        self.active_plan_last_accepted_measurement_count = None
         self.first_intercept_anchor_intercept_time  = None
         self.first_intercept_original_trigger_time = None
         self.mode = PlatformMode.SEARCHING
@@ -1182,10 +1197,15 @@ class Platform:
             ) # FOR DEBUG ONLY
             return False
 
-        if plan_error_ratio > ACTIVE_PLAN_VALIDITY_INVALID_RATIO:
-            self.active_plan_invalid_streak += 1
-        elif plan_error_ratio < ACTIVE_PLAN_VALIDITY_RECOVER_RATIO:
-            self.active_plan_invalid_streak = 0
+        accepted_measurement_count = tracker.track.accepted_measurement_count
+        new_accepted_measurement = accepted_measurement_count != self.active_plan_last_accepted_measurement_count
+        self.active_plan_last_accepted_measurement_count = accepted_measurement_count
+
+        if new_accepted_measurement:
+            if plan_error_ratio > ACTIVE_PLAN_VALIDITY_INVALID_RATIO:
+                self.active_plan_invalid_streak += 1
+            elif plan_error_ratio < ACTIVE_PLAN_VALIDITY_RECOVER_RATIO:
+                self.active_plan_invalid_streak = 0
 
         if self.active_plan_invalid_streak >= ACTIVE_PLAN_INVALID_STREAK_REQUIRED:
             print(
@@ -1196,7 +1216,7 @@ class Platform:
             ) # FOR DEBUG ONLY
             return False
 
-        if self.active_plan_invalid_streak > 0:
+        if new_accepted_measurement and self.active_plan_invalid_streak > 0:
             print(
                 f"PLAN HYSTERESIS HOLD | ratio={plan_error_ratio:.2f} | "
                 f"streak={self.active_plan_invalid_streak}/{ACTIVE_PLAN_INVALID_STREAK_REQUIRED} | "

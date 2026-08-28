@@ -54,6 +54,7 @@ class Track:
         self.confirmed = False if min_hits > 1 else True
 
         self.last_hit_measurement = initial_measurement
+        self.accepted_measurement_count = 1
         self.initial_velocity_initialized = False
 
         # Camera-space uncertainty/innovation diagnostics; useful to Platform later without inventing
@@ -69,6 +70,7 @@ class Track:
         self.hit_streak += 1
         self.missed_streak = 0
         self.last_hit_measurement = measurement
+        self.accepted_measurement_count += 1
 
         if self.hit_streak >= min_hits:
             self.confirmed = True
