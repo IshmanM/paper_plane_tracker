@@ -37,8 +37,8 @@ FIRST_INTERCEPT_REFRESH_HALF_WINDOW = 0.010 # seconds, +/- around previous inter
 SUBSEQUENT_INTERCEPT_MAX_NUM_CANDIDATES = 5 
 SUBSEQUENT_INTERCEPT_MAX_LOOKAHEAD = 0.5 # seconds
 
-# make sure this is > FOAM_TRIGGER_HOLD_DELAY + FOAM_RESET_HOLD_DELAY from the endpoint 
-TRIGGER_DELAY = 0.060 # seconds
+# TODO: make sure this is > FOAM_TRIGGER_HOLD_DELAY + FOAM_RESET_HOLD_DELAY from the endpoint 
+TRIGGER_DELAY = 0.050 # seconds
 
 GRAVITY = 9.81  # m/s^2
 
@@ -95,7 +95,7 @@ PLAN_COST_UNCERTAINTY_RISK_START_RATIO = 0.80
 FIRST_INTERCEPT_PLAN_COST_WEIGHTS = {
     "time": 1.0,
     "servo_motion": 0.25,
-    "ready_margin": 0.00, # TODO: try 0.10, 0.15
+    "ready_margin": 0.00, # originally 0.0. weird tradeoffs happen as we go higher
     "continuity": 0.0,
     "uncertainty_risk": 0.15,
 }
@@ -631,7 +631,7 @@ class Platform:
         ready_margin_cost = np.inf
         ready_margin = plan.trigger_time - plan.ready_time
         
-        if ready_margin <= min_ready_margin:
+        if ready_margin < min_ready_margin:
             return np.inf
 
         ready_margin_surplus = ready_margin - min_ready_margin
@@ -687,6 +687,11 @@ class Platform:
 
         best_plan = None
         best_cost = np.inf # lower cost is better
+
+        debug_full_first_search = plan_type == PlanType.FIRST_INTERCEPT and not debug_rejections
+        earliest_feasible_diag = None
+        max_margin_diag = None
+        best_diag = None
 
         rejection_counts = {"backward": 0, "prediction": 0, "aim": 0, "missed_trigger": 0, "ready_margin": 0, "cost": 0}
         best_failed_ready_margin = -np.inf
@@ -753,10 +758,35 @@ class Platform:
 
             cost = self._plan_cost(now, plan, cost_weights, min_ready_margin, uncertainty_ratio) # Todo: determine what to do with infinite cost
 
+            if debug_full_first_search and np.isfinite(cost):
+                time_cost = PLAN_COST_NOW_TRIGGER_TIME_COST if trigger_time <= now else (trigger_time - now)/PLAN_COST_TIME_SCALE
+                servo_cost = float(np.linalg.norm((q_raw - q_start)/PLAN_COST_SERVO_ANGLE_SCALES))
+                ready_margin_cost = 1.0/(1.0 + (ready_margin - min_ready_margin)/PLAN_COST_READY_MARGIN_SCALE)
+                uncertainty_cost = 0.0 if uncertainty_ratio <= PLAN_COST_UNCERTAINTY_RISK_START_RATIO else (
+                    (uncertainty_ratio - PLAN_COST_UNCERTAINTY_RISK_START_RATIO)/(1.0 - PLAN_COST_UNCERTAINTY_RISK_START_RATIO)
+                )**2
+
+                diag = (
+                    (trigger_time - now)*1000.0, ready_margin*1000.0, cost,
+                    cost_weights.get("time", 0.0)*time_cost,
+                    cost_weights.get("servo_motion", 0.0)*servo_cost,
+                    cost_weights.get("ready_margin", 0.0)*ready_margin_cost,
+                    cost_weights.get("uncertainty_risk", 0.0)*uncertainty_cost,
+                    uncertainty_ratio
+                )
+
+                if earliest_feasible_diag is None:
+                    earliest_feasible_diag = diag
+                if max_margin_diag is None or diag[1] > max_margin_diag[1]:
+                    max_margin_diag = diag
+
+
             # 7. Replace the best plan if new one is better
             if cost < best_cost: # also ensures np.inf cost doesn't pass a plan
                 best_cost = cost
                 best_plan = plan
+                if debug_full_first_search:
+                    best_diag = diag
             elif not np.isfinite(cost):
                 rejection_counts["cost"] += 1
 
@@ -776,6 +806,21 @@ class Platform:
                 f"{ready_detail}"
             ) # FOR DEBUG ONLY
 
+        if debug_full_first_search and best_diag is not None:
+            print(
+                f"FIRST SEARCH DIAG | ready_w={cost_weights.get('ready_margin', 0.0):.3f} | "
+                f"EARLIEST trigger={earliest_feasible_diag[0]:.1f}ms margin={earliest_feasible_diag[1]:.1f}ms cost={earliest_feasible_diag[2]:.3f} "
+                f"[time={earliest_feasible_diag[3]:.3f} servo={earliest_feasible_diag[4]:.3f} margin={earliest_feasible_diag[5]:.3f} risk={earliest_feasible_diag[6]:.3f} ratio={earliest_feasible_diag[7]:.2f}]"
+            )
+            print(
+                f"FIRST SEARCH DIAG | WINNER   trigger={best_diag[0]:.1f}ms margin={best_diag[1]:.1f}ms cost={best_diag[2]:.3f} "
+                f"[time={best_diag[3]:.3f} servo={best_diag[4]:.3f} margin={best_diag[5]:.3f} risk={best_diag[6]:.3f} ratio={best_diag[7]:.2f}]"
+            )
+            print(
+                f"FIRST SEARCH DIAG | MAXMARGIN trigger={max_margin_diag[0]:.1f}ms margin={max_margin_diag[1]:.1f}ms cost={max_margin_diag[2]:.3f} "
+                f"[time={max_margin_diag[3]:.3f} servo={max_margin_diag[4]:.3f} margin={max_margin_diag[5]:.3f} risk={max_margin_diag[6]:.3f} ratio={max_margin_diag[7]:.2f}]"
+            )
+            
         return best_plan is not None, best_plan
 
 
