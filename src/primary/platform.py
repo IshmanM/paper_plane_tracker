@@ -1,6 +1,7 @@
 from src.primary.tracking import Track, TrackStatus, SingleObjectTracker
 import numpy as np
 import time
+import math
 from src.primary.geometry import estimateObjectPlatformPosition
 import src.primary.config as config
 from src.primary.comm_buffer import CommBuffer
@@ -44,9 +45,13 @@ GRAVITY = 9.81  # m/s^2
 
 # Increase as needed.
 MAX_AIM_SOLVE_ITERATIONS = 5
+MAX_TILT_SOLVE_ITERATIONS = 8
 
 # Tune experimentally.
-FOAM_PROTRUSION_SPEED = 12.0  # m/s
+DART_PROTRUSION_SPEED = 15.0 # m/s, actual protrusion speed v0
+DART_DRAG_K = 0.05 # 1/m; k=rho*Cd*A/(2m) ~= 1.2*0.6*pi*(0.0065)^2/(2*0.001) ~= 0.048
+DART_SIMULATION_DT = 0.0005 # seconds, Euler. TODO: RK4 could allow a larger dt at similar/better accuracy.
+TRAJECTORY_HEIGHT_TOLERANCE = 0.0005 # m
 
 # Do not aim at objects effectively behind / on top of platform.
 MIN_FORWARD_RANGE = 0.02  # m
@@ -878,6 +883,143 @@ class Platform:
         return best_plan is not None, best_plan
 
 
+    def _solve_dart_elevation_and_flight_time(self, horizontal_range: float, target_up: float) -> tuple[bool, float | None, float | None]:
+        """Solve launch elevation and flight time using quadratic drag with Euler integration."""
+
+        if horizontal_range <= 0.0 or not np.isfinite(horizontal_range) or not np.isfinite(target_up):
+            return False, None, None
+
+        v0 = float(DART_PROTRUSION_SPEED)
+        g = float(GRAVITY)
+        k = float(DART_DRAG_K)
+        dt = float(DART_SIMULATION_DT)
+        if v0 <= 0.0 or g < 0.0 or k < 0.0 or dt <= 0.0:
+            raise ValueError("Invalid dart simulation constants")
+
+        # Planner lookahead already bounds any useful dart flight; longer flights cannot produce a feasible trigger.
+        max_steps = int(math.ceil(max(FIRST_INTERCEPT_MAX_LOOKAHEAD, SUBSEQUENT_INTERCEPT_MAX_LOOKAHEAD)/dt))
+
+        def simulate(theta_rad: float) -> tuple[float, float] | None:
+            vx = v0*math.cos(theta_rad)
+            vz = v0*math.sin(theta_rad)
+            if vx <= 1e-9:
+                return None
+
+            x = z = t = 0.0
+            for _ in range(max_steps):
+                speed = math.hypot(vx, vz)
+                ax = -k*speed*vx
+                az = -g - k*speed*vz
+
+                # Explicit Euler. Interpolate the target-range crossing so height/time are not quantized to dt.
+                next_x = x + vx*dt
+                next_z = z + vz*dt
+                if next_x >= horizontal_range:
+                    dx = next_x - x
+                    if dx <= 1e-12:
+                        return None
+                    alpha = min(max((horizontal_range - x)/dx, 0.0), 1.0)
+                    return z + alpha*(next_z - z), t + alpha*dt
+
+                vx += ax*dt
+                vz += az*dt
+                x, z, t = next_x, next_z, t + dt
+                if vx <= 0.0:
+                    return None
+
+            return None
+
+        # Drag cannot make a point reachable if the same v0 cannot reach it without drag.
+        A = g*horizontal_range*horizontal_range/(2.0*v0*v0)
+        if A <= 1e-12:
+            theta_low_no_drag = theta_high_no_drag = math.atan2(target_up, horizontal_range)
+        else:
+            discriminant = horizontal_range*horizontal_range - 4.0*A*(A + target_up)
+            if discriminant < -1e-9:
+                return False, None, None
+            sqrt_disc = math.sqrt(max(discriminant, 0.0))
+            theta_low_no_drag = math.atan((horizontal_range - sqrt_disc)/(2.0*A))
+            theta_high_no_drag = math.atan((horizontal_range + sqrt_disc)/(2.0*A))
+
+        if USE_HIGH_ARC:
+            # High arc is intentionally slower: scan for both roots and select the later-angle crossing.
+            theta = math.atan2(target_up, horizontal_range)
+            prev_result = simulate(theta)
+            if prev_result is None:
+                return False, None, None
+            prev_f = prev_result[0] - target_up
+            brackets = []
+            step = math.radians(0.5)
+            while theta + step < math.radians(89.5):
+                next_theta = theta + step
+                result = simulate(next_theta)
+                if result is None:
+                    break
+                f = result[0] - target_up
+                if prev_f*f <= 0.0:
+                    brackets.append((theta, prev_f, next_theta, f))
+                theta, prev_f = next_theta, f
+            if len(brackets) < 2:
+                return False, None, None
+            theta_lo, f_lo, theta_hi, f_hi = brackets[-1]
+        else:
+            theta_lo = math.atan2(target_up, horizontal_range)
+            result_lo = simulate(theta_lo)
+            if result_lo is None:
+                return False, None, None
+            f_lo = result_lo[0] - target_up
+            if abs(f_lo) <= TRAJECTORY_HEIGHT_TOLERANCE:
+                return True, theta_lo, result_lo[1]
+
+            # The no-drag low solution is a close starting point; step upward until drag trajectory brackets the target.
+            theta_hi = max(theta_low_no_drag, theta_lo) + math.radians(1.0)
+            max_theta = min(theta_high_no_drag, math.radians(89.0))
+            while theta_hi <= max_theta + 1e-12:
+                result_hi = simulate(theta_hi)
+                if result_hi is None:
+                    return False, None, None
+                f_hi = result_hi[0] - target_up
+                if f_lo*f_hi <= 0.0:
+                    break
+                theta_hi += math.radians(1.0)
+            else:
+                return False, None, None
+
+        # Regula falsi converges in only a few trajectory simulations for this smooth low-arc problem.
+        result = None
+        for _ in range(MAX_TILT_SOLVE_ITERATIONS):
+            denom = f_hi - f_lo
+            if abs(denom) <= 1e-12:
+                break
+            theta = (theta_lo*f_hi - theta_hi*f_lo)/denom
+            result = simulate(theta)
+            if result is None:
+                return False, None, None
+            f = result[0] - target_up
+            if abs(f) <= TRAJECTORY_HEIGHT_TOLERANCE:
+                return True, theta, result[1]
+            if f_lo*f <= 0.0:
+                theta_hi, f_hi = theta, f
+            else:
+                theta_lo, f_lo = theta, f
+
+        # Rare fallback: finish robustly with bisection if false-position convergence stalls.
+        for _ in range(MAX_TILT_SOLVE_ITERATIONS):
+            theta = 0.5*(theta_lo + theta_hi)
+            result = simulate(theta)
+            if result is None:
+                return False, None, None
+            f = result[0] - target_up
+            if abs(f) <= TRAJECTORY_HEIGHT_TOLERANCE:
+                return True, theta, result[1]
+            if f_lo*f <= 0.0:
+                theta_hi, f_hi = theta, f
+            else:
+                theta_lo, f_lo = theta, f
+
+        return (True, theta, result[1]) if result is not None else (False, None, None)
+
+
     def _object_position_to_servo_angles_and_flight_time(self, position: np.ndarray) -> tuple[bool, np.ndarray | None, float | None]:
         """
         Convert platform-frame object position to pan/tilt angles.
@@ -900,73 +1042,37 @@ class Platform:
         if position.shape != (3,) or not np.all(np.isfinite(position)):
             return fail()
 
-        # This currently uses a lightweight fixed-point iteration to account for the
-        # fact that the foam-mechanism origin moves as pan/tilt change.
-        #
-        # TODO: If the platform geometry becomes more complicated, consider replacing
-        # this with a proper numerical IK solve over pan, tilt, and flight time.
-        # That would directly solve the full foam-motion equations while naturally
-        # accounting for moving origins, fixed mechanism rotation, and joint limits.
-
+        # Lightweight fixed-point iteration accounts for the foam-mechanism origin moving with pan/tilt.
+        # TODO: If geometry becomes more complicated, replace this with full numerical IK over pan/tilt/time.
         foam_origin_forward = self.platform_geometry_spec.foam_mechanism_origin_offset_m
         R_foam_forward = self.platform_geometry_spec.rotation_platform_from_foam_mechanism_at_forward
-
-        # Foam-mechanism +x is the foam exit direction in its FLU frame.
-        # R_foam_forward captures any fixed angular offset at nominal forward pan/tilt.
         foam_direction_forward = R_foam_forward@np.array([1.0, 0.0, 0.0])
 
-        v0 = float(FOAM_PROTRUSION_SPEED)
-        g = float(GRAVITY)
-
         # Initial guess assumes the foam exits from the platform origin.
-        # The iterations below correct this using the actual moving foam-exit position.
         platform_yaw_rad = np.arctan2(position[1], position[0])
         platform_theta_rad = np.arctan2(position[2], np.hypot(position[0], position[1]))
 
         for _ in range(MAX_AIM_SOLVE_ITERATIONS):
-
-            # Pan/tilt rotates the physical foam-exit offset about the platform origin.
             R_joint = rotationPlatformFromPanTilt(platform_yaw_rad, platform_theta_rad)
             foam_origin_platform = R_joint@foam_origin_forward
-
-            # Re-express the object relative to where the foam actually exits.
             relative_position = position - foam_origin_platform
             forward, left, up = relative_position
 
             if forward <= MIN_FORWARD_RANGE:
                 return fail()
 
-            # 1. Horizontal direction required from the current foam-exit position.
             target_yaw_rad = np.arctan2(left, forward)
-
-            # 2. Vertical direction required after accounting for gravity.
-            r = np.hypot(forward, left)
-            if r <= 1e-9:
+            horizontal_range = np.hypot(forward, left)
+            if horizontal_range <= 1e-9:
                 return fail()
 
-            A = g*r*r/(2.0*v0*v0)
+            trajectory_valid, target_theta_rad, _ = self._solve_dart_elevation_and_flight_time(horizontal_range, up)
+            if not trajectory_valid:
+                return fail()
 
-            if A <= 1e-12:
-                tan_theta = up/r
-            else:
-                discriminant = r*r - 4.0*A*(A + up)
-
-                # Allow tiny numerical roundoff.
-                if discriminant < -1e-9:
-                    return fail()
-
-                sqrt_disc = np.sqrt(max(discriminant, 0.0))
-                tan_theta_low = (r - sqrt_disc)/(2.0*A)
-                tan_theta_high = (r + sqrt_disc)/(2.0*A)
-                tan_theta = tan_theta_high if USE_HIGH_ARC else tan_theta_low
-
-            target_theta_rad = np.arctan(tan_theta)
-
-            # 3. Convert required exit direction into pan/tilt joint angles,
-            # compensating for fixed foam-mechanism rotation at the forward pose.
+            # Convert required exit direction into pan/tilt joint angles, compensating for fixed mechanism rotation.
             axis_x, axis_y, axis_z = foam_direction_forward
             axis_xz = np.hypot(axis_x, axis_z)
-
             if axis_xz <= 1e-9:
                 return fail()
 
@@ -975,85 +1081,43 @@ class Platform:
                 return fail()
 
             foam_theta_offset_rad = np.arctan2(axis_z, axis_x)
-            new_platform_theta_rad = (
-                np.arcsin(np.clip(target_z/axis_xz, -1.0, 1.0))
-                - foam_theta_offset_rad
-            )
+            new_platform_theta_rad = np.arcsin(np.clip(target_z/axis_xz, -1.0, 1.0)) - foam_theta_offset_rad
 
-            # After applying elevation, find the remaining horizontal angular offset
-            # of the foam mechanism and compensate for it with yaw.
-            rotated_axis_x = (
-                np.cos(new_platform_theta_rad)*axis_x
-                - np.sin(new_platform_theta_rad)*axis_z
-            )
-
+            rotated_axis_x = np.cos(new_platform_theta_rad)*axis_x - np.sin(new_platform_theta_rad)*axis_z
             foam_yaw_offset_rad = np.arctan2(axis_y, rotated_axis_x)
             new_platform_yaw_rad = target_yaw_rad - foam_yaw_offset_rad
             new_platform_yaw_rad = (new_platform_yaw_rad + np.pi)%(2.0*np.pi) - np.pi
 
-            # The new angles change the foam-exit position, so repeat until the
-            # resulting correction becomes negligible.
             yaw_change = (new_platform_yaw_rad - platform_yaw_rad + np.pi)%(2.0*np.pi) - np.pi
             theta_change = new_platform_theta_rad - platform_theta_rad
-
             platform_yaw_rad = new_platform_yaw_rad
             platform_theta_rad = new_platform_theta_rad
 
             if np.hypot(yaw_change, theta_change) < 1e-6:
                 break
 
-        # 4. Recalculate distance and flight time from the final foam-exit position.
+        # Recalculate the trajectory once from the final moving foam-exit position for the final flight time.
         R_joint = rotationPlatformFromPanTilt(platform_yaw_rad, platform_theta_rad)
         foam_origin_platform = R_joint@foam_origin_forward
         relative_position = position - foam_origin_platform
-
         forward, left, up = relative_position
-
         if forward <= MIN_FORWARD_RANGE:
             return fail()
 
-        r = np.hypot(forward, left)
-        if r <= 1e-9:
+        horizontal_range = np.hypot(forward, left)
+        if horizontal_range <= 1e-9:
             return fail()
 
-        A = g*r*r/(2.0*v0*v0)
-
-        if A <= 1e-12:
-            tan_theta = up/r
-        else:
-            discriminant = r*r - 4.0*A*(A + up)
-
-            if discriminant < -1e-9:
-                return fail()
-
-            sqrt_disc = np.sqrt(max(discriminant, 0.0))
-            tan_theta_low = (r - sqrt_disc)/(2.0*A)
-            tan_theta_high = (r + sqrt_disc)/(2.0*A)
-            tan_theta = tan_theta_high if USE_HIGH_ARC else tan_theta_low
-
-        foam_theta_rad = np.arctan(tan_theta)
-        cos_theta = np.cos(foam_theta_rad)
-
-        if cos_theta <= 1e-9:
+        trajectory_valid, _, flight_time = self._solve_dart_elevation_and_flight_time(horizontal_range, up)
+        if not trajectory_valid or flight_time is None or not np.isfinite(flight_time) or flight_time <= 0.0:
             return fail()
 
-        flight_time = r/(v0*cos_theta)
-        if not np.isfinite(flight_time) or flight_time <= 0.0:
-            return fail()
-
-        # 5. Convert platform yaw/elevation angles into servo commands.
+        # Convert platform yaw/elevation angles into servo commands.
         platform_yaw_deg = np.rad2deg(platform_yaw_rad)
         platform_theta_deg = np.rad2deg(platform_theta_rad)
 
-        pan_angle = (
-            config.FORWARD_SERVO_ANGLES[config.SERVO_IDX["pan"]]
-            + config.SERVO_SIGNS[config.SERVO_IDX["pan"]]*platform_yaw_deg
-        )
-
-        tilt_angle = (
-            config.FORWARD_SERVO_ANGLES[config.SERVO_IDX["tilt"]]
-            + config.SERVO_SIGNS[config.SERVO_IDX["tilt"]]*platform_theta_deg
-        )
+        pan_angle = config.FORWARD_SERVO_ANGLES[config.SERVO_IDX["pan"]] + config.SERVO_SIGNS[config.SERVO_IDX["pan"]]*platform_yaw_deg
+        tilt_angle = config.FORWARD_SERVO_ANGLES[config.SERVO_IDX["tilt"]] + config.SERVO_SIGNS[config.SERVO_IDX["tilt"]]*platform_theta_deg
 
         servo_angles = np.asarray(config.DEFAULT_SERVO_ANGLES, dtype=float).copy()
         servo_angles[config.SERVO_IDX["pan"]] = pan_angle
@@ -1062,22 +1126,10 @@ class Platform:
         if not np.all(np.isfinite(servo_angles)):
             return fail()
 
-        # 6. Reject solutions outside the usable servo range.
         min_angles = np.asarray(config.MIN_SERVO_ANGLES, dtype=float)
         max_angles = np.asarray(config.MAX_SERVO_ANGLES, dtype=float)
-
         outside_limits = (servo_angles < min_angles) | (servo_angles > max_angles)
         if np.any(outside_limits):
-            # print("Servo angle outside limits") # FOR DEBUG ONLY
-            # print(f"position_platform = {position}") # FOR DEBUG ONLY
-            # print(f"servo_angles      = {servo_angles}") # FOR DEBUG ONLY
-            # print(f"min_angles        = {min_angles}") # FOR DEBUG ONLY
-            # print(f"max_angles        = {max_angles}") # FOR DEBUG ONLY
-            # print(f"outside_limits    = {outside_limits}") # FOR DEBUG ONLY
-            # print(f"pan_angle         = {pan_angle:.2f}") # FOR DEBUG ONLY
-            # print(f"tilt_angle        = {tilt_angle:.2f}") # FOR DEBUG ONLY
-            # print(f"platform_yaw_deg  = {platform_yaw_deg:.2f}") # FOR DEBUG ONLY
-            # print(f"platform_theta_deg= {platform_theta_deg:.2f}") # FOR DEBUG ONLY
             return fail()
 
         return True, servo_angles, flight_time
@@ -1180,9 +1232,12 @@ class Platform:
         range_uncertainty = tracker.track.range_uncertainty_m
         if range_uncertainty is not None and np.isfinite(range_uncertainty):
             range_uncertainty = min(range_uncertainty, MAX_TRIGGER_RANGE_UNCERTAINTY_M)
+            # Approximate range-uncertainty -> time-uncertainty using current average dart speed.
+            horizontal_range = np.hypot(current_intercept_position_platform[0], current_intercept_position_platform[1])
+            average_dart_speed = horizontal_range/current_foam_flight_time if current_foam_flight_time > 0.0 else DART_PROTRUSION_SPEED
             flight_time_tolerance = max(
                 flight_time_tolerance,
-                ACTIVE_PLAN_UNCERTAINTY_SIGMA_MULTIPLIER*range_uncertainty/FOAM_PROTRUSION_SPEED
+                ACTIVE_PLAN_UNCERTAINTY_SIGMA_MULTIPLIER*range_uncertainty/max(average_dart_speed, 1e-6)
             )
 
         servo_error_ratio = float(np.max(np.abs(servo_angle_error)/servo_angle_tolerances))
