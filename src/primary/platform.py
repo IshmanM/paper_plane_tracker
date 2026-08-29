@@ -51,8 +51,17 @@ MAX_TRAJECTORY_SOLVE_ITERATIONS = 8
 # Tune experimentally.
 DART_PROTRUSION_SPEED = 15.0 # m/s, actual protrusion speed v0
 DART_DRAG_K = 0.05 # 1/m; k=rho*Cd*A/(2m) ~= 1.2*0.6*pi*(0.0065)^2/(2*0.001) ~= 0.048
-DART_SIMULATION_DT = 0.001 # seconds, Euler; target-range crossing is linearly interpolated.
+DART_SIMULATION_DT = 0.001 # seconds, Euler used to precompute the trajectory table.
 TRAJECTORY_HEIGHT_TOLERANCE = 0.0005 # m
+
+DART_TRAJECTORY_TABLE_MAX_FORWARD_RANGE = 8.0 # m
+DART_TRAJECTORY_TABLE_MIN_TARGET_UP = -3.0 # m
+DART_TRAJECTORY_TABLE_MAX_TARGET_UP = 3.0 # m
+DART_TRAJECTORY_TABLE_X_STEP = 0.01 # m
+DART_TRAJECTORY_TABLE_MIN_TILT_DEG = -89.0
+DART_TRAJECTORY_TABLE_MAX_TILT_DEG = 89.0
+DART_TRAJECTORY_TABLE_TILT_STEP_DEG = 0.25
+DART_TRAJECTORY_TABLE_MAX_GENERATION_TIME = 5.0 # s; safety cap for near-vertical trajectories.
 
 # Do not aim at objects effectively behind / on top of platform.
 MIN_FORWARD_RANGE = 0.02  # m
@@ -155,6 +164,7 @@ class Platform:
         self.platform_geometry_spec = PLATFORM_GEOMETRY_SPECS[platform_geometry_spec_id]
 
         self.camera_to_platform_calibration = camera_to_platform_calibration
+        self._generate_dart_trajectory_table()
         
         # extra Todos:
         # - if adding ACKs from the rpi: eg. self.last_ack_cmd_id, self.last_ack_time. <-- should use the buffer
@@ -908,8 +918,113 @@ class Platform:
         return best_plan is not None, best_plan
 
 
+    def _generate_dart_trajectory_table(self):
+        """Precompute z(x) and t(x) once for each launch tilt; live planning only interpolates this table."""
+        start = time.perf_counter()
+        v0, g, k, dt = float(DART_PROTRUSION_SPEED), float(GRAVITY), float(DART_DRAG_K), float(DART_SIMULATION_DT)
+        if v0 <= 0.0 or g < 0.0 or k < 0.0 or dt <= 0.0:
+            raise ValueError("Invalid dart simulation constants")
+
+        x_step = float(DART_TRAJECTORY_TABLE_X_STEP)
+        if x_step <= 0.0 or DART_TRAJECTORY_TABLE_MAX_FORWARD_RANGE <= 0.0 or DART_TRAJECTORY_TABLE_TILT_STEP_DEG <= 0.0:
+            raise ValueError("Invalid dart trajectory table constants")
+
+        self._dart_trajectory_table_tilts_rad = np.deg2rad(np.arange(
+            DART_TRAJECTORY_TABLE_MIN_TILT_DEG,
+            DART_TRAJECTORY_TABLE_MAX_TILT_DEG + 0.5*DART_TRAJECTORY_TABLE_TILT_STEP_DEG,
+            DART_TRAJECTORY_TABLE_TILT_STEP_DEG,
+            dtype=float
+        ))
+        num_x = int(round(DART_TRAJECTORY_TABLE_MAX_FORWARD_RANGE/x_step)) + 1
+        shape = (self._dart_trajectory_table_tilts_rad.size, num_x)
+        self._dart_trajectory_table_height_m = np.full(shape, np.nan, dtype=np.float32)
+        self._dart_trajectory_table_time_s = np.full(shape, np.nan, dtype=np.float32)
+        self._dart_trajectory_table_height_m[:, 0] = 0.0
+        self._dart_trajectory_table_time_s[:, 0] = 0.0
+
+        max_steps = int(math.ceil(DART_TRAJECTORY_TABLE_MAX_GENERATION_TIME/dt))
+        for tilt_idx, theta_rad in enumerate(self._dart_trajectory_table_tilts_rad):
+            x = z = t = 0.0
+            vx, vz = v0*math.cos(theta_rad), v0*math.sin(theta_rad)
+            next_x_idx = 1
+            if vx <= 1e-9:
+                continue
+
+            for _ in range(max_steps):
+                speed = math.hypot(vx, vz)
+                ax, az = -k*speed*vx, -g - k*speed*vz
+                next_x, next_z, next_t = x + vx*dt, z + vz*dt, t + dt
+
+                if next_x > x:
+                    while next_x_idx < num_x and next_x_idx*x_step <= next_x + 1e-12:
+                        query_x = next_x_idx*x_step
+                        alpha = min(max((query_x - x)/(next_x - x), 0.0), 1.0)
+                        self._dart_trajectory_table_height_m[tilt_idx, next_x_idx] = z + alpha*(next_z - z)
+                        self._dart_trajectory_table_time_s[tilt_idx, next_x_idx] = t + alpha*dt
+                        next_x_idx += 1
+
+                vx += ax*dt
+                vz += az*dt
+                x, z, t = next_x, next_z, next_t
+                if next_x_idx >= num_x or vx <= 0.0 or (z < DART_TRAJECTORY_TABLE_MIN_TARGET_UP and vz < 0.0):
+                    break
+
+        memory_mb = (self._dart_trajectory_table_height_m.nbytes + self._dart_trajectory_table_time_s.nbytes)/(1024.0*1024.0)
+        print(
+            f"DART TRAJECTORY TABLE | tilts={shape[0]} | x={shape[1]} | "
+            f"memory={memory_mb:.2f} MB | generation={(time.perf_counter() - start)*1000.0:.1f} ms"
+        ) # FOR DEBUG ONLY
+
+
     def _solve_dart_tilt_and_flight_time(self, horizontal_range: float, target_up: float, initial_theta_rad=None) -> tuple[bool, float | None, float | None]:
-        """Solve launch tilt and flight time using quadratic drag with Euler integration."""
+        """Interpolate the precomputed tilt trajectories at the requested horizontal range and target height."""
+        if (
+            horizontal_range <= 0.0 or not np.isfinite(horizontal_range) or not np.isfinite(target_up)
+            or horizontal_range > DART_TRAJECTORY_TABLE_MAX_FORWARD_RANGE
+            or target_up < DART_TRAJECTORY_TABLE_MIN_TARGET_UP or target_up > DART_TRAJECTORY_TABLE_MAX_TARGET_UP
+        ):
+            return False, None, None
+
+        x_position = horizontal_range/DART_TRAJECTORY_TABLE_X_STEP
+        x0_idx = int(math.floor(x_position))
+        x1_idx = min(x0_idx + 1, self._dart_trajectory_table_height_m.shape[1] - 1)
+        x_alpha = x_position - x0_idx
+
+        z0 = self._dart_trajectory_table_height_m[:, x0_idx]
+        t0 = self._dart_trajectory_table_time_s[:, x0_idx]
+        if x1_idx == x0_idx:
+            heights, times = z0.astype(float), t0.astype(float)
+        else:
+            z1 = self._dart_trajectory_table_height_m[:, x1_idx]
+            t1 = self._dart_trajectory_table_time_s[:, x1_idx]
+            valid = np.isfinite(z0) & np.isfinite(z1) & np.isfinite(t0) & np.isfinite(t1)
+            heights = np.full(z0.shape, np.nan, dtype=float)
+            times = np.full(t0.shape, np.nan, dtype=float)
+            heights[valid] = z0[valid] + x_alpha*(z1[valid] - z0[valid])
+            times[valid] = t0[valid] + x_alpha*(t1[valid] - t0[valid])
+
+        errors = heights - target_up
+        pair_valid = np.isfinite(errors[:-1]) & np.isfinite(errors[1:])
+        crossings = np.flatnonzero(pair_valid & (((errors[:-1] <= 0.0) & (errors[1:] >= 0.0)) | ((errors[:-1] >= 0.0) & (errors[1:] <= 0.0))))
+        if crossings.size == 0:
+            exact = np.flatnonzero(np.isfinite(errors) & (np.abs(errors) <= TRAJECTORY_HEIGHT_TOLERANCE))
+            if exact.size == 0:
+                return False, None, None
+            idx = int(exact[-1] if USE_HIGH_ARC else exact[0])
+            flight_time = float(times[idx])
+            return (True, float(self._dart_trajectory_table_tilts_rad[idx]), flight_time) if np.isfinite(flight_time) and flight_time > 0.0 else (False, None, None)
+
+        idx = int(crossings[-1] if USE_HIGH_ARC else crossings[0])
+        z_lo, z_hi = float(heights[idx]), float(heights[idx + 1])
+        denom = z_hi - z_lo
+        theta_alpha = 0.0 if abs(denom) <= 1e-12 else float(np.clip((target_up - z_lo)/denom, 0.0, 1.0))
+        theta_rad = float(self._dart_trajectory_table_tilts_rad[idx] + theta_alpha*(self._dart_trajectory_table_tilts_rad[idx + 1] - self._dart_trajectory_table_tilts_rad[idx]))
+        flight_time = float(times[idx] + theta_alpha*(times[idx + 1] - times[idx]))
+        return (True, theta_rad, flight_time) if np.isfinite(theta_rad) and np.isfinite(flight_time) and flight_time > 0.0 else (False, None, None)
+
+
+    def _solve_dart_tilt_and_flight_time_euler(self, horizontal_range: float, target_up: float, initial_theta_rad=None) -> tuple[bool, float | None, float | None]:
+        """Numerical inverse solver retained for debug/validation; live planning uses the precomputed table."""
 
         if horizontal_range <= 0.0 or not np.isfinite(horizontal_range) or not np.isfinite(target_up):
             return False, None, None
