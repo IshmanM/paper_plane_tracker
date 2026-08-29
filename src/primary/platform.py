@@ -29,7 +29,8 @@ PRE_SLEW_LOOKAHEAD = 0.100 # seconds. TODO: adjust this
 TRIGGER_TIME_LOWER_THRESHOLD = 0.040 # seconds. allow up to this much time late
 TRIGGER_TIME_UPPER_THRESHOLD = 0.020 # seconds. allow up to this much time early
 
-FIRST_INTERCEPT_MAX_NUM_CANDIDATES = 51 
+FIRST_INTERCEPT_COARSE_NUM_CANDIDATES = 11
+FIRST_INTERCEPT_FINE_NUM_CANDIDATES = 11
 FIRST_INTERCEPT_MAX_LOOKAHEAD = 0.5 # seconds
 
 FIRST_INTERCEPT_REFRESH_NUM_CANDIDATES = 20
@@ -45,7 +46,7 @@ GRAVITY = 9.81  # m/s^2
 
 # Increase as needed.
 MAX_AIM_SOLVE_ITERATIONS = 5
-MAX_TILT_SOLVE_ITERATIONS = 8
+MAX_TRAJECTORY_SOLVE_ITERATIONS = 8
 
 # Tune experimentally.
 DART_PROTRUSION_SPEED = 15.0 # m/s, actual protrusion speed v0
@@ -601,29 +602,36 @@ class Platform:
         This function intentionally searches candidate intercept times instead of trying to solve everything analytically.
         """
 
-        if fixed_intercept_time is None:
-            candidate_intercept_times = np.linspace(
-                start=now,
-                stop=now + FIRST_INTERCEPT_MAX_LOOKAHEAD,
-                num=FIRST_INTERCEPT_MAX_NUM_CANDIDATES
-            )
-        else:
+        cost_weights = FIRST_INTERCEPT_PLAN_COST_WEIGHTS
+
+        if fixed_intercept_time is not None:
             candidate_intercept_times = np.linspace(
                 start=fixed_intercept_time - FIRST_INTERCEPT_REFRESH_HALF_WINDOW,
                 stop=fixed_intercept_time + FIRST_INTERCEPT_REFRESH_HALF_WINDOW,
                 num=FIRST_INTERCEPT_REFRESH_NUM_CANDIDATES
             )
+            return self._make_best_valid_intercept_plan_from_candidates(
+                tracker, now, PlanType.FIRST_INTERCEPT, candidate_intercept_times, cost_weights,
+                min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN, debug_rejections=True, search_label="REFRESH"
+            )
 
-        cost_weights = FIRST_INTERCEPT_PLAN_COST_WEIGHTS
+        # Coarse-to-fine search: first find the useful time region, then recover roughly the old 10 ms resolution locally.
+        coarse_times = np.linspace(now, now + FIRST_INTERCEPT_MAX_LOOKAHEAD, num=FIRST_INTERCEPT_COARSE_NUM_CANDIDATES)
+        coarse_valid, coarse_plan = self._make_best_valid_intercept_plan_from_candidates(
+            tracker, now, PlanType.FIRST_INTERCEPT, coarse_times, cost_weights,
+            min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN, debug_rejections=True, search_label="COARSE"
+        )
+        if not coarse_valid:
+            return False, None
+
+        coarse_spacing = FIRST_INTERCEPT_MAX_LOOKAHEAD/(FIRST_INTERCEPT_COARSE_NUM_CANDIDATES - 1)
+        fine_start = max(now, coarse_plan.intercept_time - coarse_spacing)
+        fine_stop = min(now + FIRST_INTERCEPT_MAX_LOOKAHEAD, coarse_plan.intercept_time + coarse_spacing)
+        fine_times = np.linspace(fine_start, fine_stop, num=FIRST_INTERCEPT_FINE_NUM_CANDIDATES)
 
         return self._make_best_valid_intercept_plan_from_candidates(
-            tracker,
-            now,
-            PlanType.FIRST_INTERCEPT,
-            candidate_intercept_times,
-            cost_weights,
-            min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN,
-            debug_rejections=fixed_intercept_time is not None
+            tracker, now, PlanType.FIRST_INTERCEPT, fine_times, cost_weights,
+            min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN, debug_rejections=False, search_label="FINE"
         )
 
 
@@ -735,33 +743,21 @@ class Platform:
         return cost
 
 
-    def _make_best_valid_intercept_plan_from_candidates(self, tracker: SingleObjectTracker, now, plan_type: PlanType, candidate_intercept_times, cost_weights, min_ready_margin, debug_rejections=False) -> tuple[bool, Plan | None]:
-
-        # Current estimate of where the servos are starting from
-        # should eventually come from feedback or Pi-side ACK
-        q_start = self._planning_servo_angles()
-
-        best_plan = None
-        best_cost = np.inf # lower cost is better
+    def _make_best_valid_intercept_plan_from_candidates(self, tracker: SingleObjectTracker, now, plan_type: PlanType, candidate_intercept_times, cost_weights, min_ready_margin, debug_rejections=False, search_label=None) -> tuple[bool, Plan | None]:
+        search_start_time = time.perf_counter()
 
         debug_full_first_search = plan_type == PlanType.FIRST_INTERCEPT and not debug_rejections
-        earliest_feasible_diag = None
-        max_margin_diag = None
-        best_diag = None
-
         rejection_counts = {"backward": 0, "prediction": 0, "aim": 0, "missed_trigger": 0, "ready_margin": 0, "cost": 0}
-        best_failed_ready_margin = -np.inf
 
+        # First compute the expensive target/trajectory results. Do not continuously update "now" here:
+        # all candidates should later be compared against one common decision time.
+        computed_candidates = []
         for intercept_time in candidate_intercept_times:
-
-            # Cannot predict backwards.
             dt = intercept_time - tracker.track.state_time
             if dt <= 0.0:
                 rejection_counts["backward"] += 1
                 continue
 
-            # 1. Predict object position and uncertainty at candidate intercept time.
-            # Todo: might eventually want to add different behavior for position outside the visible range
             predicted_state, transverse_uncertainty_m, range_uncertainty_m = tracker.predict(dt, include_uncertainty=True)
             object_position_world = predicted_state[:3].copy()
             if (not np.all(np.isfinite(object_position_world))
@@ -775,24 +771,42 @@ class Platform:
                 range_uncertainty_m/MAX_TRIGGER_RANGE_UNCERTAINTY_M
             )
 
-            # 2. Transform object position into platform frame.
             object_position_platform = estimateObjectPlatformPosition(object_position_world, self.camera_to_platform_calibration)
-
-            # 3. Use platform-frame point to compute servo raw pan/tilt angles and foam flight time
             angles_valid, q_raw, foam_flight_time = self._object_position_to_servo_angles_and_flight_time(object_position_platform)
             if not angles_valid:
                 rejection_counts["aim"] += 1
                 continue
 
-            # 4. Convert intercept time to trigger time.
+            computed_candidates.append((
+                intercept_time,
+                object_position_world,
+                uncertainty_ratio,
+                q_raw,
+                foam_flight_time
+            ))
+
+        physics_done_time = time.perf_counter()
+
+        # Take one fresh common timestamp after the expensive work. Candidates computed first and last are therefore
+        # judged consistently, while any trigger opportunities that expired during computation are rejected here.
+        decision_now = physics_done_time
+        q_start = self._planning_servo_angles()
+
+        best_plan = None
+        best_cost = np.inf
+        earliest_feasible_diag = None
+        max_margin_diag = None
+        best_diag = None
+        best_failed_ready_margin = -np.inf
+
+        for intercept_time, object_position_world, uncertainty_ratio, q_raw, foam_flight_time in computed_candidates:
             trigger_time = intercept_time - foam_flight_time - TRIGGER_DELAY
-            if trigger_time < now and not self._close_to_trigger_time(now, trigger_time=trigger_time):
+            if trigger_time < decision_now and not self._close_to_trigger_time(decision_now, trigger_time=trigger_time):
                 rejection_counts["missed_trigger"] += 1
                 continue
 
-            # 5. Estimate the ready time and whether its within margin
             servo_rotation_time = self._estimate_servo_rotation_time(q_from=q_start, q_to=q_raw)
-            expected_ready_time = now + servo_rotation_time + config.CMD_THREAD_MAX_DELAY + config.UDP_TX_DELAY + config.ENDPOINT_CMD_MAX_DELAY
+            expected_ready_time = decision_now + servo_rotation_time + config.CMD_THREAD_MAX_DELAY + config.UDP_TX_DELAY + config.ENDPOINT_CMD_MAX_DELAY
             ready_margin = trigger_time - expected_ready_time
 
             if ready_margin < min_ready_margin:
@@ -800,7 +814,6 @@ class Platform:
                 best_failed_ready_margin = max(best_failed_ready_margin, ready_margin)
                 continue
 
-            # 6. Create the plan and compute its cost
             plan = Plan(
                 track_id=tracker.track.id,
                 plan_type=plan_type,
@@ -812,10 +825,10 @@ class Platform:
                 trigger_time=trigger_time
             )
 
-            cost = self._plan_cost(now, plan, cost_weights, min_ready_margin, uncertainty_ratio) # Todo: determine what to do with infinite cost
+            cost = self._plan_cost(decision_now, plan, cost_weights, min_ready_margin, uncertainty_ratio)
 
             if debug_full_first_search and np.isfinite(cost):
-                time_cost = PLAN_COST_NOW_TRIGGER_TIME_COST if trigger_time <= now else (trigger_time - now)/PLAN_COST_TIME_SCALE
+                time_cost = PLAN_COST_NOW_TRIGGER_TIME_COST if trigger_time <= decision_now else (trigger_time - decision_now)/PLAN_COST_TIME_SCALE
                 servo_cost = float(np.clip(np.linalg.norm((q_raw - q_start)/PLAN_COST_SERVO_ANGLE_SCALES), 0.0, 1.0))
                 ready_margin_cost = 1.0/(1.0 + (ready_margin - min_ready_margin)/PLAN_COST_READY_MARGIN_SCALE)
                 uncertainty_x = np.clip(
@@ -826,7 +839,7 @@ class Platform:
                 uncertainty_cost = float(uncertainty_x**2 * (3.0 - 2.0*uncertainty_x))
 
                 diag = (
-                    (trigger_time - now)*1000.0, ready_margin*1000.0, cost,
+                    (trigger_time - decision_now)*1000.0, ready_margin*1000.0, cost,
                     cost_weights.get("time", 0.0)*time_cost,
                     cost_weights.get("servo_motion", 0.0)*servo_cost,
                     cost_weights.get("ready_margin", 0.0)*ready_margin_cost,
@@ -839,15 +852,22 @@ class Platform:
                 if max_margin_diag is None or diag[1] > max_margin_diag[1]:
                     max_margin_diag = diag
 
-
-            # 7. Replace the best plan if new one is better
-            if cost < best_cost: # also ensures np.inf cost doesn't pass a plan
+            if cost < best_cost:
                 best_cost = cost
                 best_plan = plan
                 if debug_full_first_search:
                     best_diag = diag
             elif not np.isfinite(cost):
                 rejection_counts["cost"] += 1
+
+        search_done_time = time.perf_counter()
+        label = f"{plan_type.name} {search_label}" if search_label else plan_type.name
+        print(
+            f"PLAN SEARCH TIME | {label} | "
+            f"compute={(physics_done_time - search_start_time)*1000:.1f} ms | "
+            f"total={(search_done_time - search_start_time)*1000:.1f} ms | "
+            f"computed={len(computed_candidates)}/{len(candidate_intercept_times)}"
+        ) # FOR DEBUG ONLY
 
         if debug_rejections and best_plan is None:
             ready_detail = ""
@@ -879,7 +899,7 @@ class Platform:
                 f"FIRST SEARCH DIAG | MAXMARGIN trigger={max_margin_diag[0]:.1f}ms margin={max_margin_diag[1]:.1f}ms cost={max_margin_diag[2]:.3f} "
                 f"[time={max_margin_diag[3]:.3f} servo={max_margin_diag[4]:.3f} margin={max_margin_diag[5]:.3f} risk={max_margin_diag[6]:.3f} ratio={max_margin_diag[7]:.2f}]"
             )
-            
+
         return best_plan is not None, best_plan
 
 
@@ -987,7 +1007,7 @@ class Platform:
 
         # Regula falsi converges in only a few trajectory simulations for this smooth low-arc problem.
         result = None
-        for _ in range(MAX_TILT_SOLVE_ITERATIONS):
+        for _ in range(MAX_TRAJECTORY_SOLVE_ITERATIONS):
             denom = f_hi - f_lo
             if abs(denom) <= 1e-12:
                 break
@@ -1004,7 +1024,7 @@ class Platform:
                 theta_lo, f_lo = theta, f
 
         # Rare fallback: finish robustly with bisection if false-position convergence stalls.
-        for _ in range(MAX_TILT_SOLVE_ITERATIONS):
+        for _ in range(MAX_TRAJECTORY_SOLVE_ITERATIONS):
             theta = 0.5*(theta_lo + theta_hi)
             result = simulate(theta)
             if result is None:
