@@ -33,7 +33,7 @@ FIRST_INTERCEPT_COARSE_NUM_CANDIDATES = 11
 FIRST_INTERCEPT_FINE_NUM_CANDIDATES = 11
 FIRST_INTERCEPT_MAX_LOOKAHEAD = 0.5 # seconds
 
-FIRST_INTERCEPT_REFRESH_NUM_CANDIDATES = 20
+FIRST_INTERCEPT_REFRESH_NUM_CANDIDATES = 6
 FIRST_INTERCEPT_REFRESH_HALF_WINDOW = 0.010 # seconds, +/- around previous intercept time
 
 SUBSEQUENT_INTERCEPT_MAX_NUM_CANDIDATES = 5 
@@ -51,7 +51,7 @@ MAX_TRAJECTORY_SOLVE_ITERATIONS = 8
 # Tune experimentally.
 DART_PROTRUSION_SPEED = 15.0 # m/s, actual protrusion speed v0
 DART_DRAG_K = 0.05 # 1/m; k=rho*Cd*A/(2m) ~= 1.2*0.6*pi*(0.0065)^2/(2*0.001) ~= 0.048
-DART_SIMULATION_DT = 0.0005 # seconds, Euler. TODO: RK4 could allow a larger dt at similar/better accuracy.
+DART_SIMULATION_DT = 0.001 # seconds, Euler; target-range crossing is linearly interpolated.
 TRAJECTORY_HEIGHT_TOLERANCE = 0.0005 # m
 
 # Do not aim at objects effectively behind / on top of platform.
@@ -575,13 +575,10 @@ class Platform:
 
         cost_weights = SUBSEQUENT_INTERCEPT_PLAN_COST_WEIGHTS 
 
+        warm_start_servo_angles = self.active_plan.raw_servo_angles if self.active_plan is not None else None
         return self._make_best_valid_intercept_plan_from_candidates(
-            tracker, 
-            now, 
-            PlanType.SUBSEQUENT_INTERCEPT, 
-            candidate_intercept_times, 
-            cost_weights, 
-            min_ready_margin=MIN_SUBSEQUENT_INTERCEPT_READY_MARGIN
+            tracker, now, PlanType.SUBSEQUENT_INTERCEPT, candidate_intercept_times, cost_weights,
+            min_ready_margin=MIN_SUBSEQUENT_INTERCEPT_READY_MARGIN, initial_aim_guess=warm_start_servo_angles
         )
 
 
@@ -610,9 +607,11 @@ class Platform:
                 stop=fixed_intercept_time + FIRST_INTERCEPT_REFRESH_HALF_WINDOW,
                 num=FIRST_INTERCEPT_REFRESH_NUM_CANDIDATES
             )
+            warm_start_servo_angles = self.active_plan.raw_servo_angles if self.active_plan is not None else None
             return self._make_best_valid_intercept_plan_from_candidates(
                 tracker, now, PlanType.FIRST_INTERCEPT, candidate_intercept_times, cost_weights,
-                min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN, debug_rejections=True, search_label="REFRESH"
+                min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN, debug_rejections=True, search_label="REFRESH",
+                initial_aim_guess=warm_start_servo_angles
             )
 
         # Coarse-to-fine search: first find the useful time region, then recover roughly the old 10 ms resolution locally.
@@ -631,7 +630,8 @@ class Platform:
 
         return self._make_best_valid_intercept_plan_from_candidates(
             tracker, now, PlanType.FIRST_INTERCEPT, fine_times, cost_weights,
-            min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN, debug_rejections=False, search_label="FINE"
+            min_ready_margin=MIN_FIRST_INTERCEPT_READY_MARGIN, debug_rejections=False, search_label="FINE",
+            initial_aim_guess=coarse_plan.raw_servo_angles
         )
 
 
@@ -743,7 +743,7 @@ class Platform:
         return cost
 
 
-    def _make_best_valid_intercept_plan_from_candidates(self, tracker: SingleObjectTracker, now, plan_type: PlanType, candidate_intercept_times, cost_weights, min_ready_margin, debug_rejections=False, search_label=None) -> tuple[bool, Plan | None]:
+    def _make_best_valid_intercept_plan_from_candidates(self, tracker: SingleObjectTracker, now, plan_type: PlanType, candidate_intercept_times, cost_weights, min_ready_margin, debug_rejections=False, search_label=None, initial_aim_guess=None) -> tuple[bool, Plan | None]:
         search_start_time = time.perf_counter()
 
         debug_full_first_search = plan_type == PlanType.FIRST_INTERCEPT and not debug_rejections
@@ -752,6 +752,7 @@ class Platform:
         # First compute the expensive target/trajectory results. Do not continuously update "now" here:
         # all candidates should later be compared against one common decision time.
         computed_candidates = []
+        warm_start_servo_angles = None if initial_aim_guess is None else np.asarray(initial_aim_guess, dtype=float).reshape(-1).copy()
         for intercept_time in candidate_intercept_times:
             dt = intercept_time - tracker.track.state_time
             if dt <= 0.0:
@@ -772,11 +773,15 @@ class Platform:
             )
 
             object_position_platform = estimateObjectPlatformPosition(object_position_world, self.camera_to_platform_calibration)
-            angles_valid, q_raw, foam_flight_time = self._object_position_to_servo_angles_and_flight_time(object_position_platform)
+            angles_valid, q_raw, foam_flight_time = self._object_position_to_servo_angles_and_flight_time(
+                object_position_platform, initial_servo_angles=warm_start_servo_angles
+            )
             if not angles_valid:
                 rejection_counts["aim"] += 1
                 continue
 
+            # Adjacent intercept candidates are close in time/space, so reuse the last solved aim as the next initial guess.
+            warm_start_servo_angles = q_raw.copy()
             computed_candidates.append((
                 intercept_time,
                 object_position_world,
@@ -903,8 +908,8 @@ class Platform:
         return best_plan is not None, best_plan
 
 
-    def _solve_dart_elevation_and_flight_time(self, horizontal_range: float, target_up: float) -> tuple[bool, float | None, float | None]:
-        """Solve launch elevation and flight time using quadratic drag with Euler integration."""
+    def _solve_dart_tilt_and_flight_time(self, horizontal_range: float, target_up: float, initial_theta_rad=None) -> tuple[bool, float | None, float | None]:
+        """Solve launch tilt and flight time using quadratic drag with Euler integration."""
 
         if horizontal_range <= 0.0 or not np.isfinite(horizontal_range) or not np.isfinite(target_up):
             return False, None, None
@@ -983,29 +988,70 @@ class Platform:
                 return False, None, None
             theta_lo, f_lo, theta_hi, f_hi = brackets[-1]
         else:
-            theta_lo = math.atan2(target_up, horizontal_range)
-            result_lo = simulate(theta_lo)
-            if result_lo is None:
-                return False, None, None
-            f_lo = result_lo[0] - target_up
-            if abs(f_lo) <= TRAJECTORY_HEIGHT_TOLERANCE:
-                return True, theta_lo, result_lo[1]
-
-            # The no-drag low solution is a close starting point; step upward until drag trajectory brackets the target.
-            theta_hi = max(theta_low_no_drag, theta_lo) + math.radians(1.0)
+            theta_los = math.atan2(target_up, horizontal_range)
             max_theta = min(theta_high_no_drag, math.radians(89.0))
-            while theta_hi <= max_theta + 1e-12:
-                result_hi = simulate(theta_hi)
-                if result_hi is None:
-                    return False, None, None
-                f_hi = result_hi[0] - target_up
-                if f_lo*f_hi <= 0.0:
-                    break
-                theta_hi += math.radians(1.0)
-            else:
-                return False, None, None
+            bracket_found = False
 
-        # Regula falsi converges in only a few trajectory simulations for this smooth low-arc problem.
+            # Warm start from the previous nearby solution. Search outward only as far as needed, then fall back below.
+            if initial_theta_rad is not None and np.isfinite(initial_theta_rad) and max_theta >= theta_los:
+                theta_guess = float(np.clip(initial_theta_rad, theta_los, max_theta))
+                result_guess = simulate(theta_guess)
+                if result_guess is not None:
+                    f_guess = result_guess[0] - target_up
+                    if abs(f_guess) <= TRAJECTORY_HEIGHT_TOLERANCE:
+                        return True, theta_guess, result_guess[1]
+
+                    step = math.radians(0.25)
+                    if f_guess < 0.0:
+                        theta_lo, f_lo = theta_guess, f_guess
+                        while theta_lo < max_theta - 1e-12:
+                            theta_hi = min(theta_lo + step, max_theta)
+                            result_hi = simulate(theta_hi)
+                            if result_hi is None:
+                                break
+                            f_hi = result_hi[0] - target_up
+                            if f_lo*f_hi <= 0.0:
+                                bracket_found = True
+                                break
+                            theta_lo, f_lo = theta_hi, f_hi
+                            step *= 2.0
+                    else:
+                        theta_hi, f_hi = theta_guess, f_guess
+                        while theta_hi > theta_los + 1e-12:
+                            theta_lo = max(theta_hi - step, theta_los)
+                            result_lo = simulate(theta_lo)
+                            if result_lo is None:
+                                break
+                            f_lo = result_lo[0] - target_up
+                            if f_lo*f_hi <= 0.0:
+                                bracket_found = True
+                                break
+                            theta_hi, f_hi = theta_lo, f_lo
+                            step *= 2.0
+
+            if not bracket_found:
+                theta_lo = theta_los
+                result_lo = simulate(theta_lo)
+                if result_lo is None:
+                    return False, None, None
+                f_lo = result_lo[0] - target_up
+                if abs(f_lo) <= TRAJECTORY_HEIGHT_TOLERANCE:
+                    return True, theta_lo, result_lo[1]
+
+                # The no-drag low solution is a close starting point; step upward until drag trajectory brackets the target.
+                theta_hi = max(theta_low_no_drag, theta_lo) + math.radians(1.0)
+                while theta_hi <= max_theta + 1e-12:
+                    result_hi = simulate(theta_hi)
+                    if result_hi is None:
+                        return False, None, None
+                    f_hi = result_hi[0] - target_up
+                    if f_lo*f_hi <= 0.0:
+                        break
+                    theta_hi += math.radians(1.0)
+                else:
+                    return False, None, None
+
+        # False position converges quickly for this smooth low-arc problem.
         result = None
         for _ in range(MAX_TRAJECTORY_SOLVE_ITERATIONS):
             denom = f_hi - f_lo
@@ -1040,7 +1086,7 @@ class Platform:
         return (True, theta, result[1]) if result is not None else (False, None, None)
 
 
-    def _object_position_to_servo_angles_and_flight_time(self, position: np.ndarray) -> tuple[bool, np.ndarray | None, float | None]:
+    def _object_position_to_servo_angles_and_flight_time(self, position: np.ndarray, initial_servo_angles=None) -> tuple[bool, np.ndarray | None, float | None]:
         """
         Convert platform-frame object position to pan/tilt angles.
 
@@ -1068,9 +1114,23 @@ class Platform:
         R_foam_forward = self.platform_geometry_spec.rotation_platform_from_foam_mechanism_at_forward
         foam_direction_forward = R_foam_forward@np.array([1.0, 0.0, 0.0])
 
-        # Initial guess assumes the foam exits from the platform origin.
-        platform_yaw_rad = np.arctan2(position[1], position[0])
-        platform_theta_rad = np.arctan2(position[2], np.hypot(position[0], position[1]))
+        # Use a nearby solved aim when available; otherwise start from the platform-origin line of sight.
+        target_theta_guess_rad = None
+        if initial_servo_angles is not None:
+            initial_servo_angles = np.asarray(initial_servo_angles, dtype=float).reshape(-1).copy()
+            pan_idx, tilt_idx = config.SERVO_IDX["pan"], config.SERVO_IDX["tilt"]
+            pan_sign, tilt_sign = config.SERVO_SIGNS[pan_idx], config.SERVO_SIGNS[tilt_idx]
+            if initial_servo_angles.shape == (config.NUM_SERVOS,) and np.all(np.isfinite(initial_servo_angles)) and abs(pan_sign) > 1e-12 and abs(tilt_sign) > 1e-12:
+                platform_yaw_rad = np.deg2rad((initial_servo_angles[pan_idx] - config.FORWARD_SERVO_ANGLES[pan_idx])/pan_sign)
+                platform_theta_rad = np.deg2rad((initial_servo_angles[tilt_idx] - config.FORWARD_SERVO_ANGLES[tilt_idx])/tilt_sign)
+                initial_foam_direction = rotationPlatformFromPanTilt(platform_yaw_rad, platform_theta_rad)@foam_direction_forward
+                target_theta_guess_rad = np.arctan2(initial_foam_direction[2], np.hypot(initial_foam_direction[0], initial_foam_direction[1]))
+            else:
+                initial_servo_angles = None
+
+        if initial_servo_angles is None:
+            platform_yaw_rad = np.arctan2(position[1], position[0])
+            platform_theta_rad = np.arctan2(position[2], np.hypot(position[0], position[1]))
 
         for _ in range(MAX_AIM_SOLVE_ITERATIONS):
             R_joint = rotationPlatformFromPanTilt(platform_yaw_rad, platform_theta_rad)
@@ -1086,9 +1146,12 @@ class Platform:
             if horizontal_range <= 1e-9:
                 return fail()
 
-            trajectory_valid, target_theta_rad, _ = self._solve_dart_elevation_and_flight_time(horizontal_range, up)
+            trajectory_valid, target_theta_rad, _ = self._solve_dart_tilt_and_flight_time(
+                horizontal_range, up, initial_theta_rad=target_theta_guess_rad
+            )
             if not trajectory_valid:
                 return fail()
+            target_theta_guess_rad = target_theta_rad
 
             # Convert required exit direction into pan/tilt joint angles, compensating for fixed mechanism rotation.
             axis_x, axis_y, axis_z = foam_direction_forward
@@ -1128,7 +1191,9 @@ class Platform:
         if horizontal_range <= 1e-9:
             return fail()
 
-        trajectory_valid, _, flight_time = self._solve_dart_elevation_and_flight_time(horizontal_range, up)
+        trajectory_valid, _, flight_time = self._solve_dart_tilt_and_flight_time(
+            horizontal_range, up, initial_theta_rad=target_theta_guess_rad
+        )
         if not trajectory_valid or flight_time is None or not np.isfinite(flight_time) or flight_time <= 0.0:
             return fail()
 
@@ -1225,7 +1290,7 @@ class Platform:
         )
 
         aim_valid, current_servo_angles, current_foam_flight_time = self._object_position_to_servo_angles_and_flight_time(
-            current_intercept_position_platform
+            current_intercept_position_platform, initial_servo_angles=self.active_plan.raw_servo_angles
         )
         if not aim_valid:
             return False
