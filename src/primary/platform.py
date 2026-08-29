@@ -969,15 +969,25 @@ class Platform:
                 if next_x_idx >= num_x or vx <= 0.0 or (z < DART_TRAJECTORY_TABLE_MIN_TARGET_UP and vz < 0.0):
                     break
 
-        memory_mb = (self._dart_trajectory_table_height_m.nbytes + self._dart_trajectory_table_time_s.nbytes)/(1024.0*1024.0)
+        # Per-range branch metadata makes the live inverse lookup scalar/logarithmic instead of scanning every tilt.
+        valid = np.isfinite(self._dart_trajectory_table_height_m)
+        self._dart_trajectory_table_first_valid_tilt_idx = np.argmax(valid, axis=0).astype(np.int16)
+        self._dart_trajectory_table_last_valid_tilt_idx = (shape[0] - 1 - np.argmax(valid[::-1], axis=0)).astype(np.int16)
+        self._dart_trajectory_table_peak_tilt_idx = np.argmax(np.where(valid, self._dart_trajectory_table_height_m, -np.inf), axis=0).astype(np.int16)
+
+        memory_bytes = (
+            self._dart_trajectory_table_height_m.nbytes + self._dart_trajectory_table_time_s.nbytes
+            + self._dart_trajectory_table_first_valid_tilt_idx.nbytes + self._dart_trajectory_table_last_valid_tilt_idx.nbytes
+            + self._dart_trajectory_table_peak_tilt_idx.nbytes
+        )
         print(
             f"DART TRAJECTORY TABLE | tilts={shape[0]} | x={shape[1]} | "
-            f"memory={memory_mb:.2f} MB | generation={(time.perf_counter() - start)*1000.0:.1f} ms"
+            f"memory={memory_bytes/(1024.0*1024.0):.2f} MB | generation={(time.perf_counter() - start)*1000.0:.1f} ms"
         ) # FOR DEBUG ONLY
 
 
     def _solve_dart_tilt_and_flight_time(self, horizontal_range: float, target_up: float, initial_theta_rad=None) -> tuple[bool, float | None, float | None]:
-        """Interpolate the precomputed tilt trajectories at the requested horizontal range and target height."""
+        """Fast inverse lookup on the precomputed trajectory table; warm-neighbor probe with binary-search fallback."""
         if (
             horizontal_range <= 0.0 or not np.isfinite(horizontal_range) or not np.isfinite(target_up)
             or horizontal_range > DART_TRAJECTORY_TABLE_MAX_FORWARD_RANGE
@@ -985,42 +995,148 @@ class Platform:
         ):
             return False, None, None
 
+        heights_table, times_table = self._dart_trajectory_table_height_m, self._dart_trajectory_table_time_s
+        tilts = self._dart_trajectory_table_tilts_rad
         x_position = horizontal_range/DART_TRAJECTORY_TABLE_X_STEP
         x0_idx = int(math.floor(x_position))
-        x1_idx = min(x0_idx + 1, self._dart_trajectory_table_height_m.shape[1] - 1)
+        x1_idx = min(x0_idx + 1, heights_table.shape[1] - 1)
         x_alpha = x_position - x0_idx
 
-        z0 = self._dart_trajectory_table_height_m[:, x0_idx]
-        t0 = self._dart_trajectory_table_time_s[:, x0_idx]
-        if x1_idx == x0_idx:
-            heights, times = z0.astype(float), t0.astype(float)
-        else:
-            z1 = self._dart_trajectory_table_height_m[:, x1_idx]
-            t1 = self._dart_trajectory_table_time_s[:, x1_idx]
-            valid = np.isfinite(z0) & np.isfinite(z1) & np.isfinite(t0) & np.isfinite(t1)
-            heights = np.full(z0.shape, np.nan, dtype=float)
-            times = np.full(t0.shape, np.nan, dtype=float)
-            heights[valid] = z0[valid] + x_alpha*(z1[valid] - z0[valid])
-            times[valid] = t0[valid] + x_alpha*(t1[valid] - t0[valid])
+        # A row is usable only if both neighboring x samples exist.
+        first_idx = max(int(self._dart_trajectory_table_first_valid_tilt_idx[x0_idx]), int(self._dart_trajectory_table_first_valid_tilt_idx[x1_idx]))
+        last_idx = min(int(self._dart_trajectory_table_last_valid_tilt_idx[x0_idx]), int(self._dart_trajectory_table_last_valid_tilt_idx[x1_idx]))
+        if first_idx >= last_idx:
+            return False, None, None
 
-        errors = heights - target_up
-        pair_valid = np.isfinite(errors[:-1]) & np.isfinite(errors[1:])
-        crossings = np.flatnonzero(pair_valid & (((errors[:-1] <= 0.0) & (errors[1:] >= 0.0)) | ((errors[:-1] >= 0.0) & (errors[1:] <= 0.0))))
-        if crossings.size == 0:
-            exact = np.flatnonzero(np.isfinite(errors) & (np.abs(errors) <= TRAJECTORY_HEIGHT_TOLERANCE))
-            if exact.size == 0:
+        def sample(idx: int):
+            z0, t0 = float(heights_table[idx, x0_idx]), float(times_table[idx, x0_idx])
+            if x1_idx == x0_idx:
+                return (z0, t0) if math.isfinite(z0) and math.isfinite(t0) else None
+            z1, t1 = float(heights_table[idx, x1_idx]), float(times_table[idx, x1_idx])
+            if not (math.isfinite(z0) and math.isfinite(z1) and math.isfinite(t0) and math.isfinite(t1)):
+                return None
+            return z0 + x_alpha*(z1 - z0), t0 + x_alpha*(t1 - t0)
+
+        # Adjacent x columns have nearly identical peak indices. Their interpolated peak is accurate enough to
+        # bound a warm probe; the exact interpolated peak is only refined if that fast path does not bracket.
+        peak_guess = int(round(
+            (1.0 - x_alpha)*float(self._dart_trajectory_table_peak_tilt_idx[x0_idx])
+            + x_alpha*float(self._dart_trajectory_table_peak_tilt_idx[x1_idx])
+        ))
+        peak_guess = min(max(peak_guess, first_idx), last_idx)
+
+        if initial_theta_rad is not None and np.isfinite(initial_theta_rad):
+            warm_lo, warm_hi = (peak_guess, last_idx) if USE_HIGH_ARC else (first_idx, peak_guess)
+            tilt_step = tilts[1] - tilts[0]
+            guess_idx = int(round((float(initial_theta_rad) - tilts[0])/tilt_step))
+            guess_idx = min(max(guess_idx, warm_lo), warm_hi)
+            guess_sample = sample(guess_idx)
+            if guess_sample is not None:
+                guess_error = guess_sample[0] - target_up
+                if abs(guess_error) <= 1e-12:
+                    return True, float(tilts[guess_idx]), float(guess_sample[1])
+                direction = (-1 if guess_error > 0.0 else 1) if not USE_HIGH_ARC else (1 if guess_error > 0.0 else -1)
+                neighbor_idx = guess_idx + direction
+                if warm_lo <= neighbor_idx <= warm_hi:
+                    neighbor_sample = sample(neighbor_idx)
+                    if neighbor_sample is not None and guess_error*(neighbor_sample[0] - target_up) <= 0.0:
+                        if guess_idx < neighbor_idx:
+                            return self._interpolate_dart_trajectory_table_rows(guess_idx, neighbor_idx, guess_sample, neighbor_sample, target_up)
+                        return self._interpolate_dart_trajectory_table_rows(neighbor_idx, guess_idx, neighbor_sample, guess_sample, target_up)
+
+        # Robust fallback: hill-climb a few scalar samples to the exact peak of the x-interpolated trajectory family.
+        peak_idx = peak_guess
+        peak_sample = sample(peak_idx)
+        if peak_sample is None:
+            return False, None, None
+        while peak_idx > first_idx:
+            left_sample = sample(peak_idx - 1)
+            if left_sample is None or left_sample[0] <= peak_sample[0]:
+                break
+            peak_idx, peak_sample = peak_idx - 1, left_sample
+        while peak_idx < last_idx:
+            right_sample = sample(peak_idx + 1)
+            if right_sample is None or right_sample[0] <= peak_sample[0]:
+                break
+            peak_idx, peak_sample = peak_idx + 1, right_sample
+
+        if target_up > peak_sample[0] + TRAJECTORY_HEIGHT_TOLERANCE:
+            return False, None, None
+
+        branch_lo, branch_hi = (peak_idx, last_idx) if USE_HIGH_ARC else (first_idx, peak_idx)
+        lo_sample, hi_sample = sample(branch_lo), sample(branch_hi)
+        if lo_sample is None or hi_sample is None:
+            return False, None, None
+
+        # Low branch rises with tilt; high branch falls. Reject targets outside the selected branch's height span.
+        if USE_HIGH_ARC:
+            if target_up < hi_sample[0] - TRAJECTORY_HEIGHT_TOLERANCE or target_up > lo_sample[0] + TRAJECTORY_HEIGHT_TOLERANCE:
                 return False, None, None
-            idx = int(exact[-1] if USE_HIGH_ARC else exact[0])
-            flight_time = float(times[idx])
-            return (True, float(self._dart_trajectory_table_tilts_rad[idx]), flight_time) if np.isfinite(flight_time) and flight_time > 0.0 else (False, None, None)
+        else:
+            if target_up < lo_sample[0] - TRAJECTORY_HEIGHT_TOLERANCE or target_up > hi_sample[0] + TRAJECTORY_HEIGHT_TOLERANCE:
+                return False, None, None
 
-        idx = int(crossings[-1] if USE_HIGH_ARC else crossings[0])
-        z_lo, z_hi = float(heights[idx]), float(heights[idx + 1])
-        denom = z_hi - z_lo
-        theta_alpha = 0.0 if abs(denom) <= 1e-12 else float(np.clip((target_up - z_lo)/denom, 0.0, 1.0))
-        theta_rad = float(self._dart_trajectory_table_tilts_rad[idx] + theta_alpha*(self._dart_trajectory_table_tilts_rad[idx + 1] - self._dart_trajectory_table_tilts_rad[idx]))
-        flight_time = float(times[idx] + theta_alpha*(times[idx + 1] - times[idx]))
-        return (True, theta_rad, flight_time) if np.isfinite(theta_rad) and np.isfinite(flight_time) and flight_time > 0.0 else (False, None, None)
+        # Warm-start: if the prior solution and one neighboring row already straddle the target, finish immediately.
+        if initial_theta_rad is not None and np.isfinite(initial_theta_rad):
+            tilt_step = tilts[1] - tilts[0]
+            guess_idx = int(round((float(initial_theta_rad) - tilts[0])/tilt_step))
+            guess_idx = min(max(guess_idx, branch_lo), branch_hi)
+            guess_sample = sample(guess_idx)
+            if guess_sample is not None:
+                guess_error = guess_sample[0] - target_up
+                if abs(guess_error) <= 1e-12:
+                    return True, float(tilts[guess_idx]), float(guess_sample[1])
+                direction = (-1 if guess_error > 0.0 else 1) if not USE_HIGH_ARC else (1 if guess_error > 0.0 else -1)
+                neighbor_idx = guess_idx + direction
+                if branch_lo <= neighbor_idx <= branch_hi:
+                    neighbor_sample = sample(neighbor_idx)
+                    if neighbor_sample is not None:
+                        neighbor_error = neighbor_sample[0] - target_up
+                        if guess_error*neighbor_error <= 0.0:
+                            lower_idx, upper_idx = sorted((guess_idx, neighbor_idx))
+                            lower_sample, upper_sample = sample(lower_idx), sample(upper_idx)
+                            return self._interpolate_dart_trajectory_table_rows(lower_idx, upper_idx, lower_sample, upper_sample, target_up)
+
+                # The warm row still shrinks the binary-search interval even when its immediate neighbor does not bracket.
+                if not USE_HIGH_ARC:
+                    if guess_error < 0.0:
+                        branch_lo, lo_sample = guess_idx, guess_sample
+                    else:
+                        branch_hi, hi_sample = guess_idx, guess_sample
+                else:
+                    if guess_error > 0.0:
+                        branch_lo, lo_sample = guess_idx, guess_sample
+                    else:
+                        branch_hi, hi_sample = guess_idx, guess_sample
+
+        # Binary search the monotonic selected branch until two adjacent table tilts straddle the requested height.
+        while branch_hi - branch_lo > 1:
+            mid_idx = (branch_lo + branch_hi)//2
+            mid_sample = sample(mid_idx)
+            if mid_sample is None:
+                return False, None, None
+            mid_error = mid_sample[0] - target_up
+            if abs(mid_error) <= 1e-12:
+                return True, float(tilts[mid_idx]), float(mid_sample[1])
+            if (mid_error < 0.0) != USE_HIGH_ARC:
+                branch_lo, lo_sample = mid_idx, mid_sample
+            else:
+                branch_hi, hi_sample = mid_idx, mid_sample
+
+        return self._interpolate_dart_trajectory_table_rows(branch_lo, branch_hi, lo_sample, hi_sample, target_up)
+
+
+    def _interpolate_dart_trajectory_table_rows(self, idx0: int, idx1: int, sample0, sample1, target_up: float):
+        """Interpolate tilt and flight time between two already-sampled neighboring trajectory rows."""
+        if sample0 is None or sample1 is None:
+            return False, None, None
+        z0, t0 = sample0
+        z1, t1 = sample1
+        denom = z1 - z0
+        alpha = 0.0 if abs(denom) <= 1e-12 else min(max((target_up - z0)/denom, 0.0), 1.0)
+        theta = float(self._dart_trajectory_table_tilts_rad[idx0] + alpha*(self._dart_trajectory_table_tilts_rad[idx1] - self._dart_trajectory_table_tilts_rad[idx0]))
+        flight_time = float(t0 + alpha*(t1 - t0))
+        return (True, theta, flight_time) if math.isfinite(theta) and math.isfinite(flight_time) and flight_time > 0.0 else (False, None, None)
 
 
     def _solve_dart_tilt_and_flight_time_euler(self, horizontal_range: float, target_up: float, initial_theta_rad=None) -> tuple[bool, float | None, float | None]:
