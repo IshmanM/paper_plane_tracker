@@ -49,7 +49,7 @@ MAX_AIM_SOLVE_ITERATIONS = 5
 MAX_TRAJECTORY_SOLVE_ITERATIONS = 8
 
 # Tune experimentally.
-DART_PROTRUSION_SPEED = 12.0 # m/s, actual protrusion speed v0
+DART_PROTRUSION_SPEED = 15.0 # m/s, actual protrusion speed v0
 DART_DRAG_K = 0.044 # 1/m; k=rho*Cd*A/(2m) ~= 1.2*0.6*pi*(0.0065)^2/(2*0.001) ~= 0.048
 DART_SIMULATION_DT = 0.001 # seconds, Euler used to precompute the trajectory table.
 TRAJECTORY_HEIGHT_TOLERANCE = 0.0005 # m
