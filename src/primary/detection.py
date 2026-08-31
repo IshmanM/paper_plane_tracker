@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import time
 from collections import Counter
 from itertools import combinations, permutations
 
@@ -895,11 +896,12 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
     # Paper-plane acquisition mirrors the useful first stages of the tennis-ball detector:
     # LAB chroma response -> LAB hotspots -> candidate ROIs -> loose HSV seed. The existing
     # polygon/straight-edge refinement remains responsible for the actual marker geometry.
+    LAB_ACQUISITION_SCALE = 0.5
     GLOBAL_BLUR_KERNEL = (5, 5)
     HOTSPOT_PERCENTILE = 98.5
     MIN_HOTSPOT_RESPONSE_FACTOR = 0.30
     MIN_LAB_DIRECTION_COSINE = 0.75
-    MIN_HOTSPOT_AREA_PX = 6
+    MIN_HOTSPOT_AREA_PX_FULL_RES = 6
     HOTSPOT_PADDING_FACTOR = 0.75
     MIN_HOTSPOT_PADDING_PX = 10
     EXTRA_HOTSPOT_CANDIDATES = 2
@@ -910,6 +912,11 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
     KEEP_FRAGMENTED_HSV_COMPONENTS = False
     MIN_SECONDARY_SEED_AREA_FACTOR = 0.15
     MAX_SECONDARY_SEED_DISTANCE_FACTOR = 1.25
+
+    # Optional profiling for the live detector. Keep off during normal operation.
+    PRINT_SHAPE_DETECTION_TIMING = False
+    timing_start = time.perf_counter() if PRINT_SHAPE_DETECTION_TIMING else None
+    timing_preprocess_end = timing_lab_seconds = timing_hsv_polygon_seconds = None
 
     unique_color_ids = list(dict.fromkeys(marker.color_id for marker in polygon_markers))
     expected_num_sides_by_color = {
@@ -946,18 +953,36 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
 
         max_hotspot_candidates_by_color[color_id] = max(1, max_expected) + EXTRA_HOTSPOT_CANDIDATES
 
-    blurred_frame = cv2.GaussianBlur(frame, GLOBAL_BLUR_KERNEL, 0)
-    lab_frame = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2LAB)
+    # LAB is only used for rough candidate acquisition, so do it at half resolution.
+    # HSV/polygon geometry stays full-resolution.
+    acquisition_frame = cv2.resize(
+        frame, None, fx=LAB_ACQUISITION_SCALE, fy=LAB_ACQUISITION_SCALE, interpolation=cv2.INTER_AREA,
+    )
+    blurred_acquisition_frame = cv2.GaussianBlur(acquisition_frame, GLOBAL_BLUR_KERNEL, 0)
+    lab_frame = cv2.cvtColor(blurred_acquisition_frame, cv2.COLOR_BGR2LAB)
     _, a_u8, b_u8 = cv2.split(lab_frame)
     a = a_u8.astype(np.float32) - 128.0
     b = b_u8.astype(np.float32) - 128.0
+    pixel_chroma_strength = np.sqrt(a*a + b*b)
+
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    acquisition_to_full_x = frame.shape[1]/acquisition_frame.shape[1]
+    acquisition_to_full_y = frame.shape[0]/acquisition_frame.shape[0]
+    min_hotspot_area_px = max(1, int(np.ceil(
+        MIN_HOTSPOT_AREA_PX_FULL_RES*LAB_ACQUISITION_SCALE*LAB_ACQUISITION_SCALE
+    )))
+
+    if PRINT_SHAPE_DETECTION_TIMING:
+        timing_preprocess_end = time.perf_counter()
+        timing_lab_seconds = 0.0
+        timing_hsv_polygon_seconds = 0.0
 
     shape_candidates: list[ShapeDetection] = []
     combined_raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
     combined_cleaned_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
     hsv_cleanup_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    hotspot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # 3x3 at half resolution is approximately the old 5x5 full-resolution cleanup footprint.
+    hotspot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
 
     if debug is not None:
         debug.stages.clear()
@@ -974,6 +999,8 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         if color_spec.lab_value is None:
             raise ValueError(f"Paper-plane shape detection requires ColorSpec.lab_value for {color_id}")
 
+        lab_stage_start = time.perf_counter() if PRINT_SHAPE_DETECTION_TIMING else None
+
         # Step 1: Continuous LAB chroma response for this marker color.
         lab_direction = color_spec.lab_value[1:3].astype(np.float32) - 128.0
         reference_chroma_strength = float(np.linalg.norm(lab_direction))
@@ -987,7 +1014,6 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         # Unlike the single-color tennis-ball case, multiple marker colors can have positive
         # projections onto one another's LAB directions. Require the pixel chroma direction to
         # actually point near this target color before letting its magnitude compete for hotspots.
-        pixel_chroma_strength = np.sqrt(a*a + b*b)
         lab_direction_cosine = np.divide(
             lab_color_response, pixel_chroma_strength,
             out=np.full_like(lab_color_response, -1.0), where=pixel_chroma_strength > 1e-6,
@@ -1008,9 +1034,15 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         hotspot_mask = cv2.dilate(hotspot_mask, hotspot_kernel, iterations=1)
 
         if debug is not None:
-            response_debug = np.clip(4.0*aligned_response, 0, 255).astype(np.uint8)
+            response_debug_small = np.clip(4.0*aligned_response, 0, 255).astype(np.uint8)
+            response_debug = cv2.resize(
+                response_debug_small, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR,
+            )
+            hotspot_debug_mask = cv2.resize(
+                hotspot_mask, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST,
+            )
             debug.addStage(f"LAB color response - {color_name}", response_debug)
-            debug.addStage(f"LAB hotspot mask - {color_name}", hotspot_mask)
+            debug.addStage(f"LAB hotspot mask - {color_name}", hotspot_debug_mask)
 
         # Step 3: Rank spatially distinct hotspot components and keep only as many as the model
         # says could plausibly exist for this color, plus two clutter candidates.
@@ -1022,7 +1054,7 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
 
         for hotspot_label in range(1, num_hotspot_labels):
             area = int(hotspot_stats[hotspot_label, cv2.CC_STAT_AREA])
-            if area < MIN_HOTSPOT_AREA_PX:
+            if area < min_hotspot_area_px:
                 continue
 
             x = int(hotspot_stats[hotspot_label, cv2.CC_STAT_LEFT])
@@ -1055,9 +1087,27 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
             if len(selected_hotspots) >= max_hotspot_candidates_by_color[color_id]:
                 break
 
+        # Convert the selected half-resolution hotspot boxes to full-resolution coordinates once.
+        selected_hotspots_full = []
+        for score, area, x, y, w, h, mean_response, hotspot_label in selected_hotspots:
+            full_x1 = int(np.floor(x*acquisition_to_full_x))
+            full_y1 = int(np.floor(y*acquisition_to_full_y))
+            full_x2 = int(np.ceil((x + w)*acquisition_to_full_x))
+            full_y2 = int(np.ceil((y + h)*acquisition_to_full_y))
+            full_x1, full_y1 = max(0, full_x1), max(0, full_y1)
+            full_x2, full_y2 = min(frame.shape[1], full_x2), min(frame.shape[0], full_y2)
+            selected_hotspots_full.append((
+                score, area, full_x1, full_y1, max(1, full_x2 - full_x1), max(1, full_y2 - full_y1),
+                mean_response, hotspot_label, x, y, w, h,
+            ))
+
+        if PRINT_SHAPE_DETECTION_TIMING:
+            timing_lab_seconds += time.perf_counter() - lab_stage_start
+            hsv_polygon_stage_start = time.perf_counter()
+
         if debug is not None:
             hotspot_debug = frame.copy()
-            for candidate_index, (score, area, x, y, w, h, mean_response, _) in enumerate(selected_hotspots, start=1):
+            for candidate_index, (score, area, x, y, w, h, mean_response, *_rest) in enumerate(selected_hotspots_full, start=1):
                 cv2.rectangle(hotspot_debug, (x, y), (x + w, y + h), draw_bgr, 1)
                 cv2.putText(
                     hotspot_debug,
@@ -1065,11 +1115,11 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
                     (x, max(15, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, draw_bgr, 1, cv2.LINE_AA,
                 )
             debug.addStage(
-                f"LAB hotspot candidates - {color_name} ({len(selected_hotspots)}/{max_hotspot_candidates_by_color[color_id]} cap)",
+                f"LAB hotspot candidates - {color_name} ({len(selected_hotspots_full)}/{max_hotspot_candidates_by_color[color_id]} cap)",
                 hotspot_debug,
             )
 
-        if not selected_hotspots:
+        if not selected_hotspots_full:
             continue
 
         # Step 4: Build one loose HSV mask for this color. Each LAB hotspot ROI selects the HSV
@@ -1095,7 +1145,9 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         num_seed_labels, seed_labels, seed_stats, _ = cv2.connectedComponentsWithStats(cleaned_loose_hsv_mask, connectivity=8)
         used_primary_seed_labels = set()
 
-        for candidate_index, (_, _, hot_x, hot_y, hot_w, hot_h, _, hotspot_label) in enumerate(selected_hotspots, start=1):
+        for candidate_index, (
+            _, _, hot_x, hot_y, hot_w, hot_h, _, hotspot_label, low_x, low_y, low_w, low_h,
+        ) in enumerate(selected_hotspots_full, start=1):
             hotspot_size = max(hot_w, hot_h)
             padding = max(MIN_HOTSPOT_PADDING_PX, int(HOTSPOT_PADDING_FACTOR*hotspot_size))
             x1, y1 = max(0, hot_x - padding), max(0, hot_y - padding)
@@ -1104,7 +1156,19 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
             if x2 <= x1 or y2 <= y1:
                 continue
 
-            hotspot_component_roi = hotspot_labels[y1:y2, x1:x2] == hotspot_label
+            # Upscale only this small hotspot-label ROI to full resolution for overlap testing.
+            low_x1 = max(0, int(np.floor(x1/acquisition_to_full_x)))
+            low_y1 = max(0, int(np.floor(y1/acquisition_to_full_y)))
+            low_x2 = min(hotspot_labels.shape[1], int(np.ceil(x2/acquisition_to_full_x)))
+            low_y2 = min(hotspot_labels.shape[0], int(np.ceil(y2/acquisition_to_full_y)))
+            low_component_roi = (hotspot_labels[low_y1:low_y2, low_x1:low_x2] == hotspot_label).astype(np.uint8)
+
+            if low_component_roi.size == 0:
+                continue
+
+            hotspot_component_roi = cv2.resize(
+                low_component_roi, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
             seed_labels_roi = seed_labels[y1:y2, x1:x2]
             best_seed = None
 
@@ -1253,6 +1317,9 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
                         cv2.circle(refined_debug, (int(vertex_u), int(vertex_v)), 4, draw_bgr, -1)
                     debug.addStage(f"{color_name} candidate {candidate_index} refined polygon", refined_debug)
 
+        if PRINT_SHAPE_DETECTION_TIMING:
+            timing_hsv_polygon_seconds += time.perf_counter() - hsv_polygon_stage_start
+
     if debug is not None:
         debug.addStage("Combined raw mask", combined_raw_mask)
         debug.addStage("Combined cleaned mask", combined_cleaned_mask)
@@ -1265,8 +1332,16 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         debug.addStage("Accepted shape candidates", candidate_debug_frame)
 
     if not shape_candidates:
+        if PRINT_SHAPE_DETECTION_TIMING:
+            total_ms = (time.perf_counter() - timing_start)*1000.0
+            preprocess_ms = (timing_preprocess_end - timing_start)*1000.0
+            print(
+                f"shape timing: preprocess={preprocess_ms:.1f} ms | LAB={timing_lab_seconds*1000.0:.1f} ms | "
+                f"HSV+polygon={timing_hsv_polygon_seconds*1000.0:.1f} ms | total={total_ms:.1f} ms (no shapes)"
+            )
         return None
 
+    grouping_start = time.perf_counter() if PRINT_SHAPE_DETECTION_TIMING else None
     shape_groups = groupShapeCandidates(shape_candidates, object_vision_spec)
 
     if debug is not None:
@@ -1290,6 +1365,15 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         debug.addStage("Matching shape groups", group_debug_frame)
 
     if not shape_groups:
+        if PRINT_SHAPE_DETECTION_TIMING:
+            total_ms = (time.perf_counter() - timing_start)*1000.0
+            preprocess_ms = (timing_preprocess_end - timing_start)*1000.0
+            grouping_ms = (time.perf_counter() - grouping_start)*1000.0
+            print(
+                f"shape timing: preprocess={preprocess_ms:.1f} ms | LAB={timing_lab_seconds*1000.0:.1f} ms | "
+                f"HSV+polygon={timing_hsv_polygon_seconds*1000.0:.1f} ms | grouping={grouping_ms:.1f} ms | "
+                f"total={total_ms:.1f} ms (no groups)"
+            )
         return None
 
     best_shape_group = selectBestShapeGroup(shape_groups, object_vision_spec)
@@ -1323,6 +1407,16 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         cv2.circle(final_debug_frame, (int(round(detection.u)), int(round(detection.v))), 5, (0, 0, 255), -1)
         cv2.putText(final_debug_frame, f"u={detection.u:.1f}, v={detection.v:.1f}, w={detection.px_w:.1f}, h={detection.px_h:.1f}", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
         debug.addStage("Final object detection", final_debug_frame)
+
+    if PRINT_SHAPE_DETECTION_TIMING:
+        total_ms = (time.perf_counter() - timing_start)*1000.0
+        preprocess_ms = (timing_preprocess_end - timing_start)*1000.0
+        grouping_ms = (time.perf_counter() - grouping_start)*1000.0
+        print(
+            f"shape timing: preprocess={preprocess_ms:.1f} ms | LAB={timing_lab_seconds*1000.0:.1f} ms | "
+            f"HSV+polygon={timing_hsv_polygon_seconds*1000.0:.1f} ms | grouping+select={grouping_ms:.1f} ms | "
+            f"total={total_ms:.1f} ms"
+        )
 
     return detection
 
