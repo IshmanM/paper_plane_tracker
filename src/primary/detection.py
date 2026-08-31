@@ -36,12 +36,30 @@ class Detection:
         self,
         u: float | None, v: float | None, px_w: float | None, px_h: float | None,
         shapes: list[ShapeDetection] | None = None,
+        bbox_center_offset_px: tuple[float, float] | np.ndarray | None = None,
     ):
+        """
+        u, v are the detected object's center in image pixels.
+
+        bbox_center_offset_px is optional and gives the vector from the object center
+        to the bounding-box center:
+            bbox_center = [u, v] + bbox_center_offset_px
+
+        When omitted, the bounding box is centered on the object center as before.
+        """
         self.u = u
         self.v = v
         self.px_w = px_w
         self.px_h = px_h
         self.shapes = shapes if shapes is not None else []
+
+        if bbox_center_offset_px is None:
+            self.bbox_center_offset_px = None
+        else:
+            bbox_center_offset_px = np.asarray(bbox_center_offset_px, dtype=np.float64)
+            if bbox_center_offset_px.shape != (2,) or not np.all(np.isfinite(bbox_center_offset_px)):
+                raise ValueError("bbox_center_offset_px must be a finite length-2 vector")
+            self.bbox_center_offset_px = bbox_center_offset_px
 
 
 class Measurement:
@@ -158,6 +176,25 @@ def detectPaperPlaneShapes(frame: np.ndarray, object_vision_spec: ObjectVisionSp
     if measurement.x is None:
         return failedDetectionResult(detection)
 
+    # findSingleObjectUsingBestShapeGroup initially centers Detection on the
+    # visible-marker bounding box. For paper planes, PnP gives the actual model/object
+    # origin, so make Detection.u/v represent that center while preserving the marker
+    # bbox through an offset.
+    bbox_center_u, bbox_center_v = detection.u, detection.v
+    origin_px, _ = cv2.projectPoints(
+        np.zeros((1, 3), dtype=np.float64), np.zeros((3, 1), dtype=np.float64),
+        np.array([[measurement.x], [measurement.y], [measurement.z]], dtype=np.float64),
+        camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
+    )
+    center_u, center_v = origin_px.reshape(2)
+
+    detection.u = float(center_u)
+    detection.v = float(center_v)
+    detection.bbox_center_offset_px = np.array([
+        float(bbox_center_u - center_u),
+        float(bbox_center_v - center_v),
+    ], dtype=np.float64)
+
     return True, detection, measurement
 
 
@@ -172,10 +209,14 @@ def drawDetection(frame: np.ndarray, detection: Detection,) -> None:
     if detection.u is None or detection.v is None or detection.px_w is None or detection.px_h is None:
         return
 
-    x_min = int(round(detection.u - detection.px_w/2.0))
-    y_min = int(round(detection.v - detection.px_h/2.0))
-    x_max = int(round(detection.u + detection.px_w/2.0))
-    y_max = int(round(detection.v + detection.px_h/2.0))
+    bbox_offset = detection.bbox_center_offset_px
+    bbox_center_u = detection.u + (0.0 if bbox_offset is None else bbox_offset[0])
+    bbox_center_v = detection.v + (0.0 if bbox_offset is None else bbox_offset[1])
+
+    x_min = int(round(bbox_center_u - detection.px_w/2.0))
+    y_min = int(round(bbox_center_v - detection.px_h/2.0))
+    x_max = int(round(bbox_center_u + detection.px_w/2.0))
+    y_max = int(round(bbox_center_v + detection.px_h/2.0))
 
     cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), color=(0, 255, 0), thickness=2,)
     cv2.circle(frame, (int(round(detection.u)), int(round(detection.v))), radius=5, color=(0, 255, 0), thickness=-1,)
