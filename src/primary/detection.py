@@ -107,7 +107,8 @@ class DetectionDebug:
         if self._reference_image is None or not self.timings_ms:
             return
 
-        timing_image = np.full_like(self._reference_image, 25)
+        timing_height = max(self._reference_image.shape[0], 80 + 27*len(self.timings_ms))
+        timing_image = np.full((timing_height, self._reference_image.shape[1], 3), 25, dtype=np.uint8)
         cv2.putText(timing_image, "TIMING (warmed; debug drawing excluded)", (18, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2, cv2.LINE_AA)
 
@@ -116,8 +117,6 @@ class DetectionDebug:
             cv2.putText(timing_image, f"{name}: {elapsed_ms:.2f} ms", (18, y),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (230, 230, 230), 1, cv2.LINE_AA)
             y += 27
-            if y > timing_image.shape[0] - 15:
-                break
 
         stage = ("Timing summary", timing_image)
         if self._timing_stage_index is None:
@@ -993,6 +992,14 @@ def findSingleObjectUsingBestShapeGroup(
     HOTSPOT_PADDING_FACTOR = 0.75
     MIN_HOTSPOT_PADDING_PX = 10
     EXTRA_HOTSPOT_CANDIDATES = 2
+
+    # Full-resolution HSV is evaluated only around LAB hotspots. Start generously, then
+    # automatically expand and retry if a selected HSV component reaches an ROI edge.
+    # This keeps the ROI optimization from clipping long/acute marker shapes.
+    HSV_ROI_PADDING_FACTOR = 1.25
+    MIN_HSV_ROI_PADDING_PX = 16
+    HSV_ROI_EXPANSION_FACTOR = 0.50
+    MAX_HSV_ROI_EXPANSIONS = 4
     LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 40, 15], dtype=np.int16)
 
     # Optional seam/shadow recovery analogous to the tennis-ball path. Off initially because
@@ -1023,6 +1030,8 @@ def findSingleObjectUsingBestShapeGroup(
     timing_lab_seconds = timing_hsv_polygon_seconds = None
     timing_model_setup_s = timing_resize_blur_s = timing_lab_prep_s = None
     timing_hsv_conversion_s = timing_frame_setup_s = None
+    timing_hsv_threshold_s = timing_hsv_cleanup_s = timing_hsv_components_s = 0.0
+    timing_hsv_association_s = timing_contour_s = timing_polygon_refine_s = 0.0
 
     model_setup_start = time.perf_counter() if profile_shape_detection else None
 
@@ -1099,8 +1108,8 @@ def findSingleObjectUsingBestShapeGroup(
     )))
 
     shape_candidates: list[ShapeDetection] = []
-    combined_raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
-    combined_cleaned_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+    combined_raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8) if debug is not None else None
+    combined_cleaned_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8) if debug is not None else None
     hsv_cleanup_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     # 3x3 at half resolution is approximately the old 5x5 full-resolution cleanup footprint.
     hotspot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
@@ -1137,16 +1146,14 @@ def findSingleObjectUsingBestShapeGroup(
         lab_color_response = a*float(lab_direction[0]) + b*float(lab_direction[1])
 
         # Unlike the single-color tennis-ball case, multiple marker colors can have positive
-        # projections onto one another's LAB directions. Require the pixel chroma direction to
-        # actually point near this target color before letting its magnitude compete for hotspots.
-        lab_direction_cosine = np.divide(
-            lab_color_response, pixel_chroma_strength,
-            out=np.full_like(lab_color_response, -1.0), where=pixel_chroma_strength > 1e-6,
+        # projections onto one another's LAB directions. For positive response,
+        # response/chroma >= cosine_threshold is exactly equivalent to
+        # response >= cosine_threshold*chroma, so avoid a full-image floating-point division.
+        direction_matches = (
+            (lab_color_response > 0.0)
+            & (lab_color_response >= MIN_LAB_DIRECTION_COSINE*pixel_chroma_strength)
         )
-        aligned_response = np.where(
-            lab_direction_cosine >= MIN_LAB_DIRECTION_COSINE,
-            np.maximum(lab_color_response, 0.0), 0.0,
-        )
+        aligned_response = np.where(direction_matches, lab_color_response, 0.0)
 
         # Step 2: Find strong target-color LAB hotspots using both an absolute chroma floor and
         # a high within-frame percentile, then lightly clean the hotspot mask.
@@ -1247,200 +1254,385 @@ def findSingleObjectUsingBestShapeGroup(
         if not selected_hotspots_full:
             continue
 
-        # Step 4: Build one loose HSV mask for this color. Each LAB hotspot ROI selects the HSV
-        # connected component that actually overlaps that hotspot; using global component labels
-        # avoids clipping a long triangle merely because the strongest LAB hotspot was small.
-        raw_loose_hsv_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+        # Step 4: Evaluate loose HSV only inside generous full-resolution ROIs around the
+        # selected LAB hotspots. Overlapping ROIs are merged so nearby/same-color markers are
+        # segmented together. If a selected HSV component touches an expandable ROI edge, enlarge
+        # that ROI and retry before extracting any contour, preventing ROI-induced shape clipping.
+        initial_hsv_rois = []
 
-        for lower_hsv, upper_hsv in color_spec.hsv_ranges:
-            loose_lower_hsv = np.clip(
-                lower_hsv.astype(np.int16) - LOOSE_HSV_LOWER_SUBTRACTION, 0, 255,
-            ).astype(np.uint8)
-            raw_loose_hsv_mask = cv2.bitwise_or(raw_loose_hsv_mask, cv2.inRange(hsv_frame, loose_lower_hsv, upper_hsv))
-
-        cleaned_loose_hsv_mask = cv2.medianBlur(raw_loose_hsv_mask, 3)
-        cleaned_loose_hsv_mask = cv2.morphologyEx(cleaned_loose_hsv_mask, cv2.MORPH_CLOSE, hsv_cleanup_kernel)
-        combined_raw_mask = cv2.bitwise_or(combined_raw_mask, raw_loose_hsv_mask)
-        combined_cleaned_mask = cv2.bitwise_or(combined_cleaned_mask, cleaned_loose_hsv_mask)
-
-        if debug is not None:
-            debug.addStage(f"Loose HSV mask - {color_name}", raw_loose_hsv_mask)
-            debug.addStage(f"Cleaned loose HSV mask - {color_name}", cleaned_loose_hsv_mask)
-
-        num_seed_labels, seed_labels, seed_stats, _ = cv2.connectedComponentsWithStats(cleaned_loose_hsv_mask, connectivity=8)
-        used_primary_seed_labels = set()
-
-        for candidate_index, (
-            _, _, hot_x, hot_y, hot_w, hot_h, _, hotspot_label, low_x, low_y, low_w, low_h,
-        ) in enumerate(selected_hotspots_full, start=1):
+        for hotspot_index, hotspot in enumerate(selected_hotspots_full):
+            _, _, hot_x, hot_y, hot_w, hot_h, *_ = hotspot
             hotspot_size = max(hot_w, hot_h)
-            padding = max(MIN_HOTSPOT_PADDING_PX, int(HOTSPOT_PADDING_FACTOR*hotspot_size))
-            x1, y1 = max(0, hot_x - padding), max(0, hot_y - padding)
-            x2, y2 = min(frame.shape[1], hot_x + hot_w + padding), min(frame.shape[0], hot_y + hot_h + padding)
+            padding = max(MIN_HSV_ROI_PADDING_PX, int(HSV_ROI_PADDING_FACTOR*hotspot_size))
+            x1 = max(0, hot_x - padding)
+            y1 = max(0, hot_y - padding)
+            x2 = min(frame.shape[1], hot_x + hot_w + padding)
+            y2 = min(frame.shape[0], hot_y + hot_h + padding)
 
-            if x2 <= x1 or y2 <= y1:
-                continue
+            if x2 > x1 and y2 > y1:
+                initial_hsv_rois.append([x1, y1, x2, y2, [hotspot_index]])
 
-            # Upscale only this small hotspot-label ROI to full resolution for overlap testing.
-            low_x1 = max(0, int(np.floor(x1/acquisition_to_full_x)))
-            low_y1 = max(0, int(np.floor(y1/acquisition_to_full_y)))
-            low_x2 = min(hotspot_labels.shape[1], int(np.ceil(x2/acquisition_to_full_x)))
-            low_y2 = min(hotspot_labels.shape[0], int(np.ceil(y2/acquisition_to_full_y)))
-            low_component_roi = (hotspot_labels[low_y1:low_y2, low_x1:low_x2] == hotspot_label).astype(np.uint8)
+        # Merge overlapping padded ROIs transitively. Multiple HSV connected components inside a
+        # merged ROI remain separate, so nearby same-color markers are still independently usable.
+        merged_hsv_rois = []
 
-            if low_component_roi.size == 0:
-                continue
+        for x1, y1, x2, y2, hotspot_indices in initial_hsv_rois:
+            merged = True
 
-            hotspot_component_roi = cv2.resize(
-                low_component_roi, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST,
-            ).astype(bool)
-            seed_labels_roi = seed_labels[y1:y2, x1:x2]
-            best_seed = None
+            while merged:
+                merged = False
 
-            for seed_label in np.unique(seed_labels_roi[hotspot_component_roi]):
-                seed_label = int(seed_label)
-                if seed_label == 0 or seed_label in used_primary_seed_labels:
-                    continue
+                for merged_index, (mx1, my1, mx2, my2, merged_hotspot_indices) in enumerate(merged_hsv_rois):
+                    overlaps = x1 < mx2 and x2 > mx1 and y1 < my2 and y2 > my1
 
-                seed_area = int(seed_stats[seed_label, cv2.CC_STAT_AREA])
-                if seed_area < minimum_shape_area_by_color[color_id]:
-                    continue
-
-                overlap = int(np.count_nonzero((seed_labels_roi == seed_label) & hotspot_component_roi))
-                if overlap <= 0:
-                    continue
-
-                if best_seed is None or (overlap, seed_area) > (best_seed[0], best_seed[1]):
-                    best_seed = (overlap, seed_area, seed_label)
-
-            if debug is not None:
-                roi_debug = frame.copy()
-                cv2.rectangle(roi_debug, (x1, y1), (x2 - 1, y2 - 1), draw_bgr, 1)
-                cv2.rectangle(roi_debug, (hot_x, hot_y), (hot_x + hot_w, hot_y + hot_h), (255, 255, 255), 1)
-                debug.addStage(f"{color_name} candidate {candidate_index} ROI", roi_debug)
-                debug.addStage(
-                    f"{color_name} candidate {candidate_index} loose HSV seed mask",
-                    cleaned_loose_hsv_mask[y1:y2, x1:x2],
-                )
-
-            if best_seed is None:
-                continue
-
-            _, seed_area, primary_seed_label = best_seed
-            used_primary_seed_labels.add(primary_seed_label)
-            keep_seed_label = np.zeros(num_seed_labels, dtype=np.uint8)
-            keep_seed_label[primary_seed_label] = 255
-
-            # Step 5 (optional/off): recover substantial nearby HSV components if real lighting
-            # later splits a marker into pieces. This is deliberately inactive for the first tests.
-            if KEEP_FRAGMENTED_HSV_COMPONENTS:
-                sx = int(seed_stats[primary_seed_label, cv2.CC_STAT_LEFT])
-                sy = int(seed_stats[primary_seed_label, cv2.CC_STAT_TOP])
-                sw = int(seed_stats[primary_seed_label, cv2.CC_STAT_WIDTH])
-                sh = int(seed_stats[primary_seed_label, cv2.CC_STAT_HEIGHT])
-                seed_center_x, seed_center_y = sx + 0.5*sw, sy + 0.5*sh
-                min_secondary_area = MIN_SECONDARY_SEED_AREA_FACTOR*seed_area
-                max_secondary_distance_sq = (MAX_SECONDARY_SEED_DISTANCE_FACTOR*max(sw, sh))**2
-
-                for other_label in range(1, num_seed_labels):
-                    if other_label == primary_seed_label:
+                    if not overlaps:
                         continue
 
-                    other_area = int(seed_stats[other_label, cv2.CC_STAT_AREA])
-                    if other_area < min_secondary_area:
-                        continue
+                    x1, y1 = min(x1, mx1), min(y1, my1)
+                    x2, y2 = max(x2, mx2), max(y2, my2)
+                    hotspot_indices = list(dict.fromkeys(hotspot_indices + merged_hotspot_indices))
+                    merged_hsv_rois.pop(merged_index)
+                    merged = True
+                    break
 
-                    ox = int(seed_stats[other_label, cv2.CC_STAT_LEFT])
-                    oy = int(seed_stats[other_label, cv2.CC_STAT_TOP])
-                    ow = int(seed_stats[other_label, cv2.CC_STAT_WIDTH])
-                    oh = int(seed_stats[other_label, cv2.CC_STAT_HEIGHT])
-                    dx = ox + 0.5*ow - seed_center_x
-                    dy = oy + 0.5*oh - seed_center_y
+            merged_hsv_rois.append([x1, y1, x2, y2, hotspot_indices])
 
-                    if dx*dx + dy*dy <= max_secondary_distance_sq:
-                        keep_seed_label[other_label] = 255
+        roi_results = []
+        color_raw_debug_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8) if debug is not None else None
+        color_cleaned_debug_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8) if debug is not None else None
 
-            selected_seed_mask = keep_seed_label[seed_labels]
+        for initial_x1, initial_y1, initial_x2, initial_y2, hotspot_indices in merged_hsv_rois:
+            x1, y1, x2, y2 = initial_x1, initial_y1, initial_x2, initial_y2
+            final_result = None
 
-            if debug is not None:
-                debug.addStage(f"{color_name} candidate {candidate_index} selected HSV component", selected_seed_mask)
+            for expansion_index in range(MAX_HSV_ROI_EXPANSIONS + 1):
+                hsv_roi = hsv_frame[y1:y2, x1:x2]
 
-            contours, _ = cv2.findContours(selected_seed_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                continue
+                if hsv_roi.size == 0:
+                    break
 
-            contour = max(contours, key=cv2.contourArea)
-            contour_area = cv2.contourArea(contour)
+                threshold_start = time.perf_counter() if profile_shape_detection else None
+                raw_loose_hsv_roi = np.zeros(hsv_roi.shape[:2], dtype=np.uint8)
 
-            if contour_debug_frame is not None:
-                cv2.drawContours(contour_debug_frame, [contour], -1, draw_bgr, 1)
-
-            if contour_area < minimum_shape_area_by_color[color_id]:
-                continue
-
-            # Existing polygon geometry path: convex hull -> approxPolyDP -> straight-edge fitting
-            # and line intersection. This is intentionally retained before trying LAB edge refinement.
-            hull = cv2.convexHull(contour)
-            perimeter = cv2.arcLength(hull, True)
-
-            if perimeter <= 0:
-                continue
-
-            base_polygon = cv2.approxPolyDP(hull, object_vision_spec.polygon_epsilon_ratio*perimeter, True)
-
-            if polygon_debug_frame is not None:
-                cv2.polylines(polygon_debug_frame, [base_polygon], True, draw_bgr, 1)
-                polygon_center = np.mean(base_polygon.reshape(-1, 2), axis=0).astype(np.int32)
-                cv2.putText(
-                    polygon_debug_frame, f"{color_name}: {len(base_polygon)} vertices", tuple(polygon_center),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_bgr, 1, cv2.LINE_AA,
-                )
-
-            expected_num_sides = expected_num_sides_by_color[color_id]
-
-            # Prefer an exact N-sided match. Only use the N+1 retry when no configured shape matches directly.
-            if len(base_polygon) in expected_num_sides:
-                candidate_polygons = [(len(base_polygon), base_polygon)]
-            else:
-                candidate_polygons = []
-                for num_sides in expected_num_sides:
-                    if len(base_polygon) == num_sides + 1:
-                        retry_polygon = cv2.approxPolyDP(
-                            contour, (object_vision_spec.polygon_epsilon_ratio + 0.02)*perimeter, True,
-                        )
-                        if len(retry_polygon) == num_sides:
-                            candidate_polygons.append((num_sides, retry_polygon))
-
-            for num_sides, polygon in candidate_polygons:
-                if not cv2.isContourConvex(polygon):
-                    continue
-
-                vertices_px = refineShapeVerticesUsingEdges(contour, polygon)
-                shape_candidates.append(ShapeDetection(vertices_px=vertices_px, color_id=color_id, num_sides=num_sides))
-
-                if candidate_debug_frame is not None:
-                    shape_index = len(shape_candidates) - 1
-                    center_px = np.mean(vertices_px, axis=0).astype(np.int32)
-                    shape_points = np.round(vertices_px).astype(np.int32).reshape(-1, 1, 2)
-                    cv2.polylines(candidate_debug_frame, [shape_points], True, draw_bgr, 1)
-                    cv2.circle(candidate_debug_frame, tuple(center_px), 4, draw_bgr, -1)
-                    cv2.putText(
-                        candidate_debug_frame, f"S{shape_index}: {color_name}, N={num_sides}",
-                        (int(center_px[0]) + 5, int(center_px[1]) - 5),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_bgr, 1, cv2.LINE_AA,
+                for lower_hsv, upper_hsv in color_spec.hsv_ranges:
+                    loose_lower_hsv = np.clip(
+                        lower_hsv.astype(np.int16) - LOOSE_HSV_LOWER_SUBTRACTION, 0, 255,
+                    ).astype(np.uint8)
+                    raw_loose_hsv_roi = cv2.bitwise_or(
+                        raw_loose_hsv_roi, cv2.inRange(hsv_roi, loose_lower_hsv, upper_hsv),
                     )
 
-                if debug is not None:
-                    rough_debug = frame.copy()
-                    cv2.polylines(rough_debug, [polygon], True, draw_bgr, 2)
-                    debug.addStage(f"{color_name} candidate {candidate_index} rough polygon", rough_debug)
+                if profile_shape_detection:
+                    timing_hsv_threshold_s += time.perf_counter() - threshold_start
+                    cleanup_start = time.perf_counter()
 
-                    refined_debug = frame.copy()
-                    refined_points = np.round(vertices_px).astype(np.int32).reshape(-1, 1, 2)
-                    cv2.polylines(refined_debug, [refined_points], True, draw_bgr, 2)
-                    for vertex_u, vertex_v in np.round(vertices_px).astype(np.int32):
-                        cv2.circle(refined_debug, (int(vertex_u), int(vertex_v)), 4, draw_bgr, -1)
-                    debug.addStage(f"{color_name} candidate {candidate_index} refined polygon", refined_debug)
+                cleaned_loose_hsv_roi = cv2.medianBlur(raw_loose_hsv_roi, 3)
+                cleaned_loose_hsv_roi = cv2.morphologyEx(
+                    cleaned_loose_hsv_roi, cv2.MORPH_CLOSE, hsv_cleanup_kernel,
+                )
+
+                if profile_shape_detection:
+                    timing_hsv_cleanup_s += time.perf_counter() - cleanup_start
+                    components_start = time.perf_counter()
+
+                num_seed_labels, seed_labels, seed_stats, _ = cv2.connectedComponentsWithStats(
+                    cleaned_loose_hsv_roi, connectivity=8,
+                )
+
+                if profile_shape_detection:
+                    timing_hsv_components_s += time.perf_counter() - components_start
+                    association_start = time.perf_counter()
+
+                selected_seeds = []
+                used_primary_seed_labels = set()
+                selected_component_touches_expandable_edge = False
+
+                for hotspot_index in hotspot_indices:
+                    hotspot = selected_hotspots_full[hotspot_index]
+                    _, _, hot_x, hot_y, hot_w, hot_h, _, hotspot_label, *_ = hotspot
+
+                    # Upscale only this hotspot-label crop into the current HSV ROI coordinates.
+                    low_x1 = max(0, int(np.floor(x1/acquisition_to_full_x)))
+                    low_y1 = max(0, int(np.floor(y1/acquisition_to_full_y)))
+                    low_x2 = min(hotspot_labels.shape[1], int(np.ceil(x2/acquisition_to_full_x)))
+                    low_y2 = min(hotspot_labels.shape[0], int(np.ceil(y2/acquisition_to_full_y)))
+                    low_component_roi = (
+                        hotspot_labels[low_y1:low_y2, low_x1:low_x2] == hotspot_label
+                    ).astype(np.uint8)
+
+                    if low_component_roi.size == 0:
+                        continue
+
+                    hotspot_component_roi = cv2.resize(
+                        low_component_roi, (x2 - x1, y2 - y1), interpolation=cv2.INTER_NEAREST,
+                    ).astype(bool)
+                    best_seed = None
+
+                    for seed_label in np.unique(seed_labels[hotspot_component_roi]):
+                        seed_label = int(seed_label)
+
+                        if seed_label == 0 or seed_label in used_primary_seed_labels:
+                            continue
+
+                        seed_area = int(seed_stats[seed_label, cv2.CC_STAT_AREA])
+
+                        if seed_area < minimum_shape_area_by_color[color_id]:
+                            continue
+
+                        overlap = int(np.count_nonzero((seed_labels == seed_label) & hotspot_component_roi))
+
+                        if overlap <= 0:
+                            continue
+
+                        if best_seed is None or (overlap, seed_area) > (best_seed[0], best_seed[1]):
+                            best_seed = (overlap, seed_area, seed_label)
+
+                    if best_seed is None:
+                        continue
+
+                    _, seed_area, primary_seed_label = best_seed
+                    used_primary_seed_labels.add(primary_seed_label)
+                    selected_seeds.append((hotspot_index, seed_area, primary_seed_label))
+
+                    sx = int(seed_stats[primary_seed_label, cv2.CC_STAT_LEFT])
+                    sy = int(seed_stats[primary_seed_label, cv2.CC_STAT_TOP])
+                    sw = int(seed_stats[primary_seed_label, cv2.CC_STAT_WIDTH])
+                    sh = int(seed_stats[primary_seed_label, cv2.CC_STAT_HEIGHT])
+                    touches_left = sx <= 0 and x1 > 0
+                    touches_top = sy <= 0 and y1 > 0
+                    touches_right = sx + sw >= x2 - x1 and x2 < frame.shape[1]
+                    touches_bottom = sy + sh >= y2 - y1 and y2 < frame.shape[0]
+
+                    if touches_left or touches_top or touches_right or touches_bottom:
+                        selected_component_touches_expandable_edge = True
+
+                if profile_shape_detection:
+                    timing_hsv_association_s += time.perf_counter() - association_start
+
+                final_result = (
+                    x1, y1, x2, y2, raw_loose_hsv_roi, cleaned_loose_hsv_roi,
+                    seed_labels, seed_stats, num_seed_labels, selected_seeds,
+                )
+
+                if not selected_component_touches_expandable_edge or expansion_index >= MAX_HSV_ROI_EXPANSIONS:
+                    break
+
+                roi_width, roi_height = x2 - x1, y2 - y1
+                expand_x = max(MIN_HSV_ROI_PADDING_PX, int(HSV_ROI_EXPANSION_FACTOR*roi_width))
+                expand_y = max(MIN_HSV_ROI_PADDING_PX, int(HSV_ROI_EXPANSION_FACTOR*roi_height))
+                new_x1, new_y1 = max(0, x1 - expand_x), max(0, y1 - expand_y)
+                new_x2 = min(frame.shape[1], x2 + expand_x)
+                new_y2 = min(frame.shape[0], y2 + expand_y)
+
+                if (new_x1, new_y1, new_x2, new_y2) == (x1, y1, x2, y2):
+                    break
+
+                x1, y1, x2, y2 = new_x1, new_y1, new_x2, new_y2
+
+            if final_result is None:
+                continue
+
+            roi_results.append(final_result)
+
+            if debug is not None:
+                x1, y1, x2, y2, raw_roi, cleaned_roi, *_ = final_result
+                color_raw_debug_mask[y1:y2, x1:x2] = cv2.bitwise_or(
+                    color_raw_debug_mask[y1:y2, x1:x2], raw_roi,
+                )
+                color_cleaned_debug_mask[y1:y2, x1:x2] = cv2.bitwise_or(
+                    color_cleaned_debug_mask[y1:y2, x1:x2], cleaned_roi,
+                )
+
+        if debug is not None:
+            combined_raw_mask = cv2.bitwise_or(combined_raw_mask, color_raw_debug_mask)
+            combined_cleaned_mask = cv2.bitwise_or(combined_cleaned_mask, color_cleaned_debug_mask)
+            debug.addStage(f"Loose HSV mask - {color_name}", color_raw_debug_mask)
+            debug.addStage(f"Cleaned loose HSV mask - {color_name}", color_cleaned_debug_mask)
+
+        # Step 5/6: Extract only the selected component's own bounding rectangle, not a full-frame
+        # binary mask. The HSV ROI has already been expanded if the component reached its edge, so
+        # this local contour extraction does not crop the marker geometry.
+        for (
+            x1, y1, x2, y2, raw_loose_hsv_roi, cleaned_loose_hsv_roi,
+            seed_labels, seed_stats, num_seed_labels, selected_seeds,
+        ) in roi_results:
+            for hotspot_index, seed_area, primary_seed_label in selected_seeds:
+                candidate_index = hotspot_index + 1
+                hotspot = selected_hotspots_full[hotspot_index]
+                _, _, hot_x, hot_y, hot_w, hot_h, *_ = hotspot
+                keep_labels = [primary_seed_label]
+
+                # Optional/off: recover substantial nearby HSV components if lighting later splits
+                # one physical marker. All coordinates here are local to the already-safe HSV ROI.
+                if KEEP_FRAGMENTED_HSV_COMPONENTS:
+                    sx = int(seed_stats[primary_seed_label, cv2.CC_STAT_LEFT])
+                    sy = int(seed_stats[primary_seed_label, cv2.CC_STAT_TOP])
+                    sw = int(seed_stats[primary_seed_label, cv2.CC_STAT_WIDTH])
+                    sh = int(seed_stats[primary_seed_label, cv2.CC_STAT_HEIGHT])
+                    seed_center_x, seed_center_y = sx + 0.5*sw, sy + 0.5*sh
+                    min_secondary_area = MIN_SECONDARY_SEED_AREA_FACTOR*seed_area
+                    max_secondary_distance_sq = (MAX_SECONDARY_SEED_DISTANCE_FACTOR*max(sw, sh))**2
+
+                    for other_label in range(1, num_seed_labels):
+                        if other_label == primary_seed_label:
+                            continue
+
+                        other_area = int(seed_stats[other_label, cv2.CC_STAT_AREA])
+
+                        if other_area < min_secondary_area:
+                            continue
+
+                        ox = int(seed_stats[other_label, cv2.CC_STAT_LEFT])
+                        oy = int(seed_stats[other_label, cv2.CC_STAT_TOP])
+                        ow = int(seed_stats[other_label, cv2.CC_STAT_WIDTH])
+                        oh = int(seed_stats[other_label, cv2.CC_STAT_HEIGHT])
+                        dx = ox + 0.5*ow - seed_center_x
+                        dy = oy + 0.5*oh - seed_center_y
+
+                        if dx*dx + dy*dy <= max_secondary_distance_sq:
+                            keep_labels.append(other_label)
+
+                contour_start = time.perf_counter() if profile_shape_detection else None
+                component_x1 = min(int(seed_stats[label, cv2.CC_STAT_LEFT]) for label in keep_labels)
+                component_y1 = min(int(seed_stats[label, cv2.CC_STAT_TOP]) for label in keep_labels)
+                component_x2 = max(
+                    int(seed_stats[label, cv2.CC_STAT_LEFT] + seed_stats[label, cv2.CC_STAT_WIDTH])
+                    for label in keep_labels
+                )
+                component_y2 = max(
+                    int(seed_stats[label, cv2.CC_STAT_TOP] + seed_stats[label, cv2.CC_STAT_HEIGHT])
+                    for label in keep_labels
+                )
+                component_labels = seed_labels[component_y1:component_y2, component_x1:component_x2]
+
+                if len(keep_labels) == 1:
+                    selected_component_mask = (component_labels == keep_labels[0]).astype(np.uint8)*255
+                else:
+                    selected_component_mask = np.isin(component_labels, keep_labels).astype(np.uint8)*255
+
+                contours, _ = cv2.findContours(
+                    selected_component_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+                    offset=(x1 + component_x1, y1 + component_y1),
+                )
+
+                if profile_shape_detection:
+                    timing_contour_s += time.perf_counter() - contour_start
+
+                if debug is not None:
+                    roi_debug = frame.copy()
+                    cv2.rectangle(roi_debug, (x1, y1), (x2 - 1, y2 - 1), draw_bgr, 1)
+                    cv2.rectangle(
+                        roi_debug, (hot_x, hot_y), (hot_x + hot_w, hot_y + hot_h), (255, 255, 255), 1,
+                    )
+                    debug.addStage(f"{color_name} candidate {candidate_index} ROI", roi_debug)
+                    debug.addStage(
+                        f"{color_name} candidate {candidate_index} loose HSV seed mask",
+                        cleaned_loose_hsv_roi,
+                    )
+
+                    selected_seed_debug = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+                    global_component_x1 = x1 + component_x1
+                    global_component_y1 = y1 + component_y1
+                    global_component_x2 = x1 + component_x2
+                    global_component_y2 = y1 + component_y2
+                    selected_seed_debug[
+                        global_component_y1:global_component_y2,
+                        global_component_x1:global_component_x2,
+                    ] = selected_component_mask
+                    debug.addStage(
+                        f"{color_name} candidate {candidate_index} selected HSV component", selected_seed_debug,
+                    )
+
+                if not contours:
+                    continue
+
+                contour = max(contours, key=cv2.contourArea)
+                contour_area = cv2.contourArea(contour)
+
+                if contour_debug_frame is not None:
+                    cv2.drawContours(contour_debug_frame, [contour], -1, draw_bgr, 1)
+
+                if contour_area < minimum_shape_area_by_color[color_id]:
+                    continue
+
+                polygon_start = time.perf_counter() if profile_shape_detection else None
+
+                # Existing polygon geometry path: convex hull -> approxPolyDP -> straight-edge fitting
+                # and line intersection. This is intentionally retained before trying LAB edge refinement.
+                hull = cv2.convexHull(contour)
+                perimeter = cv2.arcLength(hull, True)
+
+                if perimeter <= 0:
+                    if profile_shape_detection:
+                        timing_polygon_refine_s += time.perf_counter() - polygon_start
+                    continue
+
+                base_polygon = cv2.approxPolyDP(
+                    hull, object_vision_spec.polygon_epsilon_ratio*perimeter, True,
+                )
+
+                if polygon_debug_frame is not None:
+                    cv2.polylines(polygon_debug_frame, [base_polygon], True, draw_bgr, 1)
+                    polygon_center = np.mean(base_polygon.reshape(-1, 2), axis=0).astype(np.int32)
+                    cv2.putText(
+                        polygon_debug_frame, f"{color_name}: {len(base_polygon)} vertices", tuple(polygon_center),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_bgr, 1, cv2.LINE_AA,
+                    )
+
+                expected_num_sides = expected_num_sides_by_color[color_id]
+
+                # Prefer an exact N-sided match. Only use the N+1 retry when no configured shape matches directly.
+                if len(base_polygon) in expected_num_sides:
+                    candidate_polygons = [(len(base_polygon), base_polygon)]
+                else:
+                    candidate_polygons = []
+
+                    for num_sides in expected_num_sides:
+                        if len(base_polygon) == num_sides + 1:
+                            retry_polygon = cv2.approxPolyDP(
+                                contour, (object_vision_spec.polygon_epsilon_ratio + 0.02)*perimeter, True,
+                            )
+
+                            if len(retry_polygon) == num_sides:
+                                candidate_polygons.append((num_sides, retry_polygon))
+
+                for num_sides, polygon in candidate_polygons:
+                    if not cv2.isContourConvex(polygon):
+                        continue
+
+                    vertices_px = refineShapeVerticesUsingEdges(contour, polygon)
+                    shape_candidates.append(
+                        ShapeDetection(vertices_px=vertices_px, color_id=color_id, num_sides=num_sides),
+                    )
+
+                    if candidate_debug_frame is not None:
+                        shape_index = len(shape_candidates) - 1
+                        center_px = np.mean(vertices_px, axis=0).astype(np.int32)
+                        shape_points = np.round(vertices_px).astype(np.int32).reshape(-1, 1, 2)
+                        cv2.polylines(candidate_debug_frame, [shape_points], True, draw_bgr, 1)
+                        cv2.circle(candidate_debug_frame, tuple(center_px), 4, draw_bgr, -1)
+                        cv2.putText(
+                            candidate_debug_frame, f"S{shape_index}: {color_name}, N={num_sides}",
+                            (int(center_px[0]) + 5, int(center_px[1]) - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_bgr, 1, cv2.LINE_AA,
+                        )
+
+                    if debug is not None:
+                        rough_debug = frame.copy()
+                        cv2.polylines(rough_debug, [polygon], True, draw_bgr, 2)
+                        debug.addStage(f"{color_name} candidate {candidate_index} rough polygon", rough_debug)
+
+                        refined_debug = frame.copy()
+                        refined_points = np.round(vertices_px).astype(np.int32).reshape(-1, 1, 2)
+                        cv2.polylines(refined_debug, [refined_points], True, draw_bgr, 2)
+
+                        for vertex_u, vertex_v in np.round(vertices_px).astype(np.int32):
+                            cv2.circle(refined_debug, (int(vertex_u), int(vertex_v)), 4, draw_bgr, -1)
+
+                        debug.addStage(f"{color_name} candidate {candidate_index} refined polygon", refined_debug)
+
+                if profile_shape_detection:
+                    timing_polygon_refine_s += time.perf_counter() - polygon_start
 
         if profile_shape_detection:
             timing_hsv_polygon_seconds += time.perf_counter() - hsv_polygon_stage_start
@@ -1467,6 +1659,12 @@ def findSingleObjectUsingBestShapeGroup(
                     "2D HSV conversion": timing_hsv_conversion_s,
                     "2D frame setup": timing_frame_setup_s,
                     "2D LAB acquisition": timing_lab_seconds,
+                    "2D HSV threshold (ROI)": timing_hsv_threshold_s,
+                    "2D HSV cleanup (ROI)": timing_hsv_cleanup_s,
+                    "2D HSV components (ROI)": timing_hsv_components_s,
+                    "2D HSV hotspot association": timing_hsv_association_s,
+                    "2D component contours": timing_contour_s,
+                    "2D polygon + refinement": timing_polygon_refine_s,
                     "2D HSV + polygons": timing_hsv_polygon_seconds,
                     "2D detection total": timing_total_s,
                 })
@@ -1516,6 +1714,12 @@ def findSingleObjectUsingBestShapeGroup(
                     "2D HSV conversion": timing_hsv_conversion_s,
                     "2D frame setup": timing_frame_setup_s,
                     "2D LAB acquisition": timing_lab_seconds,
+                    "2D HSV threshold (ROI)": timing_hsv_threshold_s,
+                    "2D HSV cleanup (ROI)": timing_hsv_cleanup_s,
+                    "2D HSV components (ROI)": timing_hsv_components_s,
+                    "2D HSV hotspot association": timing_hsv_association_s,
+                    "2D component contours": timing_contour_s,
+                    "2D polygon + refinement": timing_polygon_refine_s,
                     "2D HSV + polygons": timing_hsv_polygon_seconds,
                     "2D grouping + selection": timing_grouping_s,
                     "2D detection total": timing_total_s,
@@ -1574,6 +1778,12 @@ def findSingleObjectUsingBestShapeGroup(
                     "2D HSV conversion": timing_hsv_conversion_s,
                     "2D frame setup": timing_frame_setup_s,
                     "2D LAB acquisition": timing_lab_seconds,
+                    "2D HSV threshold (ROI)": timing_hsv_threshold_s,
+                    "2D HSV cleanup (ROI)": timing_hsv_cleanup_s,
+                    "2D HSV components (ROI)": timing_hsv_components_s,
+                    "2D HSV hotspot association": timing_hsv_association_s,
+                    "2D component contours": timing_contour_s,
+                    "2D polygon + refinement": timing_polygon_refine_s,
                     "2D HSV + polygons": timing_hsv_polygon_seconds,
                 "2D grouping + selection": timing_grouping_s,
                 "2D detection total": timing_total_s,
