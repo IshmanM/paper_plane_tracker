@@ -28,6 +28,8 @@ from src.comm.network_config import (
 WINDOW_NAME = "Webcam Feed"
 DISPLAY_SCALES = (1.0, 1.5, 2.0)
 
+PRINT_DETECTION = False # FOR DEBUG ONLY
+
 OBJECT_VISION_SPEC_IDS = (
     ObjectVisionSpecId.TENNIS_BALL_DEFAULT,  # 1
     ObjectVisionSpecId.ARUCO_MARKER_1,       # 2
@@ -134,9 +136,9 @@ if __name__ == "__main__":
 
     try:
         while cap.isOpened():
-            if not tracker_paused:
-                frame_time = time.perf_counter()
+            if not tracker_paused:       
                 ret, frame = cap.read()  # doesn't always give latest frame but that's a future optimization.
+                frame_time = time.perf_counter()
 
                 if not ret:
                     print("Possible camera failure")
@@ -150,11 +152,12 @@ if __name__ == "__main__":
                     last_detection_px_h = detection.px_h
                     drawDetection(frame, detection)
 
-                    print(
-                        f"BALL | u={detection.u:.2f} v={detection.v:.2f} | "
-                        f"w={detection.px_w:.3f} h={detection.px_h:.3f} | "
-                        f"xyz=[{measurement.x:.3f}, {measurement.y:.3f}, {measurement.z:.3f}]"
-                    ) # FOR DEBUG ONLY
+                    if PRINT_DETECTION: # FOR DEBUG ONLY
+                        print(
+                            f"BALL | u={detection.u:.2f} v={detection.v:.2f} | "
+                            f"w={detection.px_w:.3f} h={detection.px_h:.3f} | "
+                            f"xyz=[{measurement.x:.3f}, {measurement.y:.3f}, {measurement.z:.3f}]"
+                        ) 
 
                 if not object_detected:
                     detection_label = "No detection"
@@ -162,6 +165,8 @@ if __name__ == "__main__":
                     detection_label = f"Measurement: x={measurement.x:.4f}, y={measurement.y:.4f}, z={measurement.z:.4f}"
 
                 # Track the object state and update the platform planner.
+                if PRINT_DETECTION: # FOR DEBUG ONLY
+                    print(f"measurement age: {(time.perf_counter() - frame_time)*1000:.1f} ms")
                 track_status = tracker.update(object_detected, measurement, frame_time)
                 platform.update(tracker=tracker)
 
