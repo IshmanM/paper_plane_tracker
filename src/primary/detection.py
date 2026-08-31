@@ -1,11 +1,11 @@
 import cv2
 import numpy as np
 from collections import Counter
-from itertools import combinations
+from itertools import combinations, permutations
 
 from src.primary.camera.camera_calibration import CameraCalibration
 from src.primary.geometry import estimateObjectWorldPosition
-from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec, ObjectVisionSpecId
+from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec, ObjectVisionSpecId, getRigidPlaneIntersection
 from src.primary.color import COLOR_SPECS, ColorId
 
 
@@ -1199,140 +1199,297 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
     if not detection.shapes:
         return failed_measurement
 
-    # Keep each marker paired with the rigid plane that defines its local-to-object transform.
-    plane_marker_specs = [
-        (rigid_plane, marker)
-        for rigid_plane in object_vision_spec.rigid_planes
-        for marker in rigid_plane.shape_markers
-        if marker.num_sides != 0
-    ]
-    marker_indices_by_key: dict[tuple[ColorId, int], list[int]] = {}
+    # Precompute every physical polygon marker in the model. Marker identity is intentionally
+    # plane-level rather than globally unique: different planes may reuse the same color/shape.
+    plane_marker_specs = []
+    marker_counts_by_plane = Counter()
 
-    for marker_index, (_, marker) in enumerate(plane_marker_specs):
-        marker_indices_by_key.setdefault((marker.color_id, marker.num_sides), []).append(marker_index)
+    for rigid_plane in object_vision_spec.rigid_planes:
+        for marker in rigid_plane.shape_markers:
+            if marker.num_sides == 0:
+                continue
+            if marker.object_vertices_m is None:
+                raise ValueError(f"Shape marker {(marker.color_id, marker.num_sides)} has no object_vertices_m")
 
-    object_point_groups, image_point_groups, used_marker_indices = [], [], set()
+            marker_vertices_plane_xy_m = np.asarray(marker.object_vertices_m, dtype=np.float64)
+            num_vertices = marker.num_sides
 
-    # Match each detected polygon to its physical marker and determine vertex correspondence.
-    for shape in detection.shapes:
-        marker_key = (shape.color_id, shape.num_sides)
-        available_marker_indices = [
-            marker_index for marker_index in marker_indices_by_key.get(marker_key, [])
-            if marker_index not in used_marker_indices
-        ]
+            if marker_vertices_plane_xy_m.shape != (num_vertices, 2):
+                raise ValueError(f"object_vertices_m for {(marker.color_id, marker.num_sides)} must have shape ({num_vertices}, 2)")
+            if not np.all(np.isfinite(marker_vertices_plane_xy_m)):
+                return failed_measurement
 
-        if len(available_marker_indices) != 1:
-            raise ValueError(f"Detected marker {marker_key} must match exactly one unused shape marker")
+            marker_vertices_plane_m = np.column_stack((marker_vertices_plane_xy_m, np.zeros(num_vertices, dtype=np.float64)))
+            marker_vertices_object_m = (rigid_plane.rotation_object_from_plane@marker_vertices_plane_m.T).T + rigid_plane.translation_object_from_plane_m
 
-        marker_index = available_marker_indices[0]
-        rigid_plane, marker = plane_marker_specs[marker_index]
+            edge_pairs = [(i, (i + 1)%num_vertices) for i in range(num_vertices)]
+            object_edge_lengths = np.array([
+                np.linalg.norm(marker_vertices_plane_xy_m[i] - marker_vertices_plane_xy_m[j])
+                for i, j in edge_pairs
+            ])
+            object_shape_norm = np.linalg.norm(object_edge_lengths)
 
-        if marker.object_vertices_m is None:
-            raise ValueError(f"Shape marker {marker_key} has no object_vertices_m")
+            if object_shape_norm <= 1e-12:
+                raise ValueError(f"object_vertices_m for {(marker.color_id, marker.num_sides)} form a degenerate shape")
+            if not np.all(np.isfinite(marker_vertices_object_m)):
+                return failed_measurement
 
-        marker_vertices_plane_xy_m = np.asarray(marker.object_vertices_m, dtype=np.float64)
+            plane_marker_specs.append((
+                rigid_plane, marker, marker_vertices_object_m,
+                object_edge_lengths/object_shape_norm,
+            ))
+            marker_counts_by_plane[rigid_plane.plane_id] += 1
+
+    if not plane_marker_specs:
+        return failed_measurement
+
+    # For every detected-shape / physical-marker pair with the same (color, side count), find
+    # the best cyclic/reversed vertex correspondence and record its scale-independent shape error.
+    marker_matches = {}
+
+    for shape_index, shape in enumerate(detection.shapes):
         shape_vertices_px = np.asarray(shape.vertices_px, dtype=np.float64)
-        num_vertices = marker.num_sides
 
-        if marker_vertices_plane_xy_m.shape != (num_vertices, 2):
-            raise ValueError(f"object_vertices_m for {marker_key} must have shape ({num_vertices}, 2)")
-        if shape_vertices_px.shape != (num_vertices, 2):
-            raise ValueError(f"vertices_px for {marker_key} must have shape ({num_vertices}, 2)")
-        if not np.all(np.isfinite(marker_vertices_plane_xy_m)) or not np.all(np.isfinite(shape_vertices_px)):
+        if shape_vertices_px.shape != (shape.num_sides, 2) or not np.all(np.isfinite(shape_vertices_px)):
             return failed_measurement
 
-        # Marker vertices are plane-local (x, y), with local z=0. Rotate first, then translate into the common object/reference frame.
-        marker_vertices_plane_m = np.column_stack((marker_vertices_plane_xy_m, np.zeros(num_vertices, dtype=np.float64)))
-        marker_vertices_object_m = (rigid_plane.rotation_object_from_plane@marker_vertices_plane_m.T).T + rigid_plane.translation_object_from_plane_m
-
-        if not np.all(np.isfinite(marker_vertices_object_m)):
-            return failed_measurement
-
-        edge_pairs = [(i, (i + 1)%num_vertices) for i in range(num_vertices)]
-        object_edge_lengths = np.array([np.linalg.norm(marker_vertices_plane_xy_m[i] - marker_vertices_plane_xy_m[j]) for i, j in edge_pairs])
-        object_shape_norm = np.linalg.norm(object_edge_lengths)
-
-        if object_shape_norm <= 1e-12:
-            raise ValueError(f"object_vertices_m for {marker_key} form a degenerate shape")
-
-        normalized_object_edge_lengths = object_edge_lengths/object_shape_norm
-        best_vertices_px, best_shape_error = None, float("inf")
-
-        # Polygon vertices arrive in perimeter order, so only cyclic shifts and reversed cyclic shifts are possible.
-        vertex_orders = []
-        for start_index in range(num_vertices):
-            vertex_orders.append([(start_index + offset)%num_vertices for offset in range(num_vertices)])
-            vertex_orders.append([(start_index - offset)%num_vertices for offset in range(num_vertices)])
-
-        for vertex_order in vertex_orders:
-            ordered_vertices_px = shape_vertices_px[vertex_order]
-            image_edge_lengths = np.array([np.linalg.norm(ordered_vertices_px[i] - ordered_vertices_px[j]) for i, j in edge_pairs])
-            image_shape_norm = np.linalg.norm(image_edge_lengths)
-
-            if image_shape_norm <= 1e-12:
+        for marker_index, (_, marker, _, normalized_object_edge_lengths) in enumerate(plane_marker_specs):
+            if shape.color_id != marker.color_id or shape.num_sides != marker.num_sides:
                 continue
 
-            shape_error = float(np.linalg.norm(image_edge_lengths/image_shape_norm - normalized_object_edge_lengths))
+            num_vertices = marker.num_sides
+            edge_pairs = [(i, (i + 1)%num_vertices) for i in range(num_vertices)]
+            best_vertices_px, best_shape_error = None, float("inf")
 
-            if shape_error < best_shape_error:
-                best_vertices_px, best_shape_error = ordered_vertices_px, shape_error
+            # Polygon vertices arrive in perimeter order, so only cyclic shifts and reversed cyclic shifts are possible.
+            for start_index in range(num_vertices):
+                for direction in (1, -1):
+                    vertex_order = [(start_index + direction*offset)%num_vertices for offset in range(num_vertices)]
+                    ordered_vertices_px = shape_vertices_px[vertex_order]
+                    image_edge_lengths = np.array([
+                        np.linalg.norm(ordered_vertices_px[i] - ordered_vertices_px[j])
+                        for i, j in edge_pairs
+                    ])
+                    image_shape_norm = np.linalg.norm(image_edge_lengths)
 
-        if best_vertices_px is None:
-            return failed_measurement
+                    if image_shape_norm <= 1e-12:
+                        continue
 
-        object_point_groups.append(marker_vertices_object_m)
-        image_point_groups.append(best_vertices_px)
-        used_marker_indices.add(marker_index)
+                    shape_error = float(np.linalg.norm(image_edge_lengths/image_shape_norm - normalized_object_edge_lengths))
+                    if shape_error < best_shape_error:
+                        best_vertices_px, best_shape_error = ordered_vertices_px, shape_error
 
-    # All visible markers are now expressed in one common object frame, including each rigid plane's R and t.
-    object_points = np.concatenate(object_point_groups, axis=0)
-    image_points = np.concatenate(image_point_groups, axis=0)
+            if best_vertices_px is not None:
+                marker_matches[(shape_index, marker_index)] = (best_vertices_px, best_shape_error)
 
-    solution_count, rotation_vectors, translation_vectors, _ = cv2.solvePnPGeneric(
-        object_points, image_points, camera_calibration.camera_matrix, camera_calibration.distortion_coefficients, flags=cv2.SOLVEPNP_SQPNP,
-    )
-
-    if not solution_count:
+    if not marker_matches:
         return failed_measurement
 
-    # FOR DEBUG ONLY
-    # print(f"solutions: {solution_count}")
+    planes_by_id = {rigid_plane.plane_id: rigid_plane for rigid_plane in object_vision_spec.rigid_planes}
+    marker_indices_by_plane = {
+        plane_id: [
+            marker_index for marker_index, (rigid_plane, _, _, _) in enumerate(plane_marker_specs)
+            if rigid_plane.plane_id == plane_id
+        ]
+        for plane_id in planes_by_id
+    }
+    connections_by_pair = {
+        frozenset((plane_id_1, plane_id_2)): (plane_id_1, plane_id_2, max_rotation_deg)
+        for plane_id_1, plane_id_2, max_rotation_deg in object_vision_spec.rigid_plane_connections
+    }
 
-    # for i, (rotation_vector, translation_vector) in enumerate(zip(rotation_vectors, translation_vectors)):
-    #     projected_points, _ = cv2.projectPoints(
-    #         object_points, rotation_vector, translation_vector,
-    #         camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
-    #     )
-    #     reprojection_error = float(np.sqrt(np.mean(np.sum(
-    #         (projected_points.reshape(-1, 2) - image_points)**2, axis=1,
-    #     ))))
-    #     print(
-    #         f"{i}: x={translation_vector[0, 0]:.3f}, "
-    #         f"y={translation_vector[1, 0]:.3f}, "
-    #         f"z={translation_vector[2, 0]:.3f}, "
-    #         f"error={reprojection_error:.17f}"
-    #     )
+    # Try each plane independently and each configured hinge pair. If a model has no flexible
+    # connections, also preserve the old behavior of allowing all rigid planes to participate together.
+    candidate_plane_groups = [(plane_id,) for plane_id in planes_by_id]
+    candidate_plane_groups += [(plane_id_1, plane_id_2) for plane_id_1, plane_id_2, _ in object_vision_spec.rigid_plane_connections]
 
-    best_translation, best_reprojection_error = None, float("inf")
+    if not object_vision_spec.rigid_plane_connections and len(planes_by_id) > 1:
+        candidate_plane_groups.append(tuple(planes_by_id))
 
-    # PnP translation is the common object-frame origin in camera coordinates.
-    # Reject poses behind the camera and select the solution that best reproduces the detected vertices.
-    for rotation_vector, translation_vector in zip(rotation_vectors, translation_vectors):
-        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-        camera_points = (rotation_matrix@object_points.T + translation_vector.reshape(3, 1)).T
+    best_result = None
+    best_rank = None
 
-        if np.any(camera_points[:, 2] <= 0.0):
+    for plane_group in candidate_plane_groups:
+        group_marker_indices = [marker_index for plane_id in plane_group for marker_index in marker_indices_by_plane[plane_id]]
+        if not group_marker_indices:
             continue
 
-        projected_points, _ = cv2.projectPoints(
-            object_points, rotation_vector, translation_vector, camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
+        # Find the largest one-to-one assignment between detected shapes and the marker multiset
+        # on this plane/group. Partial marker visibility is allowed, but only after larger matches fail.
+        best_assignment, best_assignment_shape_error = None, float("inf")
+        maximum_match_count = min(len(detection.shapes), len(group_marker_indices))
+
+        for match_count in range(maximum_match_count, 0, -1):
+            for shape_indices in combinations(range(len(detection.shapes)), match_count):
+                for selected_marker_indices in combinations(group_marker_indices, match_count):
+                    for ordered_marker_indices in permutations(selected_marker_indices):
+                        assignment = list(zip(shape_indices, ordered_marker_indices))
+
+                        if any(pair not in marker_matches for pair in assignment):
+                            continue
+
+                        represented_plane_ids = {
+                            plane_marker_specs[marker_index][0].plane_id
+                            for _, marker_index in assignment
+                        }
+
+                        # A hinge candidate only counts as a two-plane observation if both sides are actually represented.
+                        if len(plane_group) == 2 and len(represented_plane_ids) != 2:
+                            continue
+
+                        total_shape_error = sum(marker_matches[pair][1] for pair in assignment)
+                        if total_shape_error < best_assignment_shape_error:
+                            best_assignment = assignment
+                            best_assignment_shape_error = total_shape_error
+
+            if best_assignment is not None:
+                break
+
+        if best_assignment is None:
+            continue
+
+        matched_counts_by_plane = Counter(
+            plane_marker_specs[marker_index][0].plane_id
+            for _, marker_index in best_assignment
         )
-        reprojection_error = float(np.sqrt(np.mean(np.sum((projected_points.reshape(-1, 2) - image_points)**2, axis=1))))
+        matched_count = len(best_assignment)
+        represented_plane_count = len(matched_counts_by_plane)
+        full_plane_count = sum(
+            matched_counts_by_plane[plane_id] == marker_counts_by_plane[plane_id]
+            for plane_id in matched_counts_by_plane
+        )
+        total_group_marker_count = sum(marker_counts_by_plane[plane_id] for plane_id in plane_group)
+        marker_coverage = matched_count/max(total_group_marker_count, 1)
+        mean_shape_error = best_assignment_shape_error/matched_count
 
-        if reprojection_error < best_reprojection_error:
-            best_translation, best_reprojection_error = translation_vector.reshape(3), reprojection_error
+        connection = connections_by_pair.get(frozenset(plane_group)) if len(plane_group) == 2 else None
+        hinge_point = hinge_direction = None
+        coarse_angles_deg = np.array([0.0])
 
-    if best_translation is None or not np.all(np.isfinite(best_translation)):
+        if connection is not None:
+            plane_id_1, plane_id_2, max_rotation_deg = connection
+            hinge_point, hinge_direction = getRigidPlaneIntersection(planes_by_id[plane_id_1], planes_by_id[plane_id_2])
+            coarse_angles_deg = (
+                np.linspace(-max_rotation_deg, max_rotation_deg, 7)
+                if max_rotation_deg > 0.0 else np.array([0.0])
+            )
+
+        def evaluateFlexAngle(flex_angle_deg: float) -> tuple[np.ndarray | None, float]:
+            object_point_groups, image_point_groups = [], []
+            rotation_1 = rotation_2 = None
+
+            if connection is not None:
+                half_angle_rad = np.deg2rad(flex_angle_deg/2.0)
+                rotation_1, _ = cv2.Rodrigues(-half_angle_rad*hinge_direction)
+                rotation_2, _ = cv2.Rodrigues(+half_angle_rad*hinge_direction)
+
+            for shape_index, marker_index in best_assignment:
+                rigid_plane, _, nominal_object_points, _ = plane_marker_specs[marker_index]
+                object_points = nominal_object_points
+
+                if connection is not None:
+                    if rigid_plane.plane_id == plane_id_1:
+                        object_points = (rotation_1@(object_points - hinge_point).T).T + hinge_point
+                    elif rigid_plane.plane_id == plane_id_2:
+                        object_points = (rotation_2@(object_points - hinge_point).T).T + hinge_point
+
+                object_point_groups.append(object_points)
+                image_point_groups.append(marker_matches[(shape_index, marker_index)][0])
+
+            object_points = np.concatenate(object_point_groups, axis=0)
+            image_points = np.concatenate(image_point_groups, axis=0)
+
+            solution_count, rotation_vectors, translation_vectors, _ = cv2.solvePnPGeneric(
+                object_points, image_points,
+                camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
+                flags=cv2.SOLVEPNP_SQPNP,
+            )
+
+            if not solution_count:
+                return None, float("inf")
+
+            best_translation, best_reprojection_error = None, float("inf")
+
+            for rotation_vector, translation_vector in zip(rotation_vectors, translation_vectors):
+                rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+                camera_points = (rotation_matrix@object_points.T + translation_vector.reshape(3, 1)).T
+
+                if np.any(camera_points[:, 2] <= 0.0):
+                    continue
+
+                projected_points, _ = cv2.projectPoints(
+                    object_points, rotation_vector, translation_vector,
+                    camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
+                )
+                reprojection_error = float(np.sqrt(np.mean(np.sum(
+                    (projected_points.reshape(-1, 2) - image_points)**2, axis=1,
+                ))))
+
+                if reprojection_error < best_reprojection_error:
+                    best_translation = translation_vector.reshape(3)
+                    best_reprojection_error = reprojection_error
+
+            return best_translation, best_reprojection_error
+
+        best_translation, best_reprojection_error, best_flex_angle_deg = None, float("inf"), 0.0
+
+        for flex_angle_deg in coarse_angles_deg:
+            translation, reprojection_error = evaluateFlexAngle(float(flex_angle_deg))
+            if reprojection_error < best_reprojection_error:
+                best_translation = translation
+                best_reprojection_error = reprojection_error
+                best_flex_angle_deg = float(flex_angle_deg)
+
+        # Refine a flexible pair near the best coarse angle at approximately 1-degree resolution.
+        if connection is not None and max_rotation_deg > 0.0 and best_translation is not None:
+            coarse_step_deg = 2.0*max_rotation_deg/6.0
+            fine_min = max(-max_rotation_deg, best_flex_angle_deg - coarse_step_deg)
+            fine_max = min(+max_rotation_deg, best_flex_angle_deg + coarse_step_deg)
+            fine_angles_deg = np.unique(np.concatenate((
+                np.arange(fine_min, fine_max + 0.5, 1.0),
+                np.array([fine_min, best_flex_angle_deg, fine_max]),
+            )))
+
+            for flex_angle_deg in fine_angles_deg:
+                translation, reprojection_error = evaluateFlexAngle(float(flex_angle_deg))
+                if reprojection_error < best_reprojection_error:
+                    best_translation = translation
+                    best_reprojection_error = reprojection_error
+                    best_flex_angle_deg = float(flex_angle_deg)
+
+        if best_translation is None or not np.all(np.isfinite(best_translation)):
+            continue
+
+        # Ordered criteria avoid arbitrary weighted coefficients:
+        #   1) more matched markers, 2) more fully observed planes, 3) greater marker-set
+        #   completeness, 4) evidence from more planes, then geometric fit quality.
+        candidate_rank = (
+            matched_count,
+            full_plane_count,
+            marker_coverage,
+            represented_plane_count,
+            -best_reprojection_error,
+            -mean_shape_error,
+        )
+
+        if best_rank is None or candidate_rank > best_rank:
+            best_rank = candidate_rank
+            best_result = (
+                best_translation, best_reprojection_error, best_flex_angle_deg,
+                connection, matched_count, total_group_marker_count,
+            )
+
+    if best_result is None:
         return failed_measurement
 
+    best_translation, best_reprojection_error, best_flex_angle_deg, best_connection, matched_count, total_group_marker_count = best_result
+
+    if best_connection is not None:
+        plane_id_1, plane_id_2, _ = best_connection
+        print(
+            f"flex {plane_id_1}<->{plane_id_2}: {best_flex_angle_deg:+.1f} deg | "
+            f"markers={matched_count}/{total_group_marker_count} | reprojection={best_reprojection_error:.2f} px"
+        )
+
     return Measurement(float(best_translation[0]), float(best_translation[1]), float(best_translation[2]), None, None, None,)
+
