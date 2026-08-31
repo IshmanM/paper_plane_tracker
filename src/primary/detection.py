@@ -983,7 +983,7 @@ def findSingleObjectUsingBestShapeGroup(
     # Paper-plane acquisition mirrors the useful first stages of the tennis-ball detector:
     # LAB chroma response -> LAB hotspots -> candidate ROIs -> loose HSV seed. The existing
     # polygon/straight-edge refinement remains responsible for the actual marker geometry.
-    LAB_ACQUISITION_SCALE = 0.5
+    LAB_ACQUISITION_SCALE = 0.4
     GLOBAL_BLUR_KERNEL = (5, 5)
     HOTSPOT_PERCENTILE = 98.5
     MIN_HOTSPOT_RESPONSE_FACTOR = 0.30
@@ -991,12 +991,12 @@ def findSingleObjectUsingBestShapeGroup(
     MIN_HOTSPOT_AREA_PX_FULL_RES = 6
     HOTSPOT_PADDING_FACTOR = 0.75
     MIN_HOTSPOT_PADDING_PX = 10
-    EXTRA_HOTSPOT_CANDIDATES = 2
+    EXTRA_HOTSPOT_CANDIDATES = 1
 
     # Full-resolution HSV is evaluated only around LAB hotspots. Start generously, then
     # automatically expand and retry if a selected HSV component reaches an ROI edge.
     # This keeps the ROI optimization from clipping long/acute marker shapes.
-    HSV_ROI_PADDING_FACTOR = 1.25
+    HSV_ROI_PADDING_FACTOR = 0.80
     MIN_HSV_ROI_PADDING_PX = 16
     HSV_ROI_EXPANSION_FACTOR = 0.50
     MAX_HSV_ROI_EXPANSIONS = 4
