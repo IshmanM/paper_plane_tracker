@@ -27,9 +27,15 @@ DEFAULT_DISPLAY_COLUMNS = 3
 DEFAULT_WINDOW_WIDTH = 1600
 DEFAULT_WINDOW_HEIGHT = 900
 
-STATUS_BAR_HEIGHT = 32
+STATUS_BAR_HEIGHT = 58
 ZOOM_STEP = 1.25
 MAX_ZOOM = 10.0
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+
+# cv2.waitKeyEx arrow-key codes used by common Windows/Linux backends.
+LEFT_ARROW_KEYS = {2424832, 65361}
+RIGHT_ARROW_KEYS = {2555904, 65363}
 
 
 class DetectionAlgorithm(Enum):
@@ -69,6 +75,20 @@ def chooseOption(title: str, options: list) -> object:
                 return option
 
         print("Enter one of the listed numbers or names.")
+
+
+def naturalPathKey(path: Path) -> list:
+    return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", path.name)]
+
+
+def getReferenceImages(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        return []
+
+    return sorted(
+        [path for path in directory.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS],
+        key=naturalPathKey,
+    )
 
 
 def createStageGridImage(stages: list[tuple[str, np.ndarray]], columns: int) -> np.ndarray:
@@ -131,7 +151,6 @@ def createStageGridImage(stages: list[tuple[str, np.ndarray]], columns: int) -> 
 def saveDetectionStages(stages: list[tuple[str, np.ndarray]], output_directory: Path) -> None:
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    # Delete only old debug images belonging to this ObjectVisionSpecId.
     for old_image_path in output_directory.glob("*.png"):
         old_image_path.unlink()
 
@@ -145,10 +164,14 @@ def saveDetectionStages(stages: list[tuple[str, np.ndarray]], output_directory: 
     print(f"Saved {len(stages)} stages to {output_directory.resolve()}")
 
 
-def showDetectionStages(stages: list[tuple[str, np.ndarray]], columns: int, output_directory: Path) -> None:
+def showDetectionStages(
+    stages: list[tuple[str, np.ndarray]], columns: int, output_directory: Path,
+    image_name: str, image_index: int, image_count: int,
+) -> int:
+    """Return -1 for previous image, +1 for next image, 0 to quit."""
     if not stages:
         print("No debug stages were recorded.")
-        return
+        return 0
 
     canvas = createStageGridImage(stages, columns)
     canvas_height, canvas_width = canvas.shape[:2]
@@ -256,34 +279,148 @@ def showDetectionStages(stages: list[tuple[str, np.ndarray]], columns: int, outp
 
         cv2.putText(
             display_image,
-            f"Wheel or +/-: zoom    Drag: pan    R/double-click: reset    S: save stages    Q/Esc: quit    Zoom: {state['zoom']:.2f}x",
-            (10, viewport_height + 22),
+            f"Image {image_index + 1}/{image_count}: {image_name}",
+            (10, viewport_height + 20),
             cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+            (255, 255, 255), 1, cv2.LINE_AA,
+        )
+        cv2.putText(
+            display_image,
+            f"A/Left: previous    D/Right: next    Wheel or +/-: zoom    Drag: pan    R: reset    S: save    Q/Esc: quit    Zoom: {state['zoom']:.2f}x",
+            (10, viewport_height + 45),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
             (225, 225, 225), 1, cv2.LINE_AA,
         )
 
         cv2.imshow(WINDOW_NAME, display_image)
-        key = cv2.waitKey(16) & 0xFF
+        key = cv2.waitKeyEx(16)
 
-        if key in (ord("q"), 27):
-            break
-        elif key in (ord("r"), ord("0")):
+        if key in (ord("q"), ord("Q"), 27):
+            cv2.destroyWindow(WINDOW_NAME)
+            return 0
+        elif key in (ord("a"), ord("A"), ord("p"), ord("P")) or key in LEFT_ARROW_KEYS:
+            cv2.destroyWindow(WINDOW_NAME)
+            return -1
+        elif key in (ord("d"), ord("D"), ord("n"), ord("N")) or key in RIGHT_ARROW_KEYS:
+            cv2.destroyWindow(WINDOW_NAME)
+            return 1
+        elif key in (ord("r"), ord("R"), ord("0")):
             resetView()
         elif key in (ord("+"), ord("=")):
             zoomAt(state["window_width"]//2, getViewportHeight()//2, ZOOM_STEP)
         elif key in (ord("-"), ord("_")):
             zoomAt(state["window_width"]//2, getViewportHeight()//2, 1.0/ZOOM_STEP)
-        elif key == ord("s"):
+        elif key in (ord("s"), ord("S")):
             saveDetectionStages(stages, output_directory)
 
-    cv2.destroyAllWindows()
+    cv2.destroyWindow(WINDOW_NAME)
+    return 0
+
+
+def runDetectionOnImage(
+    image_path: Path, algorithm: DetectionAlgorithm, object_vision_spec, camera_calibration: CameraCalibration,
+) -> tuple[list[tuple[str, np.ndarray]], object, object]:
+    frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+
+    if frame is None:
+        raise RuntimeError(f"OpenCV could not read: {image_path}")
+
+    frame_height, frame_width = frame.shape[:2]
+    if frame_width != config.FRAME_W or frame_height != config.FRAME_H:
+        raise ValueError(
+            f"Reference image is {frame_width}x{frame_height}, "
+            f"but config expects {config.FRAME_W}x{config.FRAME_H}."
+        )
+
+    debug = DetectionDebug()
+    detection = None
+    measurement = None
+
+    if algorithm == DetectionAlgorithm.SHAPE_GROUP:
+        detection = findSingleObjectUsingBestShapeGroup(frame, object_vision_spec, debug)
+        if detection is not None:
+            measurement = createMeasurementUsingShapeGroup(detection, object_vision_spec, camera_calibration)
+
+    elif algorithm == DetectionAlgorithm.SPHERE:
+        detection = findSingleObjectSphere(frame, object_vision_spec, debug)
+        if detection is not None:
+            x, y, z = estimateObjectWorldPosition(
+                detection.u, detection.v, detection.px_w, detection.px_h,
+                object_vision_spec.width, camera_calibration,
+            )
+            measurement = Measurement(x, y, z)
+
+    elif algorithm == DetectionAlgorithm.ARUCO_MARKER:
+        _, detection, measurement = detectArucoMarker(frame, object_vision_spec, camera_calibration)
+
+    else:
+        raise ValueError(f"Unsupported detection algorithm: {algorithm}")
+
+    print()
+    print(f"Input image: {image_path.resolve()}")
+    print(f"Image size: {frame_width} x {frame_height}")
+
+    detection_available = detection is not None and detection.u is not None
+
+    if not detection_available:
+        print("Detection result: no object detected")
+        print("Measurement result: unavailable")
+    else:
+        print("Detection result:")
+        print(f"  u: {detection.u:.2f} px")
+        print(f"  v: {detection.v:.2f} px")
+        print(f"  width: {detection.px_w:.2f} px")
+        print(f"  height: {detection.px_h:.2f} px")
+        print(f"  shapes: {len(detection.shapes)}")
+
+        final_frame = frame.copy()
+        drawDetection(final_frame, detection)
+
+        measurement_available = (
+            measurement is not None
+            and measurement.x is not None
+            and measurement.y is not None
+            and measurement.z is not None
+        )
+
+        if measurement_available:
+            print("Measurement result:")
+            print(f"  x: {measurement.x:.4f} m")
+            print(f"  y: {measurement.y:.4f} m")
+            print(f"  z: {measurement.z:.4f} m")
+
+            measurement_lines = [
+                f"x: {measurement.x:.4f} m",
+                f"y: {measurement.y:.4f} m",
+                f"z: {measurement.z:.4f} m",
+            ]
+
+            if algorithm == DetectionAlgorithm.SHAPE_GROUP:
+                drawModelOrigin(final_frame, measurement, camera_calibration)
+                print("  yellow X: projected model origin")
+                measurement_lines.append("yellow X: model origin")
+        else:
+            print("Measurement result: unavailable")
+            measurement_lines = ["Measurement unavailable"]
+
+        for line_index, line in enumerate(measurement_lines):
+            line_y = 35 + line_index*28
+            cv2.putText(final_frame, line, (20, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(final_frame, line, (20, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+        debug.addStage("Final detection + measurement", final_frame)
+
+    print(f"Recorded stages: {len(debug.stages)}")
+    return debug.stages, detection, measurement
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run a selected detection algorithm on one reference image and inspect its processing stages.")
+    parser = argparse.ArgumentParser(
+        description="Run a selected detection algorithm on reference images and inspect its processing stages."
+    )
 
     parser.add_argument("image_path", type=Path, nargs="?", default=None,
-                        help="Input image path. Default: reference_1.png inside the selected ObjectVisionSpecId reference folder.")
+                        help="Optional initial image. If omitted, reference_1.png (or the first image) in the selected spec folder is used.")
 
     parser.add_argument("--algorithm", choices=[algorithm.name for algorithm in DetectionAlgorithm],
                         help="Detection algorithm. If omitted, you will be required to select one.")
@@ -340,130 +477,53 @@ def main() -> None:
         )
 
     object_vision_spec = OBJECT_VISION_SPECS[object_vision_spec_id]
-
     reference_directory = args.reference_dir/object_vision_spec_id.name.lower()
     output_directory = args.save_dir/object_vision_spec_id.name.lower()
-    image_path = args.image_path if args.image_path is not None else reference_directory/"reference_1.png"
 
-    if not image_path.is_file():
-        parser.error(f"Image does not exist: {image_path}")
+    # If an explicit image is supplied, navigate among other images in that image's folder.
+    # Otherwise navigate the selected ObjectVisionSpecId's normal reference folder.
+    if args.image_path is not None:
+        if not args.image_path.is_file():
+            parser.error(f"Image does not exist: {args.image_path}")
+        image_paths = getReferenceImages(args.image_path.parent)
+        if args.image_path not in image_paths:
+            image_paths.append(args.image_path)
+            image_paths.sort(key=naturalPathKey)
+        image_index = image_paths.index(args.image_path)
+    else:
+        image_paths = getReferenceImages(reference_directory)
+        if not image_paths:
+            parser.error(f"No reference images found in: {reference_directory}")
 
-    frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
-
-    if frame is None:
-        raise RuntimeError(f"OpenCV could not read: {image_path}")
-
-    frame_height, frame_width = frame.shape[:2]
-
-    if frame_width != config.FRAME_W or frame_height != config.FRAME_H:
-        raise ValueError(
-            f"Reference image is {frame_width}x{frame_height}, "
-            f"but config expects {config.FRAME_W}x{config.FRAME_H}."
-        )
+        preferred_path = reference_directory/"reference_1.png"
+        image_index = image_paths.index(preferred_path) if preferred_path in image_paths else 0
 
     camera_calibration = CameraCalibration(config.CAMERA_CALIBRATION_PATH, config.FRAME_W, config.FRAME_H)
-    debug = DetectionDebug()
-
-    detection = None
-    measurement = None
-
-    if algorithm == DetectionAlgorithm.SHAPE_GROUP:
-        detection = findSingleObjectUsingBestShapeGroup(frame, object_vision_spec, debug)
-
-        if detection is not None:
-            measurement = createMeasurementUsingShapeGroup(detection, object_vision_spec, camera_calibration)
-
-    elif algorithm == DetectionAlgorithm.SPHERE:
-        detection = findSingleObjectSphere(frame, object_vision_spec, camera_calibration, debug)
-
-        if detection is not None:
-            x, y, z = estimateObjectWorldPosition(
-                detection.u, detection.v,
-                detection.px_w, detection.px_h,
-                object_vision_spec.width,
-                camera_calibration,
-            )
-            measurement = Measurement(x, y, z)
-
-    elif algorithm == DetectionAlgorithm.ARUCO_MARKER:
-        _, detection, measurement = detectArucoMarker(frame, object_vision_spec, camera_calibration)
-
-    else:
-        raise ValueError(f"Unsupported detection algorithm: {algorithm}")
 
     print(f"Algorithm: {algorithm.name}")
     print(f"ObjectVisionSpecId: {object_vision_spec_id.name}")
-    print(f"Input image: {image_path.resolve()}")
-    print(f"Image size: {frame_width} x {frame_height}")
+    print(f"Reference images: {len(image_paths)}")
     print(f"Debug save directory: {output_directory.resolve()}")
 
-    detection_available = detection is not None and detection.u is not None
+    if args.no_gui:
+        runDetectionOnImage(image_paths[image_index], algorithm, object_vision_spec, camera_calibration)
+        return
 
-    if not detection_available:
-        print("Detection result: no object detected")
-        print("Measurement result: unavailable")
+    print("Viewer: A/Left/P = previous | D/Right/N = next | S = save stages | Q/Esc = quit")
 
-    else:
-        print("Detection result:")
-        print(f"  u: {detection.u:.2f} px")
-        print(f"  v: {detection.v:.2f} px")
-        print(f"  width: {detection.px_w:.2f} px")
-        print(f"  height: {detection.px_h:.2f} px")
-        print(f"  shapes: {len(detection.shapes)}")
+    while True:
+        image_path = image_paths[image_index]
+        stages, _, _ = runDetectionOnImage(image_path, algorithm, object_vision_spec, camera_calibration)
 
-        final_frame = frame.copy()
-        drawDetection(final_frame, detection)
-
-        measurement_available = (
-            measurement is not None
-            and measurement.x is not None
-            and measurement.y is not None
-            and measurement.z is not None
+        navigation = showDetectionStages(
+            stages, args.columns, output_directory,
+            image_path.name, image_index, len(image_paths),
         )
 
-        if measurement_available:
-            print("Measurement result:")
-            print(f"  x: {measurement.x:.4f} m")
-            print(f"  y: {measurement.y:.4f} m")
-            print(f"  z: {measurement.z:.4f} m")
+        if navigation == 0:
+            break
 
-            measurement_lines = [
-                f"x: {measurement.x:.4f} m",
-                f"y: {measurement.y:.4f} m",
-                f"z: {measurement.z:.4f} m",
-            ]
-
-            if algorithm == DetectionAlgorithm.SHAPE_GROUP:
-                drawModelOrigin(final_frame, measurement, camera_calibration)
-                print("  yellow X: projected model origin")
-                measurement_lines.append("yellow X: model origin")
-
-        else:
-            print("Measurement result: unavailable")
-            measurement_lines = ["Measurement unavailable"]
-
-        for line_index, line in enumerate(measurement_lines):
-            line_y = 35 + line_index*28
-
-            cv2.putText(
-                final_frame, line, (20, line_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (0, 0, 0), 4, cv2.LINE_AA,
-            )
-
-            cv2.putText(
-                final_frame, line, (20, line_y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                (255, 255, 255), 2, cv2.LINE_AA,
-            )
-
-        debug.addStage("Final detection + measurement", final_frame)
-
-    print(f"Recorded stages: {len(debug.stages)}")
-
-    if not args.no_gui:
-        print("Press S in the detection-stage window to save/replace this object's debug images.")
-        showDetectionStages(debug.stages, args.columns, output_directory)
+        image_index = (image_index + navigation) % len(image_paths)
 
 
 if __name__ == "__main__":
