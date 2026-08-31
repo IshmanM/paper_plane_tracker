@@ -12,7 +12,8 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from src.primary.object_vision_spec import (
     MODELS_DIR, OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec, ObjectVisionSpecId,
-    RigidPlaneSpec, ShapeMarkerSpec, loadObjectVisionSpecModel, saveObjectVisionSpecModel,
+    RigidPlaneSpec, ShapeMarkerSpec, getRigidPlaneIntersection,
+    loadObjectVisionSpecModel, saveObjectVisionSpecModel,
 )
 from src.primary.color import COLOR_SPECS, ColorId
 
@@ -22,6 +23,7 @@ PLANE_MARGIN_M = 0.015
 EMPTY_PLANE_HALF_SIZE_M = 0.03
 OBJECT_AXIS_LENGTH_M = 0.08
 PLANE_AXIS_LENGTH_M = 0.025
+HINGE_HALF_LENGTH_M = 0.08
 
 # Camera is on the +x, -y, +z side: front + top + left.
 ISOMETRIC_ELEV_DEG = 35.26438968
@@ -31,12 +33,12 @@ ISOMETRIC_ROLL_DEG = -120.0
 # Orthographic-style presets are rolled so the airplane is oriented naturally:
 # top/bottom keep the nose (+x) upward; front/back/left/right keep +y visually downward.
 VIEW_PRESETS = {
-    "Top": (0.0, -90.0, 90.0),       # camera on -y; +x up, +z left
-    "Front": (0.0, 0.0, -90.0),      # camera on +x; +y down
-    "Back": (0.0, 180.0, 90.0),      # camera on -x; +y down
-    "Left": (90.0, -90.0, 180.0),    # camera on +z; +y down, nose left
-    "Right": (-90.0, 90.0, 180.0),   # camera on -z; +y down, nose right
-    "Bottom": (0.0, 90.0, -90.0),    # camera on +y; +x up
+    "Top": (0.0, -90.0, 90.0),
+    "Front": (0.0, 0.0, -90.0),
+    "Back": (0.0, 180.0, 90.0),
+    "Left": (90.0, -90.0, 180.0),
+    "Right": (-90.0, 90.0, 180.0),
+    "Bottom": (0.0, 90.0, -90.0),
     "Isometric": (ISOMETRIC_ELEV_DEG, ISOMETRIC_AZIM_DEG, ISOMETRIC_ROLL_DEG),
 }
 
@@ -63,11 +65,13 @@ class EditableRigidPlane:
     def __init__(
         self, rotation: np.ndarray, translation: np.ndarray,
         shape_markers: list[EditableShape] | None = None, visible: bool = True,
+        plane_id: str | None = None,
     ):
         self.rotation_object_from_plane = np.asarray(rotation, dtype=np.float64)
         self.translation_object_from_plane_m = np.asarray(translation, dtype=np.float64)
         self.shape_markers = shape_markers if shape_markers is not None else []
         self.visible = visible
+        self.plane_id = plane_id
 
 
 class EdgePointSelection:
@@ -97,9 +101,18 @@ def copyModelFromSpec(object_vision_spec: ObjectVisionSpec) -> list[EditableRigi
             rigid_plane.rotation_object_from_plane.copy(),
             rigid_plane.translation_object_from_plane_m.copy(),
             shapes,
+            plane_id=rigid_plane.plane_id,
         ))
 
     return rigid_planes
+
+
+def editablePlaneToSpec(plane: EditableRigidPlane) -> RigidPlaneSpec:
+    return RigidPlaneSpec(
+        rotation_object_from_plane=plane.rotation_object_from_plane,
+        translation_object_from_plane_m=plane.translation_object_from_plane_m,
+        plane_id=plane.plane_id,
+    )
 
 
 def transformPlanePoints(points_xy: np.ndarray, rotation: np.ndarray, translation: np.ndarray) -> np.ndarray:
@@ -140,6 +153,7 @@ def setAxesEqual(ax, points: np.ndarray, zoom_factor: float = 1.0) -> None:
 
 def drawModel(
     ax, rigid_planes: list[EditableRigidPlane], object_type: ObjectType,
+    rigid_plane_connections: list[tuple[str, str, float]] | None = None,
     view_elev: float = ISOMETRIC_ELEV_DEG, view_azim: float = ISOMETRIC_AZIM_DEG, view_roll: float = 0.0,
     edge_pick_data: list | None = None, measurement_points: list[EdgePointSelection] | None = None,
     display_unit: str = DEFAULT_DISPLAY_UNIT, zoom_factor: float = 1.0,
@@ -147,6 +161,7 @@ def drawModel(
     ax.clear()
     all_points = [np.zeros(3)]
     measurement_points = measurement_points if measurement_points is not None else []
+    rigid_plane_connections = rigid_plane_connections if rigid_plane_connections is not None else []
 
     if edge_pick_data is not None:
         edge_pick_data.clear()
@@ -166,6 +181,7 @@ def drawModel(
     for plane_index, rigid_plane in enumerate(rigid_planes):
         rotation = rigid_plane.rotation_object_from_plane
         translation = rigid_plane.translation_object_from_plane_m
+        plane_label = rigid_plane.plane_id if rigid_plane.plane_id is not None else f"plane_{plane_index}"
 
         # Keep all planes in the axis limits even when hidden so visibility toggles do not change zoom.
         if rigid_plane.shape_markers:
@@ -183,11 +199,10 @@ def drawModel(
         all_points.extend(patch_object)
 
         if rigid_plane.visible:
-            # Plane-local +x, +y, and normal transformed into the object frame.
             local_axes_object = rotation@np.eye(3)
 
             for axis_index, (label, color) in enumerate(zip(
-                (f"P{plane_index} +x", f"P{plane_index} +y", f"P{plane_index} normal"),
+                (f"P{plane_index}/{plane_label} +x", f"P{plane_index}/{plane_label} +y", f"P{plane_index}/{plane_label} normal"),
                 ("tab:red", "tab:green", "tab:blue"),
             )):
                 vector = local_axes_object[:, axis_index]*PLANE_AXIS_LENGTH_M
@@ -207,7 +222,6 @@ def drawModel(
             b, g, r = COLOR_SPECS[shape.color_id].draw_bgr
             marker_color = (r/255.0, g/255.0, b/255.0)
 
-            # Draw each edge separately so clicks can select a continuous point on that exact edge.
             for edge_index in range(shape.num_sides):
                 point_a = vertices_object[edge_index]
                 point_b = vertices_object[(edge_index + 1)%shape.num_sides]
@@ -217,9 +231,7 @@ def drawModel(
                 )
 
                 if edge_pick_data is not None:
-                    edge_pick_data.append((
-                        plane_index, shape_index, edge_index, point_a.copy(), point_b.copy(),
-                    ))
+                    edge_pick_data.append((plane_index, shape_index, edge_index, point_a.copy(), point_b.copy()))
 
             ax.scatter(vertices_object[:, 0], vertices_object[:, 1], vertices_object[:, 2], color=[marker_color], s=42)
 
@@ -228,6 +240,29 @@ def drawModel(
 
             for vertex_index, vertex in enumerate(vertices_object):
                 ax.text(*vertex, f" {vertex_index}", color=marker_color, fontsize=8)
+
+    # Draw nominal auto-computed hinge axes for connected planes.
+    planes_by_id = {plane.plane_id: plane for plane in rigid_planes if plane.plane_id is not None}
+    for plane_id_1, plane_id_2, max_rotation_deg in rigid_plane_connections:
+        plane_1, plane_2 = planes_by_id.get(plane_id_1), planes_by_id.get(plane_id_2)
+        if plane_1 is None or plane_2 is None:
+            continue
+
+        try:
+            hinge_point, hinge_direction = getRigidPlaneIntersection(editablePlaneToSpec(plane_1), editablePlaneToSpec(plane_2))
+        except ValueError:
+            label_position = 0.5*(plane_1.translation_object_from_plane_m + plane_2.translation_object_from_plane_m)
+            ax.text(*label_position, f"invalid hinge: {plane_id_1} ↔ {plane_id_2}", color="darkorange", fontsize=8)
+            continue
+
+        point_a = hinge_point - HINGE_HALF_LENGTH_M*hinge_direction
+        point_b = hinge_point + HINGE_HALF_LENGTH_M*hinge_direction
+        ax.plot(
+            [point_a[0], point_b[0]], [point_a[1], point_b[1]], [point_a[2], point_b[2]],
+            color="black", linestyle="--", linewidth=2.0,
+        )
+        ax.scatter([hinge_point[0]], [hinge_point[1]], [hinge_point[2]], color="black", s=22)
+        ax.text(*hinge_point, f"  {plane_id_1} ↔ {plane_id_2} ±{max_rotation_deg:g}°", color="black", fontsize=8)
 
     # Show the two continuously movable measurement points and their connecting segment.
     measurement_positions = []
@@ -326,7 +361,10 @@ def parsePoints(text: str, unit_to_m: float = 1.0) -> np.ndarray:
     return unit_to_m*np.asarray(points, dtype=np.float64)
 
 
-def createObjectVisionSpec(source_spec: ObjectVisionSpec, rigid_planes: list[EditableRigidPlane]) -> ObjectVisionSpec:
+def createObjectVisionSpec(
+    source_spec: ObjectVisionSpec, rigid_planes: list[EditableRigidPlane],
+    rigid_plane_connections: list[tuple[str, str, float]],
+) -> ObjectVisionSpec:
     color_ids = []
 
     for plane in rigid_planes:
@@ -355,9 +393,12 @@ def createObjectVisionSpec(source_spec: ObjectVisionSpec, rigid_planes: list[Edi
                     )
                     for shape in plane.shape_markers
                 ],
+                plane_id=plane.plane_id,
             )
             for plane in rigid_planes
         ],
+        rigid_plane_connections=list(rigid_plane_connections),
+        aruco_marker=source_spec.aruco_marker,
         width=source_spec.width, height=source_spec.height, length=source_spec.length,
     )
 
@@ -367,7 +408,7 @@ def objectVisionSpecCode(spec_id_name: str, spec: ObjectVisionSpec) -> str:
         "import numpy as np",
         "",
         "from src.primary.color import ColorId",
-        "from src.primary.object_vision_spec import ObjectType, ObjectVisionSpec, RigidPlaneSpec, ShapeMarkerSpec",
+        "from src.primary.object_vision_spec import ArucoMarkerSpec, ObjectType, ObjectVisionSpec, RigidPlaneSpec, ShapeMarkerSpec",
         "",
         f"# Suggested ObjectVisionSpecId member: {spec_id_name} = auto()",
         f'EXPORTED_OBJECT_VISION_SPEC_ID_NAME = "{spec_id_name}"',
@@ -378,12 +419,25 @@ def objectVisionSpecCode(spec_id_name: str, spec: ObjectVisionSpec) -> str:
         f"    minimum_contour_area_px={spec.minimum_contour_area_px!r},",
         f"    polygon_epsilon_ratio={spec.polygon_epsilon_ratio!r},",
         f"    shape_group_distance_factor={spec.shape_group_distance_factor!r},",
+    ]
+
+    if spec.aruco_marker is not None:
+        lines += [
+            "    aruco_marker=ArucoMarkerSpec(",
+            f"        marker_id={spec.aruco_marker.marker_id!r},",
+            f"        marker_length_m={spec.aruco_marker.marker_length_m!r},",
+            f"        dictionary_name={spec.aruco_marker.dictionary_name!r},",
+            "    ),",
+        ]
+
+    lines += [
         "    rigid_planes=[",
     ]
 
     for plane in spec.rigid_planes:
         lines += [
             "        RigidPlaneSpec(",
+            f"            plane_id={plane.plane_id!r},",
             "            rotation_object_from_plane=np.array([",
             *[f"                {row.tolist()}," for row in plane.rotation_object_from_plane],
             "            ], dtype=np.float64),",
@@ -403,12 +457,21 @@ def objectVisionSpecCode(spec_id_name: str, spec: ObjectVisionSpec) -> str:
 
         lines += ["            ],", "        ),"]
 
+    lines += ["    ],"]
+
+    if spec.rigid_plane_connections:
+        lines.append("    rigid_plane_connections=[")
+        for plane_id_1, plane_id_2, max_rotation_deg in spec.rigid_plane_connections:
+            lines.append(f"        ({plane_id_1!r}, {plane_id_2!r}, {max_rotation_deg!r}),")
+        lines.append("    ],")
+    else:
+        lines.append("    rigid_plane_connections=[],")
+
     lines += [
-        "    ],",
         f"    width={spec.width!r}, height={spec.height!r}, length={spec.length!r},",
         ")",
         "",
-        f"# Registry entry after adding the enum member:",
+        "# Registry entry after adding the enum member:",
         f"# ObjectVisionSpecId.{spec_id_name}: EXPORTED_OBJECT_VISION_SPEC,",
         "",
     ]
@@ -419,14 +482,15 @@ class ModelEditor(tk.Tk):
     def __init__(self, object_vision_spec_id: ObjectVisionSpecId):
         super().__init__()
         self.title("Object Vision Model Editor")
-        self.geometry("1500x940")
-        self.minsize(1150, 760)
+        self.geometry("1500x960")
+        self.minsize(1150, 780)
 
         self.object_vision_spec_id: ObjectVisionSpecId | None = object_vision_spec_id
         self.source_spec = OBJECT_VISION_SPECS[object_vision_spec_id]
         self.model_name = object_vision_spec_id.name
         self.model_path: Path | None = None
         self.rigid_planes = copyModelFromSpec(self.source_spec)
+        self.rigid_plane_connections = list(self.source_spec.rigid_plane_connections)
         self.selected_plane_index: int | None = None
         self.selected_shape_index: int | None = None
 
@@ -438,7 +502,6 @@ class ModelEditor(tk.Tk):
         self.display_unit = DEFAULT_DISPLAY_UNIT
         self.zoom_factor = 1.0
 
-        # Default view: front + top + left.
         self.view_elev = ISOMETRIC_ELEV_DEG
         self.view_azim = ISOMETRIC_AZIM_DEG
         self.view_roll = ISOMETRIC_ROLL_DEG
@@ -457,6 +520,7 @@ class ModelEditor(tk.Tk):
         self.buildPlot()
         self.updateUnitLabels()
         self.refreshPlaneList()
+        self.updateConnectionsButtonLabel()
         self.redraw()
 
     def buildControls(self) -> None:
@@ -479,21 +543,27 @@ class ModelEditor(tk.Tk):
         ttk.Button(self.controls, text="Delete plane", command=self.deletePlane).grid(row=3, column=1, sticky="ew")
         ttk.Button(self.controls, text="Apply plane", command=self.applyPlane).grid(row=3, column=2, sticky="ew")
 
+        ttk.Label(self.controls, text="Plane ID").grid(row=4, column=0, sticky="w", pady=(5, 0))
+        self.plane_id_entry = ttk.Entry(self.controls)
+        self.plane_id_entry.grid(row=4, column=1, sticky="ew", pady=(5, 0), padx=(2, 4))
+        self.connections_button_var = tk.StringVar(value="Connections...")
+        ttk.Button(self.controls, textvariable=self.connections_button_var, command=self.showConnections).grid(row=4, column=2, sticky="ew", pady=(5, 0))
+
         self.plane_visible_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             self.controls, text="Selected plane surface visible", variable=self.plane_visible_var,
             command=self.onPlaneVisibilityChanged,
-        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
-        ttk.Label(self.controls, text="Rotation angles [deg]").grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 2))
-        ttk.Label(self.controls, text="Convention: R = Rz(z) @ Ry(y) @ Rx(x)").grid(row=6, column=0, columnspan=3, sticky="w")
+        ttk.Label(self.controls, text="Rotation angles [deg]").grid(row=6, column=0, columnspan=3, sticky="w", pady=(8, 2))
+        ttk.Label(self.controls, text="Convention: R = Rz(z) @ Ry(y) @ Rx(x)").grid(row=7, column=0, columnspan=3, sticky="w")
 
         self.angle_vars = [tk.DoubleVar(value=0.0) for _ in range(3)]
         self.angle_entries, self.angle_scales = [], []
         self.updating_rotation_controls = False
 
         for axis_index, axis_name in enumerate(("x", "y", "z")):
-            row = 7 + axis_index
+            row = 8 + axis_index
             ttk.Label(self.controls, text=f"{axis_name}:").grid(row=row, column=0, sticky="w")
 
             entry = ttk.Entry(self.controls, width=9)
@@ -509,78 +579,78 @@ class ModelEditor(tk.Tk):
             scale.grid(row=row, column=2, sticky="ew")
             self.angle_scales.append(scale)
 
-        ttk.Label(self.controls, text="Rotation matrix R").grid(row=10, column=0, columnspan=3, sticky="w", pady=(8, 2))
+        ttk.Label(self.controls, text="Rotation matrix R").grid(row=11, column=0, columnspan=3, sticky="w", pady=(8, 2))
         self.rotation_entries = []
 
         for row in range(3):
             entry_row = []
             for col in range(3):
                 entry = ttk.Entry(self.controls, width=10)
-                entry.grid(row=11 + row, column=col, padx=2, pady=2, sticky="ew")
+                entry.grid(row=12 + row, column=col, padx=2, pady=2, sticky="ew")
                 entry_row.append(entry)
             self.rotation_entries.append(entry_row)
 
         self.translation_label_var = tk.StringVar()
-        ttk.Label(self.controls, textvariable=self.translation_label_var).grid(row=14, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        ttk.Label(self.controls, textvariable=self.translation_label_var).grid(row=15, column=0, columnspan=3, sticky="w", pady=(6, 2))
         self.translation_entries = []
 
         for col, axis_name in enumerate(("x", "y", "z")):
             frame = ttk.Frame(self.controls)
-            frame.grid(row=15, column=col, padx=2, sticky="ew")
+            frame.grid(row=16, column=col, padx=2, sticky="ew")
             ttk.Label(frame, text=axis_name).pack(side="left")
             entry = ttk.Entry(frame, width=9)
             entry.pack(side="left", fill="x", expand=True)
             self.translation_entries.append(entry)
 
-        ttk.Separator(self.controls).grid(row=16, column=0, columnspan=3, sticky="ew", pady=8)
+        ttk.Separator(self.controls).grid(row=17, column=0, columnspan=3, sticky="ew", pady=8)
 
-        ttk.Label(self.controls, text="Shapes on selected plane").grid(row=17, column=0, columnspan=3, sticky="w")
+        ttk.Label(self.controls, text="Shapes on selected plane").grid(row=18, column=0, columnspan=3, sticky="w")
         self.shape_list = tk.Listbox(self.controls, height=5, exportselection=False)
-        self.shape_list.grid(row=18, column=0, columnspan=3, sticky="ew", pady=(3, 5))
+        self.shape_list.grid(row=19, column=0, columnspan=3, sticky="ew", pady=(3, 5))
         self.shape_list.bind("<<ListboxSelect>>", self.onShapeSelected)
 
-        ttk.Button(self.controls, text="Add shape", command=self.addShape).grid(row=19, column=0, sticky="ew")
-        ttk.Button(self.controls, text="Delete shape", command=self.deleteShape).grid(row=19, column=1, sticky="ew")
-        ttk.Button(self.controls, text="Apply shape", command=self.applyShape).grid(row=19, column=2, sticky="ew")
+        ttk.Button(self.controls, text="Add shape", command=self.addShape).grid(row=20, column=0, sticky="ew")
+        ttk.Button(self.controls, text="Delete shape", command=self.deleteShape).grid(row=20, column=1, sticky="ew")
+        ttk.Button(self.controls, text="Apply shape", command=self.applyShape).grid(row=20, column=2, sticky="ew")
 
         self.shape_visible_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
             self.controls, text="Selected shape visible", variable=self.shape_visible_var,
             command=self.onShapeVisibilityChanged,
-        ).grid(row=20, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        ).grid(row=21, column=0, columnspan=3, sticky="w", pady=(5, 0))
 
-        ttk.Label(self.controls, text="Color").grid(row=21, column=0, sticky="w", pady=(6, 2))
+        ttk.Label(self.controls, text="Color").grid(row=22, column=0, sticky="w", pady=(6, 2))
         self.color_var = tk.StringVar(value=next(iter(ColorId.__members__)))
         self.color_combo = ttk.Combobox(self.controls, textvariable=self.color_var, values=list(ColorId.__members__), state="readonly")
-        self.color_combo.grid(row=21, column=1, columnspan=2, sticky="ew", pady=(6, 2))
+        self.color_combo.grid(row=22, column=1, columnspan=2, sticky="ew", pady=(6, 2))
 
         self.points_label_var = tk.StringVar()
-        ttk.Label(self.controls, textvariable=self.points_label_var).grid(row=22, column=0, columnspan=3, sticky="w", pady=(4, 2))
+        ttk.Label(self.controls, textvariable=self.points_label_var).grid(row=23, column=0, columnspan=3, sticky="w", pady=(4, 2))
         self.points_text = tk.Text(self.controls, width=36, height=6)
-        self.points_text.grid(row=23, column=0, columnspan=3, sticky="ew")
+        self.points_text.grid(row=24, column=0, columnspan=3, sticky="ew")
 
-        ttk.Button(self.controls, text="Show / copy spec code", command=self.showCode).grid(row=24, column=0, columnspan=3, sticky="ew", pady=(6, 2))
+        ttk.Button(self.controls, text="Show / copy spec code", command=self.showCode).grid(row=25, column=0, columnspan=3, sticky="ew", pady=(6, 2))
 
-        ttk.Separator(self.controls).grid(row=25, column=0, columnspan=3, sticky="ew", pady=8)
-        ttk.Label(self.controls, text="Model / ObjectVisionSpec").grid(row=26, column=0, columnspan=3, sticky="w")
+        ttk.Separator(self.controls).grid(row=26, column=0, columnspan=3, sticky="ew", pady=8)
+        ttk.Label(self.controls, text="Model / ObjectVisionSpec").grid(row=27, column=0, columnspan=3, sticky="w")
 
         self.spec_id_var = tk.StringVar(value=self.object_vision_spec_id.name)
         self.spec_id_combo = ttk.Combobox(
             self.controls, textvariable=self.spec_id_var,
             values=[spec_id.name for spec_id in ObjectVisionSpecId], state="readonly",
         )
-        self.spec_id_combo.grid(row=27, column=0, columnspan=2, sticky="ew")
-        ttk.Button(self.controls, text="Load registered", command=self.loadRegisteredSpec).grid(row=27, column=2, sticky="ew")
+        self.spec_id_combo.grid(row=28, column=0, columnspan=2, sticky="ew")
+        ttk.Button(self.controls, text="Load registered", command=self.loadRegisteredSpec).grid(row=28, column=2, sticky="ew")
 
         self.model_name_var = tk.StringVar(value=f"Current: {self.model_name}")
-        ttk.Label(self.controls, textvariable=self.model_name_var).grid(row=28, column=0, columnspan=3, sticky="w", pady=(4, 2))
+        ttk.Label(self.controls, textvariable=self.model_name_var).grid(row=29, column=0, columnspan=3, sticky="w", pady=(4, 2))
 
-        ttk.Button(self.controls, text="New blank", command=self.newBlankModel).grid(row=29, column=0, sticky="ew")
-        ttk.Button(self.controls, text="Import JSON", command=self.importModelJson).grid(row=29, column=1, sticky="ew")
-        ttk.Button(self.controls, text="Save", command=self.saveModelJson).grid(row=29, column=2, sticky="ew")
+        ttk.Button(self.controls, text="New blank", command=self.newBlankModel).grid(row=30, column=0, sticky="ew")
+        ttk.Button(self.controls, text="Import JSON", command=self.importModelJson).grid(row=30, column=1, sticky="ew")
+        ttk.Button(self.controls, text="Save", command=self.saveModelJson).grid(row=30, column=2, sticky="ew")
 
-        ttk.Button(self.controls, text="Save As JSON", command=self.saveModelJsonAs).grid(row=30, column=0, columnspan=2, sticky="ew")
-        ttk.Button(self.controls, text="Export Python", command=self.exportPythonSpec).grid(row=30, column=2, sticky="ew")
+        ttk.Button(self.controls, text="Save As JSON", command=self.saveModelJsonAs).grid(row=31, column=0, columnspan=2, sticky="ew")
+        ttk.Button(self.controls, text="Export Python", command=self.exportPythonSpec).grid(row=31, column=2, sticky="ew")
 
         for col in range(3):
             self.controls.columnconfigure(col, weight=1)
@@ -696,6 +766,11 @@ class ModelEditor(tk.Tk):
             self.measure_a_xyz_label_var.set(f"A xyz [{unit}] (type one + Enter):")
             self.measure_b_xyz_label_var.set(f"B xyz [{unit}] (type one + Enter):")
 
+    def updateConnectionsButtonLabel(self) -> None:
+        if hasattr(self, "connections_button_var"):
+            count = len(self.rigid_plane_connections)
+            self.connections_button_var.set(f"Connections ({count})...")
+
     def onUnitChanged(self, _event=None) -> None:
         self.display_unit = self.unit_var.get()
         self.updateUnitLabels()
@@ -713,7 +788,7 @@ class ModelEditor(tk.Tk):
         self.redraw()
 
     def currentObjectVisionSpec(self) -> ObjectVisionSpec:
-        return createObjectVisionSpec(self.source_spec, self.rigid_planes)
+        return createObjectVisionSpec(self.source_spec, self.rigid_planes, self.rigid_plane_connections)
 
     def setModel(self, spec: ObjectVisionSpec, name: str, spec_id: ObjectVisionSpecId | None = None, path: Path | None = None) -> None:
         self.object_vision_spec_id = spec_id
@@ -721,12 +796,14 @@ class ModelEditor(tk.Tk):
         self.model_name = name
         self.model_path = path
         self.rigid_planes = copyModelFromSpec(spec)
+        self.rigid_plane_connections = list(spec.rigid_plane_connections)
         self.selected_plane_index = None
         self.selected_shape_index = None
         self.measurement_points.clear()
         self.model_name_var.set(f"Current: {name}")
         if spec_id is not None:
             self.spec_id_var.set(spec_id.name)
+        self.updateConnectionsButtonLabel()
         self.refreshPlaneList(0 if self.rigid_planes else None)
         self.redraw()
 
@@ -745,7 +822,7 @@ class ModelEditor(tk.Tk):
             minimum_contour_area_px=self.source_spec.minimum_contour_area_px,
             polygon_epsilon_ratio=self.source_spec.polygon_epsilon_ratio,
             shape_group_distance_factor=self.source_spec.shape_group_distance_factor,
-            rigid_planes=[],
+            rigid_planes=[], rigid_plane_connections=[], aruco_marker=self.source_spec.aruco_marker,
             width=self.source_spec.width, height=self.source_spec.height, length=self.source_spec.length,
         )
         self.setModel(blank_spec, name)
@@ -753,8 +830,7 @@ class ModelEditor(tk.Tk):
     def importModelJson(self) -> None:
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         path_text = filedialog.askopenfilename(
-            title="Import ObjectVisionSpec model",
-            initialdir=MODELS_DIR,
+            title="Import ObjectVisionSpec model", initialdir=MODELS_DIR,
             filetypes=[("ObjectVisionSpec JSON", "*.json"), ("All files", "*.*")],
         )
         if not path_text:
@@ -787,11 +863,8 @@ class ModelEditor(tk.Tk):
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         initial_name = (self.model_path.stem if self.model_path is not None else self.model_name).lower() + ".json"
         path_text = filedialog.asksaveasfilename(
-            title="Save ObjectVisionSpec model",
-            initialdir=MODELS_DIR,
-            initialfile=initial_name,
-            defaultextension=".json",
-            filetypes=[("ObjectVisionSpec JSON", "*.json"), ("All files", "*.*")],
+            title="Save ObjectVisionSpec model", initialdir=MODELS_DIR, initialfile=initial_name,
+            defaultextension=".json", filetypes=[("ObjectVisionSpec JSON", "*.json"), ("All files", "*.*")],
         )
         if not path_text:
             return
@@ -802,8 +875,7 @@ class ModelEditor(tk.Tk):
 
     def exportPythonSpec(self) -> None:
         spec_id_name = simpledialog.askstring(
-            "Export Python spec",
-            "Suggested ObjectVisionSpecId name:",
+            "Export Python spec", "Suggested ObjectVisionSpecId name:",
             initialvalue=(self.object_vision_spec_id.name if self.object_vision_spec_id is not None else self.model_name.upper()),
             parent=self,
         )
@@ -813,10 +885,8 @@ class ModelEditor(tk.Tk):
         spec_id_name = spec_id_name.strip().upper().replace(" ", "_")
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         path_text = filedialog.asksaveasfilename(
-            title="Export Python ObjectVisionSpec",
-            initialdir=MODELS_DIR,
-            initialfile=spec_id_name.lower() + ".py",
-            defaultextension=".py",
+            title="Export Python ObjectVisionSpec", initialdir=MODELS_DIR,
+            initialfile=spec_id_name.lower() + ".py", defaultextension=".py",
             filetypes=[("Python files", "*.py"), ("All files", "*.*")],
         )
         if not path_text:
@@ -855,7 +925,6 @@ class ModelEditor(tk.Tk):
         if event.inaxes != self.ax or event.button != 1:
             self.mouse_press_xy = None
             return
-
         self.mouse_press_xy = (event.x, event.y)
 
     def onPlotMouseRelease(self, event) -> None:
@@ -868,10 +937,8 @@ class ModelEditor(tk.Tk):
         press_x, press_y = self.mouse_press_xy
         self.mouse_press_xy = None
 
-        # A drag rotates the 3D camera; only a nearly stationary click selects an edge point.
         if np.hypot(event.x - press_x, event.y - press_y) > 5.0:
             return
-
         if getattr(self.toolbar, "mode", ""):
             return
 
@@ -919,7 +986,7 @@ class ModelEditor(tk.Tk):
         self.savePlotView()
         self.validateMeasurementPoints()
         drawModel(
-            self.ax, self.rigid_planes, self.source_spec.object_type,
+            self.ax, self.rigid_planes, self.source_spec.object_type, self.rigid_plane_connections,
             self.view_elev, self.view_azim, self.view_roll,
             self.edge_pick_data, self.measurement_points,
             self.display_unit, self.zoom_factor,
@@ -969,9 +1036,7 @@ class ModelEditor(tk.Tk):
 
         for point_index, entries in enumerate(self.measure_coord_entries):
             if point_index < len(self.measurement_points):
-                point = self.metersToDisplay(
-                    getEdgePointObjectPosition(self.rigid_planes, self.measurement_points[point_index])
-                )
+                point = self.metersToDisplay(getEdgePointObjectPosition(self.rigid_planes, self.measurement_points[point_index]))
                 for axis_index, entry in enumerate(entries):
                     entry.state(["!disabled"])
                     entry.delete(0, tk.END)
@@ -1016,12 +1081,8 @@ class ModelEditor(tk.Tk):
             f"B: {edgeSelectionName(self.measurement_points[1], self.rigid_planes)}, "
             f"({point_b[0]:.4f}, {point_b[1]:.4f}, {point_b[2]:.4f}) {self.display_unit}"
         )
-        self.measure_delta_var.set(
-            f"Δ(B-A): x={delta[0]:+.4f}, y={delta[1]:+.4f}, z={delta[2]:+.4f} {self.display_unit}"
-        )
-        self.measure_axis_abs_var.set(
-            f"|Δ axes|: x={abs(delta[0]):.4f}, y={abs(delta[1]):.4f}, z={abs(delta[2]):.4f} {self.display_unit}"
-        )
+        self.measure_delta_var.set(f"Δ(B-A): x={delta[0]:+.4f}, y={delta[1]:+.4f}, z={delta[2]:+.4f} {self.display_unit}")
+        self.measure_axis_abs_var.set(f"|Δ axes|: x={abs(delta[0]):.4f}, y={abs(delta[1]):.4f}, z={abs(delta[2]):.4f} {self.display_unit}")
         self.measure_distance_var.set(f"3D distance: {distance:.4f} {self.display_unit}")
 
     def onMeasurementSlider(self, index: int, value: str) -> None:
@@ -1081,12 +1142,20 @@ class ModelEditor(tk.Tk):
         self.measurement_points.clear()
         self.redraw()
 
+    def nextPlaneId(self) -> str:
+        used = {plane.plane_id for plane in self.rigid_planes}
+        index = 0
+        while f"plane_{index}" in used:
+            index += 1
+        return f"plane_{index}"
+
     def refreshPlaneList(self, select_index: int | None = None) -> None:
         self.plane_list.delete(0, tk.END)
 
         for index, plane in enumerate(self.rigid_planes):
             visibility = "x" if plane.visible else " "
-            self.plane_list.insert(tk.END, f"[{visibility}] Plane {index}  ({len(plane.shape_markers)} shapes)")
+            plane_id = plane.plane_id if plane.plane_id is not None else f"plane_{index}"
+            self.plane_list.insert(tk.END, f"[{visibility}] P{index}: {plane_id}  ({len(plane.shape_markers)} shapes)")
 
         if select_index is not None and self.rigid_planes:
             select_index = min(select_index, len(self.rigid_planes) - 1)
@@ -1128,7 +1197,6 @@ class ModelEditor(tk.Tk):
         selection = self.plane_list.curselection()
         if not selection:
             return
-
         self.selected_plane_index = selection[0]
         self.loadPlaneFields()
         self.refreshShapeList()
@@ -1137,14 +1205,12 @@ class ModelEditor(tk.Tk):
         selection = self.shape_list.curselection()
         if not selection:
             return
-
         self.selected_shape_index = selection[0]
         self.loadShapeFields()
 
     def onPlaneVisibilityChanged(self) -> None:
         if self.selected_plane_index is None:
             return
-
         self.rigid_planes[self.selected_plane_index].visible = bool(self.plane_visible_var.get())
         selected = self.selected_plane_index
         self.refreshPlaneList(selected)
@@ -1164,17 +1230,15 @@ class ModelEditor(tk.Tk):
     def clearPlaneFields(self) -> None:
         self.updating_rotation_controls = True
         self.plane_visible_var.set(True)
+        self.plane_id_entry.delete(0, tk.END)
 
         for entry in self.angle_entries:
             entry.delete(0, tk.END)
-
         for variable in self.angle_vars:
             variable.set(0.0)
-
         for row in self.rotation_entries:
             for entry in row:
                 entry.delete(0, tk.END)
-
         for entry in self.translation_entries:
             entry.delete(0, tk.END)
 
@@ -1186,6 +1250,8 @@ class ModelEditor(tk.Tk):
 
         plane = self.rigid_planes[self.selected_plane_index]
         self.plane_visible_var.set(plane.visible)
+        self.plane_id_entry.delete(0, tk.END)
+        self.plane_id_entry.insert(0, plane.plane_id if plane.plane_id is not None else f"plane_{self.selected_plane_index}")
         self.setRotationControlsFromMatrix(plane.rotation_object_from_plane)
 
         translation_display = self.metersToDisplay(plane.translation_object_from_plane_m)
@@ -1264,7 +1330,7 @@ class ModelEditor(tk.Tk):
         self.points_text.insert("1.0", "\n".join(f"{x:.8g} {y:.8g}" for x, y in points_display))
 
     def addPlane(self) -> None:
-        self.rigid_planes.append(EditableRigidPlane(np.eye(3), np.zeros(3)))
+        self.rigid_planes.append(EditableRigidPlane(np.eye(3), np.zeros(3), plane_id=self.nextPlaneId()))
         self.refreshPlaneList(len(self.rigid_planes) - 1)
         self.redraw()
 
@@ -1273,8 +1339,14 @@ class ModelEditor(tk.Tk):
             return
 
         index = self.selected_plane_index
+        plane_id = self.rigid_planes[index].plane_id
         self.measurement_points.clear()
         del self.rigid_planes[index]
+        self.rigid_plane_connections = [
+            connection for connection in self.rigid_plane_connections
+            if connection[0] != plane_id and connection[1] != plane_id
+        ]
+        self.updateConnectionsButtonLabel()
         self.refreshPlaneList(min(index, len(self.rigid_planes) - 1) if self.rigid_planes else None)
         self.redraw()
 
@@ -1285,14 +1357,34 @@ class ModelEditor(tk.Tk):
         try:
             rotation = parseRotation(self.rotation_entries)
             translation = parseTranslation(self.translation_entries, self.unitToMeters())
+            plane_id = self.plane_id_entry.get().strip()
+            if not plane_id:
+                raise ValueError("Plane ID cannot be empty")
+            if any(i != self.selected_plane_index and plane.plane_id == plane_id for i, plane in enumerate(self.rigid_planes)):
+                raise ValueError(f"Plane ID already exists: {plane_id}")
         except ValueError as error:
-            messagebox.showerror("Invalid plane transform", str(error))
+            messagebox.showerror("Invalid plane", str(error))
             return
 
         plane = self.rigid_planes[self.selected_plane_index]
+        old_plane_id = plane.plane_id
         plane.rotation_object_from_plane = rotation
         plane.translation_object_from_plane_m = translation
+        plane.plane_id = plane_id
+
+        if old_plane_id != plane_id:
+            self.rigid_plane_connections = [
+                (
+                    plane_id if connection[0] == old_plane_id else connection[0],
+                    plane_id if connection[1] == old_plane_id else connection[1],
+                    connection[2],
+                )
+                for connection in self.rigid_plane_connections
+            ]
+
         self.setRotationControlsFromMatrix(rotation)
+        self.updateConnectionsButtonLabel()
+        self.refreshPlaneList(self.selected_plane_index)
         self.redraw()
 
     def addShape(self) -> None:
@@ -1339,10 +1431,121 @@ class ModelEditor(tk.Tk):
         self.refreshShapeList(self.selected_shape_index)
         self.redraw()
 
+    def parseConnectionText(self, text: str) -> tuple[str, str, float]:
+        parts = [part.strip() for part in text.replace(",", " ").split() if part.strip()]
+        if len(parts) != 3:
+            raise ValueError("Enter exactly: plane_id_1 plane_id_2 max_rotation_deg")
+
+        plane_id_1, plane_id_2 = parts[0], parts[1]
+        max_rotation_deg = float(parts[2])
+        plane_ids = {plane.plane_id for plane in self.rigid_planes}
+
+        if plane_id_1 == plane_id_2:
+            raise ValueError("A plane cannot connect to itself")
+        if plane_id_1 not in plane_ids or plane_id_2 not in plane_ids:
+            raise ValueError("Both plane IDs must exist")
+        if not np.isfinite(max_rotation_deg) or max_rotation_deg < 0.0:
+            raise ValueError("max_rotation_deg must be finite and >= 0")
+
+        planes_by_id = {plane.plane_id: plane for plane in self.rigid_planes}
+        getRigidPlaneIntersection(editablePlaneToSpec(planes_by_id[plane_id_1]), editablePlaneToSpec(planes_by_id[plane_id_2]))
+        return plane_id_1, plane_id_2, max_rotation_deg
+
+    def showConnections(self) -> None:
+        window = tk.Toplevel(self)
+        window.title("Rigid plane connections")
+        window.geometry("560x330")
+        window.transient(self)
+        window.grab_set()
+
+        plane_ids = [plane.plane_id for plane in self.rigid_planes]
+        ttk.Label(window, text="Connected pairs rotate ±max angle around their auto-computed plane intersection.").pack(anchor="w", padx=10, pady=(10, 4))
+        ttk.Label(window, text="Plane IDs: " + (", ".join(plane_ids) if plane_ids else "(none)")).pack(anchor="w", padx=10, pady=(0, 8))
+
+        listbox = tk.Listbox(window, height=9, exportselection=False)
+        listbox.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+
+        def refresh(select_index: int | None = None):
+            listbox.delete(0, tk.END)
+            for connection in self.rigid_plane_connections:
+                listbox.insert(tk.END, f"{connection[0]} ↔ {connection[1]}    ±{connection[2]:g}°")
+            if select_index is not None and self.rigid_plane_connections:
+                select_index = min(select_index, len(self.rigid_plane_connections) - 1)
+                listbox.selection_set(select_index)
+                listbox.activate(select_index)
+            self.updateConnectionsButtonLabel()
+            self.redraw()
+
+        def prompt_connection(existing: tuple[str, str, float] | None = None) -> tuple[str, str, float] | None:
+            initial = "" if existing is None else f"{existing[0]}, {existing[1]}, {existing[2]:g}"
+            text = simpledialog.askstring(
+                "Plane connection",
+                "Enter: plane_id_1, plane_id_2, max_rotation_deg\n"
+                "The max angle is two-way: e.g. 15 means ±15°.\n\n"
+                f"Available: {', '.join(plane_ids)}",
+                initialvalue=initial, parent=window,
+            )
+            if text is None:
+                return None
+            try:
+                return self.parseConnectionText(text)
+            except Exception as error:
+                messagebox.showerror("Invalid connection", str(error), parent=window)
+                return None
+
+        def add_connection():
+            connection = prompt_connection()
+            if connection is None:
+                return
+            pair = frozenset(connection[:2])
+            if any(frozenset(existing[:2]) == pair for existing in self.rigid_plane_connections):
+                messagebox.showerror("Duplicate connection", "Those two planes are already connected.", parent=window)
+                return
+            self.rigid_plane_connections.append(connection)
+            refresh(len(self.rigid_plane_connections) - 1)
+
+        def edit_connection():
+            selection = listbox.curselection()
+            if not selection:
+                return
+            index = selection[0]
+            connection = prompt_connection(self.rigid_plane_connections[index])
+            if connection is None:
+                return
+            pair = frozenset(connection[:2])
+            if any(i != index and frozenset(existing[:2]) == pair for i, existing in enumerate(self.rigid_plane_connections)):
+                messagebox.showerror("Duplicate connection", "Those two planes are already connected.", parent=window)
+                return
+            self.rigid_plane_connections[index] = connection
+            refresh(index)
+
+        def delete_connection():
+            selection = listbox.curselection()
+            if not selection:
+                return
+            index = selection[0]
+            del self.rigid_plane_connections[index]
+            refresh(min(index, len(self.rigid_plane_connections) - 1) if self.rigid_plane_connections else None)
+
+        button_frame = ttk.Frame(window, padding=(10, 0, 10, 10))
+        button_frame.pack(fill="x")
+        ttk.Button(button_frame, text="Add", command=add_connection).pack(side="left")
+        ttk.Button(button_frame, text="Edit", command=edit_connection).pack(side="left", padx=6)
+        ttk.Button(button_frame, text="Delete", command=delete_connection).pack(side="left")
+        ttk.Button(button_frame, text="Close", command=window.destroy).pack(side="right")
+
+        refresh()
+
     def showCode(self) -> None:
+        try:
+            spec = self.currentObjectVisionSpec()
+        except Exception as error:
+            messagebox.showerror("Invalid model", str(error))
+            return
+
         code = objectVisionSpecCode(
             self.object_vision_spec_id.name if self.object_vision_spec_id is not None else self.model_name.upper(),
-            self.currentObjectVisionSpec(),
+            spec,
         )
         window = tk.Toplevel(self)
         window.title("Generated ObjectVisionSpec code")

@@ -23,7 +23,6 @@ class ObjectVisionSpecId(Enum):
     TENNIS_BALL_DEFAULT = auto()
     ARUCO_MARKER_1 = auto()
     PAPER_PLANE_SHAPES_1 = auto()
-    
 
 
 class ShapeMarkerSpec:
@@ -67,9 +66,13 @@ class RigidPlaneSpec:
         rotation_object_from_plane: np.ndarray,
         translation_object_from_plane_m: np.ndarray | None = None,
         shape_markers: list[ShapeMarkerSpec] | None = None,
+        plane_id: str | None = None,
     ):
         """
         A set of markers whose relative geometry is rigid because they lie on the same physical plane.
+
+        plane_id identifies this plane inside ObjectVisionSpec so flexible connections can reference it.
+        If omitted, ObjectVisionSpec assigns a stable default such as "plane_0".
 
         Each plane-local marker point is embedded as p_plane=[x,y,0], then transformed by rotation
         first and translation second:
@@ -89,10 +92,40 @@ class RigidPlaneSpec:
         )
         if translation_object_from_plane_m.shape != (3,) or not np.all(np.isfinite(translation_object_from_plane_m)):
             raise ValueError("translation_object_from_plane_m must be a finite length-3 vector")
+        if plane_id is not None and (not isinstance(plane_id, str) or not plane_id.strip()):
+            raise ValueError("plane_id must be None or a non-empty string")
 
+        self.plane_id = None if plane_id is None else plane_id.strip()
         self.rotation_object_from_plane = rotation_object_from_plane
         self.translation_object_from_plane_m = translation_object_from_plane_m
         self.shape_markers = shape_markers if shape_markers is not None else []
+
+
+def getRigidPlaneIntersection(rigid_plane_1: RigidPlaneSpec, rigid_plane_2: RigidPlaneSpec) -> tuple[np.ndarray, np.ndarray]:
+    """Return a point and unit direction for the nominal intersection line of two rigid planes."""
+    normal_1 = np.asarray(rigid_plane_1.rotation_object_from_plane[:, 2], dtype=np.float64)
+    normal_2 = np.asarray(rigid_plane_2.rotation_object_from_plane[:, 2], dtype=np.float64)
+    normal_1_norm, normal_2_norm = np.linalg.norm(normal_1), np.linalg.norm(normal_2)
+
+    if normal_1_norm <= 1e-12 or normal_2_norm <= 1e-12:
+        raise ValueError("Rigid plane has an invalid zero-length normal")
+
+    normal_1 /= normal_1_norm
+    normal_2 /= normal_2_norm
+    hinge_direction = np.cross(normal_1, normal_2)
+    hinge_direction_norm = np.linalg.norm(hinge_direction)
+
+    if hinge_direction_norm <= 1e-6:
+        raise ValueError("Connected rigid planes are parallel or nearly parallel; cannot determine a unique hinge axis")
+
+    hinge_direction /= hinge_direction_norm
+    plane_equations = np.vstack((normal_1, normal_2))
+    plane_offsets = np.array([
+        np.dot(normal_1, rigid_plane_1.translation_object_from_plane_m),
+        np.dot(normal_2, rigid_plane_2.translation_object_from_plane_m),
+    ], dtype=np.float64)
+    hinge_point = np.linalg.lstsq(plane_equations, plane_offsets, rcond=None)[0]
+    return hinge_point, hinge_direction
 
 
 class ArucoMarkerSpec:
@@ -138,6 +171,7 @@ class ObjectVisionSpec:
         polygon_epsilon_ratio: float = 0.03,
         shape_group_distance_factor: float = 3.0,
         rigid_planes: list[RigidPlaneSpec] | None = None,
+        rigid_plane_connections: list[tuple[str, str, float]] | None = None,
         aruco_marker: ArucoMarkerSpec | None = None,
         width=None, height=None, length=None,
     ):
@@ -148,6 +182,50 @@ class ObjectVisionSpec:
         self.shape_group_distance_factor = shape_group_distance_factor
         self.rigid_planes = rigid_planes if rigid_planes is not None else []
         self.aruco_marker = aruco_marker
+
+        # Give every plane a unique stable ID. This keeps older models/specs that predate plane_id usable.
+        used_plane_ids = set()
+        for plane_index, rigid_plane in enumerate(self.rigid_planes):
+            if rigid_plane.plane_id is None:
+                base_id = f"plane_{plane_index}"
+                plane_id, suffix = base_id, 1
+                while plane_id in used_plane_ids:
+                    plane_id, suffix = f"{base_id}_{suffix}", suffix + 1
+                rigid_plane.plane_id = plane_id
+
+            if rigid_plane.plane_id in used_plane_ids:
+                raise ValueError(f"Duplicate rigid plane ID: {rigid_plane.plane_id}")
+            used_plane_ids.add(rigid_plane.plane_id)
+
+        # Each connection is (plane_id_1, plane_id_2, max_rotation_deg), where rotation is ±max_rotation_deg.
+        self.rigid_plane_connections: list[tuple[str, str, float]] = []
+        rigid_planes_by_id = {rigid_plane.plane_id: rigid_plane for rigid_plane in self.rigid_planes}
+        seen_connection_pairs = set()
+
+        for connection in rigid_plane_connections if rigid_plane_connections is not None else []:
+            if len(connection) != 3:
+                raise ValueError("Each rigid_plane_connection must be (plane_id_1, plane_id_2, max_rotation_deg)")
+
+            plane_id_1, plane_id_2, max_rotation_deg = connection
+            if not isinstance(plane_id_1, str) or not isinstance(plane_id_2, str):
+                raise ValueError("Rigid plane connection IDs must be strings")
+            if plane_id_1 == plane_id_2:
+                raise ValueError("A rigid plane cannot be connected to itself")
+            if plane_id_1 not in rigid_planes_by_id or plane_id_2 not in rigid_planes_by_id:
+                raise ValueError(f"Rigid plane connection references unknown plane: {(plane_id_1, plane_id_2)}")
+
+            max_rotation_deg = float(max_rotation_deg)
+            if not np.isfinite(max_rotation_deg) or max_rotation_deg < 0.0:
+                raise ValueError("Rigid plane connection max_rotation_deg must be finite and >= 0")
+
+            connection_pair = frozenset((plane_id_1, plane_id_2))
+            if connection_pair in seen_connection_pairs:
+                raise ValueError(f"Duplicate rigid plane connection: {(plane_id_1, plane_id_2)}")
+
+            # A connection uses the nominal plane-plane intersection as its hinge axis.
+            getRigidPlaneIntersection(rigid_planes_by_id[plane_id_1], rigid_planes_by_id[plane_id_2])
+            seen_connection_pairs.add(connection_pair)
+            self.rigid_plane_connections.append((plane_id_1, plane_id_2, max_rotation_deg))
 
         self.width = width # m
         self.height = height # m
@@ -160,7 +238,7 @@ class ObjectVisionSpec:
 
     @property
     def shape_markers(self) -> list[ShapeMarkerSpec]:
-        # Current PnP combines all visible markers; later it can solve/fuse rigid planes separately.
+        # Current PnP combines all visible markers; later it can search allowed rigid-plane connection rotations.
         return [marker for rigid_plane in self.rigid_planes for marker in rigid_plane.shape_markers]
 
 
@@ -186,6 +264,7 @@ def objectVisionSpecToDict(object_vision_spec: ObjectVisionSpec) -> dict:
         ),
         "rigid_planes": [
             {
+                "plane_id": rigid_plane.plane_id,
                 "rotation_object_from_plane": rigid_plane.rotation_object_from_plane.tolist(),
                 "translation_object_from_plane_m": rigid_plane.translation_object_from_plane_m.tolist(),
                 "shape_markers": [
@@ -200,6 +279,7 @@ def objectVisionSpecToDict(object_vision_spec: ObjectVisionSpec) -> dict:
             }
             for rigid_plane in object_vision_spec.rigid_planes
         ],
+        "rigid_plane_connections": [list(connection) for connection in object_vision_spec.rigid_plane_connections],
     }
 
 
@@ -209,7 +289,7 @@ def objectVisionSpecFromDict(data: dict) -> ObjectVisionSpec:
         raise ValueError(f"Unsupported ObjectVisionSpec model format version: {format_version}")
 
     rigid_planes = []
-    for plane_data in data.get("rigid_planes", []):
+    for plane_index, plane_data in enumerate(data.get("rigid_planes", [])):
         shape_markers = [
             ShapeMarkerSpec(
                 color_id=ColorId[marker_data["color_id"]],
@@ -223,6 +303,7 @@ def objectVisionSpecFromDict(data: dict) -> ObjectVisionSpec:
             rotation_object_from_plane=plane_data["rotation_object_from_plane"],
             translation_object_from_plane_m=plane_data.get("translation_object_from_plane_m"),
             shape_markers=shape_markers,
+            plane_id=plane_data.get("plane_id", f"plane_{plane_index}"),
         ))
 
     aruco_data = data.get("aruco_marker")
@@ -245,6 +326,10 @@ def objectVisionSpecFromDict(data: dict) -> ObjectVisionSpec:
         polygon_epsilon_ratio=float(data.get("polygon_epsilon_ratio", 0.03)),
         shape_group_distance_factor=float(data.get("shape_group_distance_factor", 3.0)),
         rigid_planes=rigid_planes,
+        rigid_plane_connections=[
+            (connection[0], connection[1], float(connection[2]))
+            for connection in data.get("rigid_plane_connections", [])
+        ],
         aruco_marker=aruco_marker,
         width=data.get("width"),
         height=data.get("height"),
@@ -291,6 +376,7 @@ OBJECT_VISION_SPECS = {
         rigid_planes=[
             # Rough current model; replace with accurately measured final geometry.
             RigidPlaneSpec(
+                plane_id="plane_0",
                 rotation_object_from_plane=np.array([
                     [1.0, 0.0, 0.0],
                     [0.0, -1.0, 0.0],
@@ -311,6 +397,7 @@ OBJECT_VISION_SPECS = {
                 ],
             ),
             RigidPlaneSpec(
+                plane_id="plane_1",
                 rotation_object_from_plane=np.array([
                     [0.96605224, -0.17034108, 0.19423435],
                     [0.19128349, -0.033728441, -0.98095516],
@@ -330,6 +417,9 @@ OBJECT_VISION_SPECS = {
                     ),
                 ],
             ),
+        ],
+        rigid_plane_connections=[
+            ("plane_0", "plane_1", 15.0),
         ],
         width=None, height=None, length=None,
     ),
