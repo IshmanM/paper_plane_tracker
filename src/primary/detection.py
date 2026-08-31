@@ -10,6 +10,12 @@ from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, Obje
 from src.primary.color import COLOR_SPECS, ColorId
 
 
+# Previous successful flexible-plane solution. This is only a hint: if the local
+# warm-start search fits poorly, the normal full flex search runs immediately.
+_PNP_WARM_START_ANGLES_DEG: dict[tuple[int, frozenset[str]], float] = {}
+_PNP_WARM_START_ORDERED_VERTICES: dict[tuple[int, frozenset[str]], dict[int, np.ndarray]] = {}
+
+
 # Detection data passed between image processing, drawing, and measurement conversion.
 class ShapeDetection:
     def __init__(
@@ -1819,6 +1825,17 @@ def createMeasurementUsingShapeGroup(
     if not marker_matches:
         return failed_measurement
 
+    bbox_diagonal_px = float(np.hypot(
+        0.0 if detection.px_w is None else detection.px_w,
+        0.0 if detection.px_h is None else detection.px_h,
+    ))
+
+    # The same fractional/model error occupies more pixels when the plane is close.
+    # Preserve the original pixel thresholds as minimums so distant detections do not
+    # become more permissive.
+    warm_start_accept_error_px = max(6.0, 0.020*bbox_diagonal_px)
+    correspondence_rescue_error_px = max(8.0, 0.025*bbox_diagonal_px)
+
     planes_by_id = {rigid_plane.plane_id: rigid_plane for rigid_plane in object_vision_spec.rigid_planes}
     marker_indices_by_plane = {
         plane_id: [
@@ -1842,7 +1859,8 @@ def createMeasurementUsingShapeGroup(
 
     pnp_setup_seconds = time.perf_counter() - measurement_timing_start
     pnp_assignment_seconds = 0.0
-    pnp_initial_search_seconds = 0.0
+    pnp_warm_start_seconds = 0.0
+    pnp_full_search_seconds = 0.0
     pnp_rescue_seconds = 0.0
 
     best_result = None
@@ -1907,6 +1925,9 @@ def createMeasurementUsingShapeGroup(
         connection = connections_by_pair.get(frozenset(plane_group)) if len(plane_group) == 2 else None
         hinge_point = hinge_direction = None
         coarse_angles_deg = np.array([0.0])
+        warm_start_key = None
+        warm_start_angle_deg = None
+        warm_start_ordered_vertices_by_marker: dict[int, np.ndarray] = {}
 
         if connection is not None:
             plane_id_1, plane_id_2, max_rotation_deg = connection
@@ -1915,6 +1936,9 @@ def createMeasurementUsingShapeGroup(
                 np.linspace(-max_rotation_deg, max_rotation_deg, 7)
                 if max_rotation_deg > 0.0 else np.array([0.0])
             )
+            warm_start_key = (id(object_vision_spec), frozenset((plane_id_1, plane_id_2)))
+            warm_start_angle_deg = _PNP_WARM_START_ANGLES_DEG.get(warm_start_key)
+            warm_start_ordered_vertices_by_marker = _PNP_WARM_START_ORDERED_VERTICES.get(warm_start_key, {})
 
         def evaluateFlexAngle(
             flex_angle_deg: float, correspondence_indices: dict[tuple[int, int], int] | None = None,
@@ -1990,17 +2014,55 @@ def createMeasurementUsingShapeGroup(
 
             return best_translation, best_reprojection_error
 
-        correspondence_indices = {pair: 0 for pair in best_assignment}
+        # Reuse the previous frame's successful physical-vertex ordering. Candidate
+        # ordering *indices* are not stable because marker_matches is sorted by this
+        # frame's edge-ratio score, so compare normalized ordered polygon geometry instead.
+        # Centering/scaling removes image translation and range changes; over one video
+        # frame the remaining rotation/perspective change should be small.
+        correspondence_indices = {}
 
-        def searchFlex() -> tuple[np.ndarray | None, float, float]:
+        for pair in best_assignment:
+            _, marker_index = pair
+            previous_vertices = warm_start_ordered_vertices_by_marker.get(marker_index)
+
+            if previous_vertices is None:
+                correspondence_indices[pair] = 0
+                continue
+
+            best_temporal_index, best_temporal_error = 0, float("inf")
+
+            for ordering_index, (ordered_vertices_px, _) in enumerate(marker_matches[pair]):
+                centered_vertices = ordered_vertices_px - np.mean(ordered_vertices_px, axis=0)
+                vertex_scale = float(np.sqrt(np.mean(np.sum(centered_vertices*centered_vertices, axis=1))))
+
+                if vertex_scale <= 1e-12:
+                    continue
+
+                normalized_vertices = centered_vertices/vertex_scale
+                temporal_error = float(np.sqrt(np.mean(np.sum(
+                    (normalized_vertices - previous_vertices)**2, axis=1,
+                ))))
+
+                if temporal_error < best_temporal_error:
+                    best_temporal_index = ordering_index
+                    best_temporal_error = temporal_error
+
+            correspondence_indices[pair] = best_temporal_index
+
+        def searchFlexAngles(search_angles_deg: np.ndarray) -> tuple[np.ndarray | None, float, float]:
             best_translation_local, best_error_local, best_angle_local = None, float("inf"), 0.0
 
-            for flex_angle_deg in coarse_angles_deg:
+            for flex_angle_deg in search_angles_deg:
                 translation, reprojection_error = evaluateFlexAngle(float(flex_angle_deg), correspondence_indices)
                 if reprojection_error < best_error_local:
                     best_translation_local = translation
                     best_error_local = reprojection_error
                     best_angle_local = float(flex_angle_deg)
+
+            return best_translation_local, best_error_local, best_angle_local
+
+        def searchFullFlex() -> tuple[np.ndarray | None, float, float]:
+            best_translation_local, best_error_local, best_angle_local = searchFlexAngles(coarse_angles_deg)
 
             if connection is not None and max_rotation_deg > 0.0 and best_translation_local is not None:
                 coarse_step_deg = 2.0*max_rotation_deg/6.0
@@ -2010,27 +2072,44 @@ def createMeasurementUsingShapeGroup(
                     np.arange(fine_min, fine_max + 0.5, 1.0),
                     np.array([fine_min, best_angle_local, fine_max]),
                 )))
+                fine_translation, fine_error, fine_angle = searchFlexAngles(fine_angles_deg)
 
-                for flex_angle_deg in fine_angles_deg:
-                    translation, reprojection_error = evaluateFlexAngle(float(flex_angle_deg), correspondence_indices)
-                    if reprojection_error < best_error_local:
-                        best_translation_local = translation
-                        best_error_local = reprojection_error
-                        best_angle_local = float(flex_angle_deg)
+                if fine_translation is not None and fine_error < best_error_local:
+                    best_translation_local, best_error_local, best_angle_local = fine_translation, fine_error, fine_angle
 
             return best_translation_local, best_error_local, best_angle_local
 
-        initial_search_timing_start = time.perf_counter()
-        best_translation, best_reprojection_error, best_flex_angle_deg = searchFlex()
-        pnp_initial_search_seconds += time.perf_counter() - initial_search_timing_start
+        # Most consecutive video frames should have almost the same fold angle. Try only a
+        # +/-2 degree neighborhood around the previous good solution first. A poor local fit
+        # immediately falls back to the original coarse + fine search, so this does not restrict
+        # how quickly the physical hinge is allowed to move.
+        WARM_START_RADIUS_DEG = 2.0
+
+        best_translation, best_reprojection_error, best_flex_angle_deg = None, float("inf"), 0.0
+
+        if connection is not None and warm_start_angle_deg is not None and max_rotation_deg > 0.0:
+            warm_angles_deg = np.arange(
+                max(-max_rotation_deg, warm_start_angle_deg - WARM_START_RADIUS_DEG),
+                min(+max_rotation_deg, warm_start_angle_deg + WARM_START_RADIUS_DEG) + 0.5,
+                1.0,
+            )
+            warm_angles_deg = np.unique(np.append(warm_angles_deg, np.clip(warm_start_angle_deg, -max_rotation_deg, max_rotation_deg)))
+
+            warm_start_timing_start = time.perf_counter()
+            best_translation, best_reprojection_error, best_flex_angle_deg = searchFlexAngles(warm_angles_deg)
+            pnp_warm_start_seconds += time.perf_counter() - warm_start_timing_start
+
+        if best_translation is None or best_reprojection_error > warm_start_accept_error_px:
+            full_search_timing_start = time.perf_counter()
+            best_translation, best_reprojection_error, best_flex_angle_deg = searchFullFlex()
+            pnp_full_search_seconds += time.perf_counter() - full_search_timing_start
 
         # If the cheap edge-ratio ordering produced a poor fit, let actual pose reprojection
         # choose the correspondence. Use one detected marker as a PnP anchor, try each of its
         # cyclic/reversed orderings over the coarse flex angles, then project every other marker
         # and choose the ordering that lands closest to that pose. This avoids an exponential
         # Cartesian search over all marker orderings.
-        CORRESPONDENCE_RESCUE_ERROR_PX = 8.0
-        if best_translation is not None and best_reprojection_error > CORRESPONDENCE_RESCUE_ERROR_PX and len(best_assignment) >= 2:
+        if best_translation is not None and best_reprojection_error > correspondence_rescue_error_px and len(best_assignment) >= 2:
             rescue_timing_start = time.perf_counter()
             anchor_pair = max(best_assignment, key=lambda pair: plane_marker_specs[pair[1]][1].num_sides)
             best_rescue_indices = correspondence_indices.copy()
@@ -2172,12 +2251,35 @@ def createMeasurementUsingShapeGroup(
             best_result = (
                 best_translation, best_reprojection_error, best_flex_angle_deg,
                 connection, matched_count, total_group_marker_count,
+                dict(correspondence_indices),
             )
 
     if best_result is None:
         return failed_measurement
 
-    best_translation, best_reprojection_error, best_flex_angle_deg, best_connection, matched_count, total_group_marker_count = best_result
+    (
+        best_translation, best_reprojection_error, best_flex_angle_deg,
+        best_connection, matched_count, total_group_marker_count,
+        best_correspondence_indices,
+    ) = best_result
+
+    # Cache only a geometrically credible solution. Save each physical marker's
+    # successful ordered polygon geometry so it can be matched temporally next frame.
+    if best_connection is not None and best_reprojection_error <= correspondence_rescue_error_px:
+        plane_id_1, plane_id_2, _ = best_connection
+        warm_start_key = (id(object_vision_spec), frozenset((plane_id_1, plane_id_2)))
+        _PNP_WARM_START_ANGLES_DEG[warm_start_key] = best_flex_angle_deg
+        ordered_vertices_by_marker = {}
+
+        for (shape_index, marker_index), correspondence_index in best_correspondence_indices.items():
+            ordered_vertices_px = marker_matches[(shape_index, marker_index)][correspondence_index][0]
+            centered_vertices = ordered_vertices_px - np.mean(ordered_vertices_px, axis=0)
+            vertex_scale = float(np.sqrt(np.mean(np.sum(centered_vertices*centered_vertices, axis=1))))
+
+            if vertex_scale > 1e-12:
+                ordered_vertices_by_marker[marker_index] = (centered_vertices/vertex_scale).copy()
+
+        _PNP_WARM_START_ORDERED_VERTICES[warm_start_key] = ordered_vertices_by_marker
 
     if best_connection is not None and not _timing_warmup:
         plane_id_1, plane_id_2, _ = best_connection
@@ -2190,7 +2292,8 @@ def createMeasurementUsingShapeGroup(
     if measurement_debug is not None:
         measurement_debug.setTiming("PnP setup + correspondences", pnp_setup_seconds)
         measurement_debug.setTiming("PnP marker assignment", pnp_assignment_seconds)
-        measurement_debug.setTiming("PnP initial flex search", pnp_initial_search_seconds)
+        measurement_debug.setTiming("PnP warm-start search", pnp_warm_start_seconds)
+        measurement_debug.setTiming("PnP full flex search", pnp_full_search_seconds)
         measurement_debug.setTiming("PnP correspondence rescue", pnp_rescue_seconds)
         measurement_debug.setTiming("PnP total", pnp_total_seconds)
         detection_total_ms = measurement_debug.timings_ms.get("2D detection total")
