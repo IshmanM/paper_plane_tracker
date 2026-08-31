@@ -1,6 +1,7 @@
 import argparse
 import math
 import re
+import time
 from enum import Enum, auto
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from src.primary.geometry import estimateObjectWorldPosition
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpecId
 from src.primary.detection import (
     DetectionDebug, Measurement,
-    findSingleObjectUsingBestShapeGroup, findSingleObjectSphere, detectArucoMarker,
+    findSingleObjectUsingBestShapeGroup, findSingleObjectSphere, detectArucoMarker, detectSingleObject,
     createMeasurementUsingShapeGroup, drawDetection, drawModelOrigin,
 )
 
@@ -30,6 +31,9 @@ DEFAULT_WINDOW_HEIGHT = 900
 STATUS_BAR_HEIGHT = 58
 ZOOM_STEP = 1.25
 MAX_ZOOM = 10.0
+
+MAIN_BENCHMARK_WARMUP_RUNS = 3
+MAIN_BENCHMARK_TIMED_RUNS = 20
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 
@@ -317,8 +321,89 @@ def showDetectionStages(
     return 0
 
 
+
+def createMainEquivalentBenchmarkStage(
+    frame: np.ndarray, object_vision_spec_id: ObjectVisionSpecId,
+    camera_calibration: CameraCalibration, debug: DetectionDebug,
+) -> np.ndarray:
+    """Benchmark the exact public detection call used by main.py on this static frame."""
+    for _ in range(MAIN_BENCHMARK_WARMUP_RUNS):
+        detectSingleObject(frame, object_vision_spec_id, camera_calibration)
+
+    elapsed_times_ms = []
+
+    for _ in range(MAIN_BENCHMARK_TIMED_RUNS):
+        start_s = time.perf_counter()
+        detectSingleObject(frame, object_vision_spec_id, camera_calibration)
+        elapsed_times_ms.append((time.perf_counter() - start_s)*1000.0)
+
+    elapsed_times_ms = np.asarray(elapsed_times_ms, dtype=np.float64)
+    median_ms = float(np.median(elapsed_times_ms))
+    mean_ms = float(np.mean(elapsed_times_ms))
+    minimum_ms = float(np.min(elapsed_times_ms))
+    maximum_ms = float(np.max(elapsed_times_ms))
+
+    internal_total_ms = debug.timings_ms.get("TOTAL vision")
+    delta_ms = None if internal_total_ms is None else median_ms - internal_total_ms
+
+    print()
+    print("MAIN-equivalent detectSingleObject benchmark:")
+    print(f"  warm-up runs: {MAIN_BENCHMARK_WARMUP_RUNS}")
+    print(f"  timed runs: {MAIN_BENCHMARK_TIMED_RUNS}")
+    print(f"  median: {median_ms:.2f} ms")
+    print(f"  mean:   {mean_ms:.2f} ms")
+    print(f"  min:    {minimum_ms:.2f} ms")
+    print(f"  max:    {maximum_ms:.2f} ms")
+
+    if internal_total_ms is not None:
+        print(f"  internal staged total: {internal_total_ms:.2f} ms")
+        print(f"  median - internal:     {delta_ms:+.2f} ms")
+
+    benchmark_image = np.full_like(frame, 25)
+    lines = [
+        "MAIN-EQUIVALENT detectSingleObject BENCHMARK",
+        f"Warm-up: {MAIN_BENCHMARK_WARMUP_RUNS} calls | Timed: {MAIN_BENCHMARK_TIMED_RUNS} calls",
+        "",
+        f"Median: {median_ms:.2f} ms",
+        f"Mean:   {mean_ms:.2f} ms",
+        f"Min:    {minimum_ms:.2f} ms",
+        f"Max:    {maximum_ms:.2f} ms",
+    ]
+
+    if internal_total_ms is not None:
+        lines.extend([
+            "",
+            f"Internal staged total: {internal_total_ms:.2f} ms",
+            f"Median - internal:     {delta_ms:+.2f} ms",
+        ])
+
+    lines.extend([
+        "",
+        "This calls the same detectSingleObject(...) path as main.py.",
+        "Static repeated image: useful sanity check, not live-motion timing.",
+    ])
+
+    y = 34
+    for line_index, line in enumerate(lines):
+        if not line:
+            y += 14
+            continue
+
+        font_scale = 0.62 if line_index == 0 else 0.54
+        thickness = 2 if line_index == 0 else 1
+
+        cv2.putText(
+            benchmark_image, line, (18, y),
+            cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+            (245, 245, 245), thickness, cv2.LINE_AA,
+        )
+        y += 28
+
+    return benchmark_image
+
 def runDetectionOnImage(
-    image_path: Path, algorithm: DetectionAlgorithm, object_vision_spec, camera_calibration: CameraCalibration,
+    image_path: Path, algorithm: DetectionAlgorithm, object_vision_spec_id: ObjectVisionSpecId,
+    object_vision_spec, camera_calibration: CameraCalibration,
 ) -> tuple[list[tuple[str, np.ndarray]], object, object]:
     frame = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
 
@@ -409,6 +494,11 @@ def runDetectionOnImage(
             cv2.putText(final_frame, line, (20, line_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
         debug.addStage("Final detection + measurement", final_frame)
+
+    benchmark_stage = createMainEquivalentBenchmarkStage(
+        frame, object_vision_spec_id, camera_calibration, debug,
+    )
+    debug.addStage("Main-equivalent benchmark", benchmark_stage)
 
     print(f"Recorded stages: {len(debug.stages)}")
     return debug.stages, detection, measurement
@@ -506,14 +596,18 @@ def main() -> None:
     print(f"Debug save directory: {output_directory.resolve()}")
 
     if args.no_gui:
-        runDetectionOnImage(image_paths[image_index], algorithm, object_vision_spec, camera_calibration)
+        runDetectionOnImage(
+            image_paths[image_index], algorithm, object_vision_spec_id, object_vision_spec, camera_calibration,
+        )
         return
 
     print("Viewer: A/Left/P = previous | D/Right/N = next | S = save stages | Q/Esc = quit")
 
     while True:
         image_path = image_paths[image_index]
-        stages, _, _ = runDetectionOnImage(image_path, algorithm, object_vision_spec, camera_calibration)
+        stages, _, _ = runDetectionOnImage(
+            image_path, algorithm, object_vision_spec_id, object_vision_spec, camera_calibration,
+        )
 
         navigation = showDetectionStages(
             stages, args.columns, output_directory,

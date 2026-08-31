@@ -1834,6 +1834,7 @@ def createMeasurementUsingShapeGroup(
     # Preserve the original pixel thresholds as minimums so distant detections do not
     # become more permissive.
     warm_start_accept_error_px = max(6.0, 0.020*bbox_diagonal_px)
+    warm_start_severe_error_px = max(12.0, 0.040*bbox_diagonal_px)
     correspondence_rescue_error_px = max(8.0, 0.025*bbox_diagonal_px)
 
     planes_by_id = {rigid_plane.plane_id: rigid_plane for rigid_plane in object_vision_spec.rigid_planes}
@@ -2086,30 +2087,65 @@ def createMeasurementUsingShapeGroup(
         WARM_START_RADIUS_DEG = 2.0
 
         best_translation, best_reprojection_error, best_flex_angle_deg = None, float("inf"), 0.0
+        accepted_warm_solution = False
 
         if connection is not None and warm_start_angle_deg is not None and max_rotation_deg > 0.0:
-            warm_angles_deg = np.arange(
-                max(-max_rotation_deg, warm_start_angle_deg - WARM_START_RADIUS_DEG),
-                min(+max_rotation_deg, warm_start_angle_deg + WARM_START_RADIUS_DEG) + 0.5,
-                1.0,
-            )
-            warm_angles_deg = np.unique(np.append(warm_angles_deg, np.clip(warm_start_angle_deg, -max_rotation_deg, max_rotation_deg)))
+            warm_min_deg = max(-max_rotation_deg, warm_start_angle_deg - WARM_START_RADIUS_DEG)
+            warm_max_deg = min(+max_rotation_deg, warm_start_angle_deg + WARM_START_RADIUS_DEG)
+            warm_angles_deg = np.arange(warm_min_deg, warm_max_deg + 0.5, 1.0)
+            warm_angles_deg = np.unique(np.append(
+                warm_angles_deg,
+                np.clip(warm_start_angle_deg, -max_rotation_deg, max_rotation_deg),
+            ))
 
             warm_start_timing_start = time.perf_counter()
             best_translation, best_reprojection_error, best_flex_angle_deg = searchFlexAngles(warm_angles_deg)
             pnp_warm_start_seconds += time.perf_counter() - warm_start_timing_start
 
-        if best_translation is None or best_reprojection_error > warm_start_accept_error_px:
+            # A blurry frame can have a higher absolute reprojection error even when the
+            # local hinge minimum is still obvious. Expand to the full search only when:
+            #   1) no local solution exists,
+            #   2) the best angle sits on a local-window edge with unexplored hinge range
+            #      beyond that edge, or
+            #   3) the local fit is genuinely terrible.
+            EDGE_TOLERANCE_DEG = 0.51
+            best_at_expandable_lower_edge = (
+                abs(best_flex_angle_deg - warm_min_deg) <= EDGE_TOLERANCE_DEG
+                and warm_min_deg > -max_rotation_deg + 1e-9
+            )
+            best_at_expandable_upper_edge = (
+                abs(best_flex_angle_deg - warm_max_deg) <= EDGE_TOLERANCE_DEG
+                and warm_max_deg < +max_rotation_deg - 1e-9
+            )
+            warm_needs_full_search = (
+                best_translation is None
+                or best_at_expandable_lower_edge
+                or best_at_expandable_upper_edge
+                or best_reprojection_error > warm_start_severe_error_px
+            )
+
+            accepted_warm_solution = not warm_needs_full_search
+
+        else:
+            warm_needs_full_search = True
+
+        if warm_needs_full_search:
             full_search_timing_start = time.perf_counter()
             best_translation, best_reprojection_error, best_flex_angle_deg = searchFullFlex()
             pnp_full_search_seconds += time.perf_counter() - full_search_timing_start
+            accepted_warm_solution = False
 
         # If the cheap edge-ratio ordering produced a poor fit, let actual pose reprojection
         # choose the correspondence. Use one detected marker as a PnP anchor, try each of its
         # cyclic/reversed orderings over the coarse flex angles, then project every other marker
         # and choose the ordering that lands closest to that pose. This avoids an exponential
         # Cartesian search over all marker orderings.
-        if best_translation is not None and best_reprojection_error > correspondence_rescue_error_px and len(best_assignment) >= 2:
+        if (
+            not accepted_warm_solution
+            and best_translation is not None
+            and best_reprojection_error > correspondence_rescue_error_px
+            and len(best_assignment) >= 2
+        ):
             rescue_timing_start = time.perf_counter()
             anchor_pair = max(best_assignment, key=lambda pair: plane_marker_specs[pair[1]][1].num_sides)
             best_rescue_indices = correspondence_indices.copy()
@@ -2265,7 +2301,7 @@ def createMeasurementUsingShapeGroup(
 
     # Cache only a geometrically credible solution. Save each physical marker's
     # successful ordered polygon geometry so it can be matched temporally next frame.
-    if best_connection is not None and best_reprojection_error <= correspondence_rescue_error_px:
+    if best_connection is not None and best_reprojection_error <= warm_start_severe_error_px:
         plane_id_1, plane_id_2, _ = best_connection
         warm_start_key = (id(object_vision_spec), frozenset((plane_id_1, plane_id_2)))
         _PNP_WARM_START_ANGLES_DEG[warm_start_key] = best_flex_angle_deg
