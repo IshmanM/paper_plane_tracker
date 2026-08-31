@@ -892,6 +892,25 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
     if not polygon_markers:
         return None
 
+    # Paper-plane acquisition mirrors the useful first stages of the tennis-ball detector:
+    # LAB chroma response -> LAB hotspots -> candidate ROIs -> loose HSV seed. The existing
+    # polygon/straight-edge refinement remains responsible for the actual marker geometry.
+    GLOBAL_BLUR_KERNEL = (5, 5)
+    HOTSPOT_PERCENTILE = 98.5
+    MIN_HOTSPOT_RESPONSE_FACTOR = 0.30
+    MIN_LAB_DIRECTION_COSINE = 0.75
+    MIN_HOTSPOT_AREA_PX = 6
+    HOTSPOT_PADDING_FACTOR = 0.75
+    MIN_HOTSPOT_PADDING_PX = 10
+    EXTRA_HOTSPOT_CANDIDATES = 2
+    LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 40, 15], dtype=np.int16)
+
+    # Optional seam/shadow recovery analogous to the tennis-ball path. Off initially because
+    # the paper-plane markers should normally be continuous colored regions on white paper.
+    KEEP_FRAGMENTED_HSV_COMPONENTS = False
+    MIN_SECONDARY_SEED_AREA_FACTOR = 0.15
+    MAX_SECONDARY_SEED_DISTANCE_FACTOR = 1.25
+
     unique_color_ids = list(dict.fromkeys(marker.color_id for marker in polygon_markers))
     expected_num_sides_by_color = {
         color_id: sorted(set(marker.num_sides for marker in polygon_markers if marker.color_id == color_id))
@@ -905,11 +924,40 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
         for color_id in unique_color_ids
     }
 
+    # Cap LAB candidates from the model rather than using one fixed global number. Because the
+    # normal view contains one plane or one connected pair, allow the maximum expected number of
+    # same-color markers in either case plus a small amount of clutter headroom.
+    planes_by_id = {plane.plane_id: plane for plane in object_vision_spec.rigid_planes}
+    color_counts_by_plane = {
+        plane.plane_id: Counter(
+            marker.color_id for marker in plane.shape_markers if marker.num_sides != 0
+        )
+        for plane in object_vision_spec.rigid_planes
+    }
+    max_hotspot_candidates_by_color = {}
+
+    for color_id in unique_color_ids:
+        max_expected = max((counts[color_id] for counts in color_counts_by_plane.values()), default=0)
+
+        for plane_id_1, plane_id_2, _ in object_vision_spec.rigid_plane_connections:
+            if plane_id_1 in planes_by_id and plane_id_2 in planes_by_id:
+                pair_count = color_counts_by_plane[plane_id_1][color_id] + color_counts_by_plane[plane_id_2][color_id]
+                max_expected = max(max_expected, pair_count)
+
+        max_hotspot_candidates_by_color[color_id] = max(1, max_expected) + EXTRA_HOTSPOT_CANDIDATES
+
+    blurred_frame = cv2.GaussianBlur(frame, GLOBAL_BLUR_KERNEL, 0)
+    lab_frame = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2LAB)
+    _, a_u8, b_u8 = cv2.split(lab_frame)
+    a = a_u8.astype(np.float32) - 128.0
+    b = b_u8.astype(np.float32) - 128.0
     hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
     shape_candidates: list[ShapeDetection] = []
     combined_raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
     combined_cleaned_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    hsv_cleanup_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    hotspot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
 
     if debug is not None:
         debug.stages.clear()
@@ -918,40 +966,231 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
     else:
         contour_debug_frame = polygon_debug_frame = candidate_debug_frame = None
 
-    # Threshold and clean each marker color independently.
     for color_id in unique_color_ids:
         color_spec = COLOR_SPECS[color_id]
         color_name = color_id.name
         draw_bgr = color_spec.draw_bgr
-        raw_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+
+        if color_spec.lab_value is None:
+            raise ValueError(f"Paper-plane shape detection requires ColorSpec.lab_value for {color_id}")
+
+        # Step 1: Continuous LAB chroma response for this marker color.
+        lab_direction = color_spec.lab_value[1:3].astype(np.float32) - 128.0
+        reference_chroma_strength = float(np.linalg.norm(lab_direction))
+
+        if reference_chroma_strength <= 0.0:
+            raise ValueError(f"ColorSpec.lab_value for {color_id} does not define a valid chroma direction")
+
+        lab_direction /= reference_chroma_strength
+        lab_color_response = a*float(lab_direction[0]) + b*float(lab_direction[1])
+
+        # Unlike the single-color tennis-ball case, multiple marker colors can have positive
+        # projections onto one another's LAB directions. Require the pixel chroma direction to
+        # actually point near this target color before letting its magnitude compete for hotspots.
+        pixel_chroma_strength = np.sqrt(a*a + b*b)
+        lab_direction_cosine = np.divide(
+            lab_color_response, pixel_chroma_strength,
+            out=np.full_like(lab_color_response, -1.0), where=pixel_chroma_strength > 1e-6,
+        )
+        aligned_response = np.where(
+            lab_direction_cosine >= MIN_LAB_DIRECTION_COSINE,
+            np.maximum(lab_color_response, 0.0), 0.0,
+        )
+
+        # Step 2: Find strong target-color LAB hotspots using both an absolute chroma floor and
+        # a high within-frame percentile, then lightly clean the hotspot mask.
+        minimum_hotspot_response = MIN_HOTSPOT_RESPONSE_FACTOR*reference_chroma_strength
+        percentile_hotspot_response = float(np.percentile(aligned_response, HOTSPOT_PERCENTILE))
+        hotspot_threshold = max(minimum_hotspot_response, percentile_hotspot_response)
+        hotspot_mask = (aligned_response >= hotspot_threshold).astype(np.uint8)*255
+        hotspot_mask = cv2.morphologyEx(hotspot_mask, cv2.MORPH_CLOSE, hotspot_kernel)
+        hotspot_mask = cv2.erode(hotspot_mask, hotspot_kernel, iterations=1)
+        hotspot_mask = cv2.dilate(hotspot_mask, hotspot_kernel, iterations=1)
+
+        if debug is not None:
+            response_debug = np.clip(4.0*aligned_response, 0, 255).astype(np.uint8)
+            debug.addStage(f"LAB color response - {color_name}", response_debug)
+            debug.addStage(f"LAB hotspot mask - {color_name}", hotspot_mask)
+
+        # Step 3: Rank spatially distinct hotspot components and keep only as many as the model
+        # says could plausibly exist for this color, plus two clutter candidates.
+        num_hotspot_labels, hotspot_labels, hotspot_stats, _ = cv2.connectedComponentsWithStats(hotspot_mask, connectivity=8)
+        response_sums = np.bincount(
+            hotspot_labels.ravel(), weights=aligned_response.ravel(), minlength=num_hotspot_labels,
+        )
+        hotspot_candidates = []
+
+        for hotspot_label in range(1, num_hotspot_labels):
+            area = int(hotspot_stats[hotspot_label, cv2.CC_STAT_AREA])
+            if area < MIN_HOTSPOT_AREA_PX:
+                continue
+
+            x = int(hotspot_stats[hotspot_label, cv2.CC_STAT_LEFT])
+            y = int(hotspot_stats[hotspot_label, cv2.CC_STAT_TOP])
+            w = int(hotspot_stats[hotspot_label, cv2.CC_STAT_WIDTH])
+            h = int(hotspot_stats[hotspot_label, cv2.CC_STAT_HEIGHT])
+            mean_response = float(response_sums[hotspot_label]/max(area, 1))
+            score = mean_response*(area**0.10)
+            hotspot_candidates.append((score, area, x, y, w, h, mean_response, hotspot_label))
+
+        hotspot_candidates.sort(key=lambda candidate: candidate[0], reverse=True)
+        selected_hotspots = []
+
+        for candidate in hotspot_candidates:
+            _, _, x, y, w, h, _, _ = candidate
+            center_x, center_y = x + 0.5*w, y + 0.5*h
+            duplicate = False
+
+            for selected in selected_hotspots:
+                _, _, sx, sy, sw, sh, _, _ = selected
+                selected_center_x, selected_center_y = sx + 0.5*sw, sy + 0.5*sh
+                duplicate_distance = 0.75*max(w, h, sw, sh)
+
+                if (center_x - selected_center_x)**2 + (center_y - selected_center_y)**2 < duplicate_distance**2:
+                    duplicate = True
+                    break
+
+            if not duplicate:
+                selected_hotspots.append(candidate)
+            if len(selected_hotspots) >= max_hotspot_candidates_by_color[color_id]:
+                break
+
+        if debug is not None:
+            hotspot_debug = frame.copy()
+            for candidate_index, (score, area, x, y, w, h, mean_response, _) in enumerate(selected_hotspots, start=1):
+                cv2.rectangle(hotspot_debug, (x, y), (x + w, y + h), draw_bgr, 1)
+                cv2.putText(
+                    hotspot_debug,
+                    f"{candidate_index}: area={area} resp={mean_response:.1f} score={score:.1f}",
+                    (x, max(15, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.40, draw_bgr, 1, cv2.LINE_AA,
+                )
+            debug.addStage(
+                f"LAB hotspot candidates - {color_name} ({len(selected_hotspots)}/{max_hotspot_candidates_by_color[color_id]} cap)",
+                hotspot_debug,
+            )
+
+        if not selected_hotspots:
+            continue
+
+        # Step 4: Build one loose HSV mask for this color. Each LAB hotspot ROI selects the HSV
+        # connected component that actually overlaps that hotspot; using global component labels
+        # avoids clipping a long triangle merely because the strongest LAB hotspot was small.
+        raw_loose_hsv_mask = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
 
         for lower_hsv, upper_hsv in color_spec.hsv_ranges:
-            raw_mask = cv2.bitwise_or(raw_mask, cv2.inRange(hsv_frame, lower_hsv, upper_hsv))
+            loose_lower_hsv = np.clip(
+                lower_hsv.astype(np.int16) - LOOSE_HSV_LOWER_SUBTRACTION, 0, 255,
+            ).astype(np.uint8)
+            raw_loose_hsv_mask = cv2.bitwise_or(raw_loose_hsv_mask, cv2.inRange(hsv_frame, loose_lower_hsv, upper_hsv))
 
-        combined_raw_mask = cv2.bitwise_or(combined_raw_mask, raw_mask)
+        cleaned_loose_hsv_mask = cv2.medianBlur(raw_loose_hsv_mask, 3)
+        cleaned_loose_hsv_mask = cv2.morphologyEx(cleaned_loose_hsv_mask, cv2.MORPH_CLOSE, hsv_cleanup_kernel)
+        combined_raw_mask = cv2.bitwise_or(combined_raw_mask, raw_loose_hsv_mask)
+        combined_cleaned_mask = cv2.bitwise_or(combined_cleaned_mask, cleaned_loose_hsv_mask)
 
         if debug is not None:
-            debug.addStage(f"Raw mask - {color_name}", raw_mask)
+            debug.addStage(f"Loose HSV mask - {color_name}", raw_loose_hsv_mask)
+            debug.addStage(f"Cleaned loose HSV mask - {color_name}", cleaned_loose_hsv_mask)
 
-        cleaned_mask = cv2.medianBlur(raw_mask, 3)
-        cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, kernel)
-        combined_cleaned_mask = cv2.bitwise_or(combined_cleaned_mask, cleaned_mask)
+        num_seed_labels, seed_labels, seed_stats, _ = cv2.connectedComponentsWithStats(cleaned_loose_hsv_mask, connectivity=8)
+        used_primary_seed_labels = set()
 
-        if debug is not None:
-            debug.addStage(f"Cleaned mask - {color_name}", cleaned_mask)
+        for candidate_index, (_, _, hot_x, hot_y, hot_w, hot_h, _, hotspot_label) in enumerate(selected_hotspots, start=1):
+            hotspot_size = max(hot_w, hot_h)
+            padding = max(MIN_HOTSPOT_PADDING_PX, int(HOTSPOT_PADDING_FACTOR*hotspot_size))
+            x1, y1 = max(0, hot_x - padding), max(0, hot_y - padding)
+            x2, y2 = min(frame.shape[1], hot_x + hot_w + padding), min(frame.shape[0], hot_y + hot_h + padding)
 
-        contours, _ = cv2.findContours(cleaned_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if x2 <= x1 or y2 <= y1:
+                continue
 
-        # Approximate each qualifying contour against every polygon type configured for this color.
-        for contour in contours:
+            hotspot_component_roi = hotspot_labels[y1:y2, x1:x2] == hotspot_label
+            seed_labels_roi = seed_labels[y1:y2, x1:x2]
+            best_seed = None
+
+            for seed_label in np.unique(seed_labels_roi[hotspot_component_roi]):
+                seed_label = int(seed_label)
+                if seed_label == 0 or seed_label in used_primary_seed_labels:
+                    continue
+
+                seed_area = int(seed_stats[seed_label, cv2.CC_STAT_AREA])
+                if seed_area < minimum_shape_area_by_color[color_id]:
+                    continue
+
+                overlap = int(np.count_nonzero((seed_labels_roi == seed_label) & hotspot_component_roi))
+                if overlap <= 0:
+                    continue
+
+                if best_seed is None or (overlap, seed_area) > (best_seed[0], best_seed[1]):
+                    best_seed = (overlap, seed_area, seed_label)
+
+            if debug is not None:
+                roi_debug = frame.copy()
+                cv2.rectangle(roi_debug, (x1, y1), (x2 - 1, y2 - 1), draw_bgr, 1)
+                cv2.rectangle(roi_debug, (hot_x, hot_y), (hot_x + hot_w, hot_y + hot_h), (255, 255, 255), 1)
+                debug.addStage(f"{color_name} candidate {candidate_index} ROI", roi_debug)
+                debug.addStage(
+                    f"{color_name} candidate {candidate_index} loose HSV seed mask",
+                    cleaned_loose_hsv_mask[y1:y2, x1:x2],
+                )
+
+            if best_seed is None:
+                continue
+
+            _, seed_area, primary_seed_label = best_seed
+            used_primary_seed_labels.add(primary_seed_label)
+            keep_seed_label = np.zeros(num_seed_labels, dtype=np.uint8)
+            keep_seed_label[primary_seed_label] = 255
+
+            # Step 5 (optional/off): recover substantial nearby HSV components if real lighting
+            # later splits a marker into pieces. This is deliberately inactive for the first tests.
+            if KEEP_FRAGMENTED_HSV_COMPONENTS:
+                sx = int(seed_stats[primary_seed_label, cv2.CC_STAT_LEFT])
+                sy = int(seed_stats[primary_seed_label, cv2.CC_STAT_TOP])
+                sw = int(seed_stats[primary_seed_label, cv2.CC_STAT_WIDTH])
+                sh = int(seed_stats[primary_seed_label, cv2.CC_STAT_HEIGHT])
+                seed_center_x, seed_center_y = sx + 0.5*sw, sy + 0.5*sh
+                min_secondary_area = MIN_SECONDARY_SEED_AREA_FACTOR*seed_area
+                max_secondary_distance_sq = (MAX_SECONDARY_SEED_DISTANCE_FACTOR*max(sw, sh))**2
+
+                for other_label in range(1, num_seed_labels):
+                    if other_label == primary_seed_label:
+                        continue
+
+                    other_area = int(seed_stats[other_label, cv2.CC_STAT_AREA])
+                    if other_area < min_secondary_area:
+                        continue
+
+                    ox = int(seed_stats[other_label, cv2.CC_STAT_LEFT])
+                    oy = int(seed_stats[other_label, cv2.CC_STAT_TOP])
+                    ow = int(seed_stats[other_label, cv2.CC_STAT_WIDTH])
+                    oh = int(seed_stats[other_label, cv2.CC_STAT_HEIGHT])
+                    dx = ox + 0.5*ow - seed_center_x
+                    dy = oy + 0.5*oh - seed_center_y
+
+                    if dx*dx + dy*dy <= max_secondary_distance_sq:
+                        keep_seed_label[other_label] = 255
+
+            selected_seed_mask = keep_seed_label[seed_labels]
+
+            if debug is not None:
+                debug.addStage(f"{color_name} candidate {candidate_index} selected HSV component", selected_seed_mask)
+
+            contours, _ = cv2.findContours(selected_seed_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+
+            contour = max(contours, key=cv2.contourArea)
+            contour_area = cv2.contourArea(contour)
+
             if contour_debug_frame is not None:
                 cv2.drawContours(contour_debug_frame, [contour], -1, draw_bgr, 1)
 
-            if cv2.contourArea(contour) < minimum_shape_area_by_color[color_id]:
+            if contour_area < minimum_shape_area_by_color[color_id]:
                 continue
 
-            # Current polygon detection assumes convex markers. The convex hull bridges small contour
-            # defects but intentionally removes concavities. TODO: handle concave markers separately if needed.
+            # Existing polygon geometry path: convex hull -> approxPolyDP -> straight-edge fitting
+            # and line intersection. This is intentionally retained before trying LAB edge refinement.
             hull = cv2.convexHull(contour)
             perimeter = cv2.arcLength(hull, True)
 
@@ -963,7 +1202,10 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
             if polygon_debug_frame is not None:
                 cv2.polylines(polygon_debug_frame, [base_polygon], True, draw_bgr, 1)
                 polygon_center = np.mean(base_polygon.reshape(-1, 2), axis=0).astype(np.int32)
-                cv2.putText(polygon_debug_frame, f"{color_name}: {len(base_polygon)} vertices", tuple(polygon_center), cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_bgr, 1, cv2.LINE_AA)
+                cv2.putText(
+                    polygon_debug_frame, f"{color_name}: {len(base_polygon)} vertices", tuple(polygon_center),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_bgr, 1, cv2.LINE_AA,
+                )
 
             expected_num_sides = expected_num_sides_by_color[color_id]
 
@@ -974,12 +1216,13 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
                 candidate_polygons = []
                 for num_sides in expected_num_sides:
                     if len(base_polygon) == num_sides + 1:
-                        retry_polygon = cv2.approxPolyDP(contour, (object_vision_spec.polygon_epsilon_ratio + 0.02)*perimeter, True)
+                        retry_polygon = cv2.approxPolyDP(
+                            contour, (object_vision_spec.polygon_epsilon_ratio + 0.02)*perimeter, True,
+                        )
                         if len(retry_polygon) == num_sides:
                             candidate_polygons.append((num_sides, retry_polygon))
 
             for num_sides, polygon in candidate_polygons:
-                # Concave polygon markers are currently unsupported.
                 if not cv2.isContourConvex(polygon):
                     continue
 
@@ -992,12 +1235,28 @@ def findSingleObjectUsingBestShapeGroup(frame: np.ndarray, object_vision_spec: O
                     shape_points = np.round(vertices_px).astype(np.int32).reshape(-1, 1, 2)
                     cv2.polylines(candidate_debug_frame, [shape_points], True, draw_bgr, 1)
                     cv2.circle(candidate_debug_frame, tuple(center_px), 4, draw_bgr, -1)
-                    cv2.putText(candidate_debug_frame, f"S{shape_index}: {color_name}, N={num_sides}", (int(center_px[0]) + 5, int(center_px[1]) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_bgr, 1, cv2.LINE_AA)
+                    cv2.putText(
+                        candidate_debug_frame, f"S{shape_index}: {color_name}, N={num_sides}",
+                        (int(center_px[0]) + 5, int(center_px[1]) - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, draw_bgr, 1, cv2.LINE_AA,
+                    )
+
+                if debug is not None:
+                    rough_debug = frame.copy()
+                    cv2.polylines(rough_debug, [polygon], True, draw_bgr, 2)
+                    debug.addStage(f"{color_name} candidate {candidate_index} rough polygon", rough_debug)
+
+                    refined_debug = frame.copy()
+                    refined_points = np.round(vertices_px).astype(np.int32).reshape(-1, 1, 2)
+                    cv2.polylines(refined_debug, [refined_points], True, draw_bgr, 2)
+                    for vertex_u, vertex_v in np.round(vertices_px).astype(np.int32):
+                        cv2.circle(refined_debug, (int(vertex_u), int(vertex_v)), 4, draw_bgr, -1)
+                    debug.addStage(f"{color_name} candidate {candidate_index} refined polygon", refined_debug)
 
     if debug is not None:
         debug.addStage("Combined raw mask", combined_raw_mask)
         debug.addStage("Combined cleaned mask", combined_cleaned_mask)
-        debug.addStage("All mask contours", contour_debug_frame)
+        debug.addStage("All selected HSV contours", contour_debug_frame)
         debug.addStage("Polygon approximations", polygon_debug_frame)
 
         if not shape_candidates:

@@ -41,7 +41,7 @@ COLOR_SPECS = {
         draw_bgr=(0, 255, 0),
         lab_value=np.array([242, 95, 201], dtype=np.uint8),
     ),
-
+    
     ColorId.GREEN: ColorSpec(
         hsv_ranges=[
             (
@@ -49,6 +49,7 @@ COLOR_SPECS = {
                 np.array([82, 180, 235], dtype=np.uint8),
             ),
         ],
+        lab_value=np.array([145, 96, 144], dtype=np.uint8),
         draw_bgr=(0, 255, 0),
     ),
 
@@ -59,6 +60,7 @@ COLOR_SPECS = {
                 np.array([106, 220, 185], dtype=np.uint8),
             ),
         ],
+        lab_value=np.array([117, 115, 110], dtype=np.uint8),
         draw_bgr=(255, 255, 0),
     ),
 
@@ -69,6 +71,7 @@ COLOR_SPECS = {
                 np.array([170, 255, 255], dtype=np.uint8),
             ),
         ],
+        lab_value=np.array([114, 193, 91], dtype=np.uint8),
         draw_bgr=(255, 0, 255),
     ),
 }
