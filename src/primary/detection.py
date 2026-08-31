@@ -831,8 +831,11 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
         residuals = np.abs(line_direction[0]*relative_points[:, 1] - line_direction[1]*relative_points[:, 0])
         edge_fit_error = float(np.sqrt(np.mean(residuals**2)))
 
-        # Poorly supported lines are too risky to extrapolate into a corner.
-        if edge_fit_error > 1.0:
+        # Allow modest raster/mask roughness, especially on long marker edges. A fixed 1 px RMS
+        # cutoff was too strict: one slightly jagged edge could cancel refinement for the entire
+        # polygon and prevent acute corners from being recovered by line intersection.
+        maximum_edge_fit_error_px = min(3.0, max(1.5, 0.01*edge_length))
+        if edge_fit_error > maximum_edge_fit_error_px:
             return rough_vertices
 
         fitted_lines.append((line_point, line_direction))
