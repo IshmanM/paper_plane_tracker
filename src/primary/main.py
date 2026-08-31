@@ -9,6 +9,7 @@ from src.primary.detection import detectSingleObject, drawDetection
 from src.primary.object_vision_spec import ObjectVisionSpecId
 import src.primary.config as config
 from datetime import datetime
+from collections import deque
 import time
 from src.primary.comm_buffer import CommBuffer, cmd_thread_main
 from src.primary.platform import Platform
@@ -29,6 +30,7 @@ WINDOW_NAME = "Webcam Feed"
 DISPLAY_SCALES = (1.0, 1.5, 2.0)
 
 PRINT_DETECTION = False # FOR DEBUG ONLY
+TIMING_WINDOW_FRAMES = 30
 
 OBJECT_VISION_SPEC_IDS = (
     ObjectVisionSpecId.TENNIS_BALL_DEFAULT,  # 1
@@ -120,6 +122,13 @@ if __name__ == "__main__":
 
     detection_label = "No detection"
     track_label = "Dead track"
+    timing_label = "FPS: -- | capture: -- ms | vision: -- ms | meas age: -- ms"
+
+    frame_periods_s = deque(maxlen=TIMING_WINDOW_FRAMES)
+    capture_times_s = deque(maxlen=TIMING_WINDOW_FRAMES)
+    vision_times_s = deque(maxlen=TIMING_WINDOW_FRAMES)
+    measurement_ages_s = deque(maxlen=TIMING_WINDOW_FRAMES)
+    previous_frame_time = None
 
     tracker_paused = False   # OpenCV/tracker runs by default
     platform_paused = True   # Platform OFF by default
@@ -136,7 +145,8 @@ if __name__ == "__main__":
 
     try:
         while cap.isOpened():
-            if not tracker_paused:       
+            if not tracker_paused:
+                capture_start_time = time.perf_counter()
                 ret, frame = cap.read()  # doesn't always give latest frame but that's a future optimization.
                 frame_time = time.perf_counter()
 
@@ -144,8 +154,15 @@ if __name__ == "__main__":
                     print("Possible camera failure")
                     break
 
+                capture_times_s.append(frame_time - capture_start_time)
+                if previous_frame_time is not None:
+                    frame_periods_s.append(frame_time - previous_frame_time)
+                previous_frame_time = frame_time
+
                 # Detect the object and produce a measurement.
+                vision_start_time = time.perf_counter()
                 object_detected, detection, measurement = detectSingleObject(frame, object_vision_spec_id, camera_calibration)
+                vision_times_s.append(time.perf_counter() - vision_start_time)
 
                 if object_detected:
                     last_detection_px_w = detection.px_w
@@ -165,8 +182,22 @@ if __name__ == "__main__":
                     detection_label = f"Measurement: x={measurement.x:.4f}, y={measurement.y:.4f}, z={measurement.z:.4f}"
 
                 # Track the object state and update the platform planner.
+                measurement_age_s = time.perf_counter() - frame_time
+                measurement_ages_s.append(measurement_age_s)
+
+                average_frame_period_s = sum(frame_periods_s)/len(frame_periods_s) if frame_periods_s else 0.0
+                average_capture_s = sum(capture_times_s)/len(capture_times_s)
+                average_vision_s = sum(vision_times_s)/len(vision_times_s)
+                average_measurement_age_s = sum(measurement_ages_s)/len(measurement_ages_s)
+                live_fps = 1.0/average_frame_period_s if average_frame_period_s > 0.0 else 0.0
+                timing_label = (
+                    f"FPS: {live_fps:.1f} | capture: {average_capture_s*1000:.1f} ms | "
+                    f"vision: {average_vision_s*1000:.1f} ms | meas age: {average_measurement_age_s*1000:.1f} ms"
+                )
+
                 if PRINT_DETECTION: # FOR DEBUG ONLY
-                    print(f"measurement age: {(time.perf_counter() - frame_time)*1000:.1f} ms")
+                    print(timing_label)
+
                 track_status = tracker.update(object_detected, measurement, frame_time)
                 platform.update(tracker=tracker)
 
@@ -198,9 +229,10 @@ if __name__ == "__main__":
             drawDisplayText(display_frame, detection_label, (10, 20), (0, 255, 0), display_scale)
             drawDisplayText(display_frame, track_label, (10, 50), (0, 0, 255), display_scale)
             drawDisplayText(display_frame, f"Object: {object_vision_spec_id.name}", (10, 80), (255, 255, 0), display_scale)
+            drawDisplayText(display_frame, timing_label, (10, 110), (255, 255, 255), display_scale)
 
             if tracker_paused:
-                drawDisplayText(display_frame, "TRACKER PAUSED", (10, 110), (0, 0, 255), display_scale)
+                drawDisplayText(display_frame, "TRACKER PAUSED", (10, 140), (0, 0, 255), display_scale)
 
             # Controls.
             drawDisplayText(
@@ -249,6 +281,12 @@ if __name__ == "__main__":
                     last_detection_px_h = 0
                     detection_label = "No detection"
                     track_label = "Dead track"
+                    timing_label = "FPS: -- | capture: -- ms | vision: -- ms | meas age: -- ms"
+                    frame_periods_s.clear()
+                    capture_times_s.clear()
+                    vision_times_s.clear()
+                    measurement_ages_s.clear()
+                    previous_frame_time = None
 
                     print(f"Object vision spec: {object_vision_spec_id.name} | tracker reset | platform OFF")
 
@@ -269,6 +307,7 @@ if __name__ == "__main__":
             # r = resume OpenCV/tracker only
             elif key == ord("r"):
                 tracker_paused = False
+                previous_frame_time = None
                 print("Tracker/OpenCV resumed")
 
             # l = pause platform only
