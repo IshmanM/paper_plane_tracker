@@ -59,7 +59,8 @@ def drawDisplayText(image: np.ndarray, text: str, position: tuple[int, int], col
 
 if __name__ == "__main__":
     # object_vision_spec_id = ObjectVisionSpecId.TENNIS_BALL_DEFAULT
-    object_vision_spec_id = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
+    # object_vision_spec_id = ObjectVisionSpecId.PAPER_PLANE_SHAPES_1
+    object_vision_spec_id = ObjectVisionSpecId.ARUCO_MARKER_1
     platform_geometry_spec_id = PlatformGeometrySpecId.PLATFORM_1
 
     camera_calibration = CameraCalibration(config.CAMERA_CALIBRATION_PATH, config.FRAME_W, config.FRAME_H)

@@ -208,89 +208,432 @@ def detectArucoMarker(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, c
 
 
 
-def detectArucoMarkerV2(
-    frame: np.ndarray, object_vision_spec: ObjectVisionSpec,
-    camera_calibration: CameraCalibration, debug: DetectionDebug | None = None,
-) -> tuple[bool, Detection, Measurement]:
-    """Current ArUco detector with debug instrumentation only; detection behavior matches V1."""
-    aruco_spec = object_vision_spec.aruco_marker
+def orderQuadCornersForAruco(quad: np.ndarray) -> np.ndarray:
+    """Return four image points as top-left, top-right, bottom-right, bottom-left."""
+    points = np.asarray(quad, dtype=np.float32).reshape(4, 2)
+    sums = points[:, 0] + points[:, 1]
+    differences = points[:, 1] - points[:, 0]
 
-    if debug is not None:
-        debug.reset(frame)
-        debug.addStage("Original image", frame)
+    return np.array([
+        points[np.argmin(sums)],
+        points[np.argmin(differences)],
+        points[np.argmax(sums)],
+        points[np.argmax(differences)],
+    ], dtype=np.float32)
 
-    dictionary = cv2.aruco.getPredefinedDictionary(
-        getattr(cv2.aruco, aruco_spec.dictionary_name),
+
+
+def refineArucoOuterQuadUsingGrayEdges(
+    gray: np.ndarray, quad: np.ndarray,
+    debug_frame: np.ndarray | None = None,
+) -> np.ndarray:
+    """Refine the four outer black-to-white marker edges with short grayscale rays."""
+    rough = np.asarray(quad, dtype=np.float64).reshape(4, 2)
+    centroid = np.mean(rough, axis=0)
+    bbox_diagonal_px = float(np.linalg.norm(np.ptp(rough, axis=0)))
+    search_radius_px = int(np.clip(round(0.05*bbox_diagonal_px), 3, 8))
+    offsets = np.arange(
+        -search_radius_px, search_radius_px + 0.5, 0.5,
+        dtype=np.float32,
     )
-    parameters = cv2.aruco.DetectorParameters()
-    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
-    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
 
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    fitted_lines = []
+
+    for edge_index in range(4):
+        start = rough[edge_index]
+        end = rough[(edge_index + 1)%4]
+        edge = end - start
+        edge_length = float(np.linalg.norm(edge))
+
+        if edge_length <= 4.0:
+            return rough
+
+        edge_direction = edge/edge_length
+        outward_normal = np.array(
+            [-edge_direction[1], edge_direction[0]],
+            dtype=np.float64,
+        )
+        midpoint = 0.5*(start + end)
+
+        if np.dot(outward_normal, midpoint - centroid) < 0.0:
+            outward_normal = -outward_normal
+
+        ray_count = int(np.clip(round(edge_length/8.0), 6, 12))
+        fractions = np.linspace(0.12, 0.88, ray_count)
+        bases = start + fractions[:, None]*edge
+
+        samples = (
+            bases[:, None, :]
+            + offsets[None, :, None]*outward_normal[None, None, :]
+        )
+
+        intensities = cv2.remap(
+            gray.astype(np.float32),
+            samples[:, :, 0].astype(np.float32),
+            samples[:, :, 1].astype(np.float32),
+            cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+
+        smoothed = intensities.copy()
+        if intensities.shape[1] >= 3:
+            smoothed[:, 1:-1] = (
+                0.25*intensities[:, :-2]
+                + 0.50*intensities[:, 1:-1]
+                + 0.25*intensities[:, 2:]
+            )
+
+        # Moving in +normal goes from the black marker border toward the
+        # surrounding paper, so the desired outer edge is a positive gray rise.
+        rises = smoothed[:, 1:] - smoothed[:, :-1]
+        best_indices = np.argmax(rises, axis=1)
+        rows = np.arange(ray_count)
+        best_rises = rises[rows, best_indices]
+        good = best_rises >= 3.0
+
+        if np.count_nonzero(good) < 4:
+            return rough
+
+        transition_offsets = 0.5*(offsets[:-1] + offsets[1:])
+        boundary_points = (
+            bases
+            + transition_offsets[best_indices, None]*outward_normal
+        )
+        good_points = boundary_points[good]
+
+        vx, vy, x0, y0 = cv2.fitLine(
+            good_points.astype(np.float32),
+            cv2.DIST_HUBER, 0, 0.01, 0.01,
+        ).reshape(4)
+        fitted_direction = np.array([vx, vy], dtype=np.float64)
+        fitted_direction /= max(
+            float(np.linalg.norm(fitted_direction)), 1e-12,
+        )
+
+        # The local edge search may translate the line, but should not invent
+        # a radically different direction.
+        if abs(float(np.dot(fitted_direction, edge_direction))) < np.cos(np.deg2rad(20.0)):
+            return rough
+
+        fitted_lines.append((
+            np.array([x0, y0], dtype=np.float64),
+            fitted_direction,
+        ))
+
+        if debug_frame is not None:
+            for base, point, is_good in zip(bases, boundary_points, good):
+                if not is_good:
+                    continue
+
+                cv2.line(
+                    debug_frame,
+                    tuple(np.round(base).astype(int)),
+                    tuple(np.round(point).astype(int)),
+                    (200, 200, 200), 1,
+                )
+                cv2.circle(
+                    debug_frame,
+                    tuple(np.round(point).astype(int)),
+                    2, (255, 255, 0), -1,
+                )
+
+    refined = []
+
+    for vertex_index in range(4):
+        point_1, direction_1 = fitted_lines[(vertex_index - 1)%4]
+        point_2, direction_2 = fitted_lines[vertex_index]
+
+        cross = (
+            direction_1[0]*direction_2[1]
+            - direction_1[1]*direction_2[0]
+        )
+
+        if abs(cross) <= 1e-4:
+            return rough
+
+        delta = point_2 - point_1
+        t = (
+            delta[0]*direction_2[1]
+            - delta[1]*direction_2[0]
+        )/cross
+        refined.append(point_1 + t*direction_1)
+
+    refined = np.asarray(refined, dtype=np.float64)
+    refined_polygon = refined.astype(np.float32).reshape(-1, 1, 2)
+    rough_area = float(cv2.contourArea(rough.astype(np.float32)))
+    refined_area = float(cv2.contourArea(refined_polygon))
+
+    if (
+        rough_area <= 0.0
+        or not cv2.isContourConvex(refined_polygon)
+        or not 0.65 <= refined_area/rough_area <= 1.35
+        or np.any(
+            np.linalg.norm(refined - rough, axis=1)
+            > max(4.0, 0.15*bbox_diagonal_px)
+        )
+    ):
+        return rough
+
+    if debug_frame is not None:
+        cv2.polylines(
+            debug_frame,
+            [np.round(rough).astype(np.int32).reshape(-1, 1, 2)],
+            True, (0, 165, 255), 1, cv2.LINE_AA,
+        )
+        cv2.polylines(
+            debug_frame,
+            [np.round(refined).astype(np.int32).reshape(-1, 1, 2)],
+            True, (255, 0, 255), 2, cv2.LINE_AA,
+        )
+
+    return refined
+
+
+
+def findBlurredArucoOuterQuad(
+    frame: np.ndarray, gray: np.ndarray, aruco_spec, dictionary,
+    debug: DetectionDebug | None = None,
+) -> np.ndarray | None:
+    """
+    Fallback for motion-blurred markers.
+
+    Standard ArUco requires a successfully extracted/decoded marker candidate. This
+    fallback instead finds dark convex quadrilaterals, perspective-warps each one,
+    and softly compares it with the configured marker image. It therefore uses the
+    known ArUco payload as evidence without requiring hard bit decoding.
+    """
+    ADAPTIVE_BLOCK_SIZE = 31
+    ADAPTIVE_C = 7
+    MIN_QUAD_AREA_PX = max(64.0, 0.00015*frame.shape[0]*frame.shape[1])
+    MAX_QUAD_AREA_FACTOR = 0.35
+    MIN_SIDE_PX = 8.0
+    MAX_SIDE_RATIO = 3.0
+    MAX_ABS_CORNER_COSINE = 0.75
+    TEMPLATE_SIZE_PX = 96
+    MIN_TEMPLATE_CORRELATION = 0.45
+
+    dark_mask = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        ADAPTIVE_BLOCK_SIZE, ADAPTIVE_C,
+    )
+    dark_mask = cv2.morphologyEx(
+        dark_mask, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+    )
+
     if debug is not None:
-        debug.addStage("Grayscale", gray)
+        debug.addStage("Blur fallback - adaptive dark mask", dark_mask)
 
-    corners, ids, rejected = detector.detectMarkers(gray)
+    contours, _ = cv2.findContours(
+        dark_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE,
+    )
+
+    expected_marker = cv2.aruco.generateImageMarker(
+        dictionary, aruco_spec.marker_id, TEMPLATE_SIZE_PX,
+    )
+    expected_marker = cv2.GaussianBlur(expected_marker, (3, 3), 0).astype(np.float32)
+
+    destination = np.array([
+        [0.0, 0.0],
+        [TEMPLATE_SIZE_PX - 1.0, 0.0],
+        [TEMPLATE_SIZE_PX - 1.0, TEMPLATE_SIZE_PX - 1.0],
+        [0.0, TEMPLATE_SIZE_PX - 1.0],
+    ], dtype=np.float32)
+
+    candidates = []
+
+    for contour in contours:
+        contour_area = float(cv2.contourArea(contour))
+
+        if (
+            contour_area < MIN_QUAD_AREA_PX
+            or contour_area > MAX_QUAD_AREA_FACTOR*frame.shape[0]*frame.shape[1]
+        ):
+            continue
+
+        hull = cv2.convexHull(contour)
+        perimeter = float(cv2.arcLength(hull, True))
+
+        if perimeter <= 0.0:
+            continue
+
+        polygon = None
+        for epsilon_ratio in (0.010, 0.015, 0.020, 0.025, 0.030, 0.040, 0.050, 0.060, 0.080):
+            proposal = cv2.approxPolyDP(hull, epsilon_ratio*perimeter, True)
+
+            if len(proposal) == 4 and cv2.isContourConvex(proposal):
+                polygon = proposal.reshape(4, 2)
+                break
+
+        if polygon is None:
+            continue
+
+        quad = orderQuadCornersForAruco(polygon)
+        side_vectors = np.roll(quad, -1, axis=0) - quad
+        side_lengths = np.linalg.norm(side_vectors, axis=1)
+
+        if (
+            np.min(side_lengths) < MIN_SIDE_PX
+            or np.max(side_lengths)/max(np.min(side_lengths), 1e-6) > MAX_SIDE_RATIO
+        ):
+            continue
+
+        # Perspective may make the projected square non-rectangular, but reject
+        # extreme slivers/random polygons before template scoring.
+        corner_cosines = []
+
+        for corner_index in range(4):
+            previous_vector = quad[(corner_index - 1)%4] - quad[corner_index]
+            next_vector = quad[(corner_index + 1)%4] - quad[corner_index]
+            denominator = float(np.linalg.norm(previous_vector)*np.linalg.norm(next_vector))
+
+            if denominator <= 1e-6:
+                corner_cosines = [1.0]
+                break
+
+            corner_cosines.append(
+                abs(float(np.dot(previous_vector, next_vector)/denominator))
+            )
+
+        if max(corner_cosines) > MAX_ABS_CORNER_COSINE:
+            continue
+
+        transform = cv2.getPerspectiveTransform(quad, destination)
+        warped = cv2.warpPerspective(
+            gray, transform, (TEMPLATE_SIZE_PX, TEMPLATE_SIZE_PX),
+            flags=cv2.INTER_LINEAR,
+        )
+        warped = cv2.GaussianBlur(warped, (3, 3), 0).astype(np.float32)
+
+        # The marker can be rotated in the image. Compare all four rotations of
+        # the configured marker; normalized correlation tolerates brightness/gain.
+        correlations = [
+            float(cv2.matchTemplate(
+                warped, np.rot90(expected_marker, rotation).copy(),
+                cv2.TM_CCOEFF_NORMED,
+            )[0, 0])
+            for rotation in range(4)
+        ]
+        best_rotation = int(np.argmax(correlations))
+        correlation = correlations[best_rotation]
+
+        candidates.append((
+            correlation, contour_area, quad,
+            warped.astype(np.uint8), best_rotation,
+        ))
+
+    candidates.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
 
     if debug is not None:
-        candidates_debug = frame.copy()
+        proposals_debug = frame.copy()
 
-        # Rejected quadrilaterals are especially useful for motion debugging:
-        # red quad present -> candidate extraction worked but decoding rejected it.
-        for candidate_index, rejected_corners in enumerate(rejected):
-            points = np.round(np.asarray(rejected_corners).reshape(-1, 2)).astype(np.int32)
+        for candidate_index, (correlation, _, quad, _, _) in enumerate(candidates):
+            points = np.round(quad).astype(np.int32)
+            accepted = correlation >= MIN_TEMPLATE_CORRELATION
+            color = (0, 255, 0) if accepted else (0, 165, 255)
+
             cv2.polylines(
-                candidates_debug, [points.reshape(-1, 1, 2)], True,
-                (0, 0, 255), 1, cv2.LINE_AA,
+                proposals_debug, [points.reshape(-1, 1, 2)],
+                True, color, 1, cv2.LINE_AA,
             )
             center = np.mean(points, axis=0).astype(int)
             cv2.putText(
-                candidates_debug, f"R{candidate_index}", tuple(center),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 255), 1, cv2.LINE_AA,
+                proposals_debug,
+                f"Q{candidate_index} corr={correlation:.2f}",
+                (int(center[0]), int(center[1])),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                color, 1, cv2.LINE_AA,
             )
 
-        if ids is not None:
-            cv2.aruco.drawDetectedMarkers(candidates_debug, corners, ids)
-
-        decoded_count = 0 if ids is None else len(ids)
         cv2.putText(
-            candidates_debug,
-            f"decoded={decoded_count} | rejected quads={len(rejected)}",
-            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            proposals_debug,
+            f"quad candidates={len(candidates)} | accept corr>={MIN_TEMPLATE_CORRELATION:.2f}",
+            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
             (255, 255, 255), 2, cv2.LINE_AA,
         )
-        debug.addStage("ArUco candidates (green=decoded, red=rejected)", candidates_debug)
+        debug.addStage("Blur fallback - outer quad proposals", proposals_debug)
 
-    if ids is None:
+    if not candidates or candidates[0][0] < MIN_TEMPLATE_CORRELATION:
         if debug is not None:
             failure = frame.copy()
+            best_correlation = None if not candidates else candidates[0][0]
+            text = (
+                "NO BLUR-FALLBACK QUAD"
+                if best_correlation is None
+                else f"BEST TEMPLATE CORRELATION {best_correlation:.2f} < {MIN_TEMPLATE_CORRELATION:.2f}"
+            )
             cv2.putText(
-                failure, f"NO DECODED MARKER | rejected quads={len(rejected)}",
-                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                failure, text, (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                 (0, 0, 255), 2, cv2.LINE_AA,
             )
-            debug.addStage("ArUco result - no decoded marker", failure)
-        return failedDetectionResult()
+            debug.addStage("Blur fallback - rejected", failure)
+        return None
 
-    ids = ids.flatten()
-    matching_indices = np.where(ids == aruco_spec.marker_id)[0]
+    correlation, _, best_quad, best_warp, best_rotation = candidates[0]
 
-    if len(matching_indices) == 0:
-        if debug is not None:
-            failure = frame.copy()
-            decoded_ids = ",".join(str(int(marker_id)) for marker_id in ids)
+    edge_refinement_debug = frame.copy() if debug is not None else None
+    refined_quad = refineArucoOuterQuadUsingGrayEdges(
+        gray, best_quad, edge_refinement_debug,
+    )
+
+    if debug is not None:
+        debug.addStage(
+            "Blur fallback - grayscale outer-edge refinement "
+            "(orange=threshold, magenta=refined)",
+            edge_refinement_debug,
+        )
+
+        selected_debug = frame.copy()
+        points = np.round(refined_quad).astype(np.int32)
+
+        cv2.polylines(
+            selected_debug, [points.reshape(-1, 1, 2)],
+            True, (255, 0, 255), 2, cv2.LINE_AA,
+        )
+        for corner_index, (u, v) in enumerate(points):
+            cv2.circle(selected_debug, (int(u), int(v)), 4, (0, 255, 255), -1)
             cv2.putText(
-                failure,
-                f"TARGET ID {aruco_spec.marker_id} NOT FOUND | decoded: {decoded_ids}",
-                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
-                (0, 0, 255), 2, cv2.LINE_AA,
+                selected_debug, str(corner_index),
+                (int(u) + 5, int(v) - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42,
+                (0, 255, 255), 1, cv2.LINE_AA,
             )
-            debug.addStage("ArUco result - wrong marker ID", failure)
-        return failedDetectionResult()
 
-    marker_corners = np.asarray(
-        corners[matching_indices[0]], dtype=np.float64,
-    ).reshape(4, 2)
+        cv2.putText(
+            selected_debug,
+            f"blur fallback | template corr={correlation:.3f} | rotation={90*best_rotation} deg",
+            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+            (255, 255, 255), 2, cv2.LINE_AA,
+        )
+        debug.addStage("Blur fallback - selected outer square", selected_debug)
+
+        expected_rotated = np.rot90(
+            expected_marker.astype(np.uint8), best_rotation,
+        ).copy()
+        comparison = np.hstack((best_warp, expected_rotated))
+        comparison = cv2.cvtColor(comparison, cv2.COLOR_GRAY2BGR)
+        cv2.putText(
+            comparison, "warped candidate", (5, 18),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA,
+        )
+        cv2.putText(
+            comparison, "expected marker", (TEMPLATE_SIZE_PX + 5, 18),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA,
+        )
+        debug.addStage("Blur fallback - template comparison", comparison)
+
+    return refined_quad.astype(np.float64)
+
+
+def solveArucoMarkerPose(
+    frame: np.ndarray, marker_corners: np.ndarray, aruco_spec,
+    camera_calibration: CameraCalibration, debug: DetectionDebug | None,
+    source_label: str,
+) -> tuple[bool, Detection, Measurement]:
+    marker_corners = np.asarray(marker_corners, dtype=np.float64).reshape(4, 2)
 
     min_u, max_u = np.min(marker_corners[:, 0]), np.max(marker_corners[:, 0])
     min_v, max_v = np.min(marker_corners[:, 1]), np.max(marker_corners[:, 1])
@@ -300,34 +643,6 @@ def detectArucoMarkerV2(
         px_w=max_u - min_u,
         px_h=max_v - min_v,
     )
-
-    if debug is not None:
-        selected_debug = frame.copy()
-        points = np.round(marker_corners).astype(np.int32)
-        cv2.polylines(
-            selected_debug, [points.reshape(-1, 1, 2)], True,
-            (0, 255, 0), 2, cv2.LINE_AA,
-        )
-
-        corner_names = ("0 TL", "1 TR", "2 BR", "3 BL")
-        for corner_name, (u, v) in zip(corner_names, points):
-            cv2.circle(selected_debug, (int(u), int(v)), 4, (0, 255, 255), -1)
-            cv2.putText(
-                selected_debug, corner_name, (int(u) + 5, int(v) - 5),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40,
-                (0, 255, 255), 1, cv2.LINE_AA,
-            )
-
-        side_lengths = np.linalg.norm(
-            marker_corners - np.roll(marker_corners, -1, axis=0), axis=1,
-        )
-        cv2.putText(
-            selected_debug,
-            "side px: " + ", ".join(f"{length:.1f}" for length in side_lengths),
-            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
-            (255, 255, 255), 2, cv2.LINE_AA,
-        )
-        debug.addStage("Selected target marker + refined corners", selected_debug)
 
     half_side = aruco_spec.marker_length_m/2.0
     object_points = np.array([
@@ -349,8 +664,8 @@ def detectArucoMarkerV2(
         if debug is not None:
             failure = frame.copy()
             cv2.putText(
-                failure, "IPPE_SQUARE PnP FAILED", (10, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                failure, f"{source_label}: IPPE_SQUARE PnP FAILED", (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                 (0, 0, 255), 2, cv2.LINE_AA,
             )
             debug.addStage("ArUco PnP failed", failure)
@@ -365,36 +680,142 @@ def detectArucoMarkerV2(
 
     if debug is not None:
         pnp_debug = frame.copy()
-        cv2.aruco.drawDetectedMarkers(
-            pnp_debug,
-            [marker_corners.astype(np.float32).reshape(1, 4, 2)],
-            np.array([[aruco_spec.marker_id]], dtype=np.int32),
+        points = np.round(marker_corners).astype(np.int32)
+        cv2.polylines(
+            pnp_debug, [points.reshape(-1, 1, 2)],
+            True, (0, 255, 0), 2, cv2.LINE_AA,
         )
 
-        axis_length = 0.5*aruco_spec.marker_length_m
         cv2.drawFrameAxes(
             pnp_debug,
             camera_calibration.camera_matrix,
             camera_calibration.distortion_coefficients,
             rot_vector, trans_vector.reshape(3, 1),
-            axis_length, 2,
+            0.5*aruco_spec.marker_length_m, 2,
         )
 
         cv2.putText(
             pnp_debug,
-            f"xyz=({measurement.x:+.3f}, {measurement.y:+.3f}, {measurement.z:+.3f}) m",
-            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+            f"{source_label} | xyz=({measurement.x:+.3f}, {measurement.y:+.3f}, {measurement.z:+.3f}) m",
+            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
             (255, 255, 255), 2, cv2.LINE_AA,
         )
         cv2.putText(
             pnp_debug,
             f"marker bbox={detection.px_w:.1f} x {detection.px_h:.1f} px",
-            (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+            (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
             (255, 255, 255), 1, cv2.LINE_AA,
         )
         debug.addStage("ArUco PnP result", pnp_debug)
 
     return True, detection, measurement
+
+
+def detectArucoMarkerV2(
+    frame: np.ndarray, object_vision_spec: ObjectVisionSpec,
+    camera_calibration: CameraCalibration, debug: DetectionDebug | None = None,
+) -> tuple[bool, Detection, Measurement]:
+    """
+    Fast normal ArUco detection with a blur-tolerant known-marker fallback.
+
+    The fallback does not require OpenCV to decode the marker. It searches for the
+    outer square and softly matches the warped image against the marker configured
+    in ObjectVisionSpec.
+    """
+    aruco_spec = object_vision_spec.aruco_marker
+
+    if debug is not None:
+        debug.reset(frame)
+        debug.addStage("Original image", frame)
+
+    dictionary = cv2.aruco.getPredefinedDictionary(
+        getattr(cv2.aruco, aruco_spec.dictionary_name),
+    )
+    parameters = cv2.aruco.DetectorParameters()
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    if debug is not None:
+        debug.addStage("Grayscale", gray)
+
+    corners, ids, rejected = detector.detectMarkers(gray)
+
+    if debug is not None:
+        candidates_debug = frame.copy()
+
+        for candidate_index, rejected_corners in enumerate(rejected):
+            points = np.round(
+                np.asarray(rejected_corners).reshape(-1, 2),
+            ).astype(np.int32)
+            cv2.polylines(
+                candidates_debug, [points.reshape(-1, 1, 2)],
+                True, (0, 0, 255), 1, cv2.LINE_AA,
+            )
+            center = np.mean(points, axis=0).astype(int)
+            cv2.putText(
+                candidates_debug, f"R{candidate_index}", tuple(center),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                (0, 0, 255), 1, cv2.LINE_AA,
+            )
+
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(candidates_debug, corners, ids)
+
+        cv2.putText(
+            candidates_debug,
+            f"decoded={0 if ids is None else len(ids)} | rejected quads={len(rejected)}",
+            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            (255, 255, 255), 2, cv2.LINE_AA,
+        )
+        debug.addStage(
+            "Standard ArUco candidates (green=decoded, red=rejected)",
+            candidates_debug,
+        )
+
+    if ids is not None:
+        flat_ids = ids.flatten()
+        matching_indices = np.where(flat_ids == aruco_spec.marker_id)[0]
+
+        if len(matching_indices) > 0:
+            marker_corners = np.asarray(
+                corners[matching_indices[0]], dtype=np.float64,
+            ).reshape(4, 2)
+
+            if debug is not None:
+                selected_debug = frame.copy()
+                points = np.round(marker_corners).astype(np.int32)
+                cv2.polylines(
+                    selected_debug, [points.reshape(-1, 1, 2)],
+                    True, (0, 255, 0), 2, cv2.LINE_AA,
+                )
+                cv2.putText(
+                    selected_debug,
+                    f"standard ArUco decoded target ID {aruco_spec.marker_id}",
+                    (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                    (0, 255, 0), 2, cv2.LINE_AA,
+                )
+                debug.addStage("Standard ArUco - selected target", selected_debug)
+
+            return solveArucoMarkerPose(
+                frame, marker_corners, aruco_spec,
+                camera_calibration, debug, "standard ArUco",
+            )
+
+    # Standard decoding failed. Search directly for the outer square and use a
+    # soft known-marker template match rather than hard cell decoding.
+    marker_corners = findBlurredArucoOuterQuad(
+        frame, gray, aruco_spec, dictionary, debug,
+    )
+
+    if marker_corners is None:
+        return failedDetectionResult()
+
+    return solveArucoMarkerPose(
+        frame, marker_corners, aruco_spec,
+        camera_calibration, debug, "blur fallback",
+    )
 
 
 
