@@ -47,19 +47,13 @@ COLOR_SPECS = {
 
     ColorId.GREEN: ColorSpec(
         hsv_ranges=[
-            # Darker / cooler green body side
             (
-                np.array([58, 35, 85], dtype=np.uint8),
-                np.array([82, 140, 180], dtype=np.uint8),
-            ),
-            # Brighter / lighter green body side
-            (
-                np.array([48, 35, 55], dtype=np.uint8),
-                np.array([74, 170, 235], dtype=np.uint8),
+                np.array([56, 55, 90], dtype=np.uint8),
+                np.array([84, 155, 225], dtype=np.uint8),
             ),
         ],
         draw_bgr=(0, 255, 0),
-        lab_value=np.array([105, 110, 133], dtype=np.uint8),
+        lab_value=np.array([150, 108, 137], dtype=np.uint8),
     ),
 
     ColorId.CYAN: ColorSpec(
@@ -109,11 +103,11 @@ COLOR_SPECS = {
     ColorId.PINK: ColorSpec(
         hsv_ranges=[
             (
-                np.array([165, 70, 110], dtype=np.uint8),
-                np.array([179, 130, 255], dtype=np.uint8),
+                np.array([168, 85, 175], dtype=np.uint8),
+                np.array([179, 135, 245], dtype=np.uint8),
             ),
         ],
         draw_bgr=(180, 105, 255),
-        lab_value=np.array([203, 150, 127], dtype=np.uint8),
+        lab_value=np.array([176, 155, 131], dtype=np.uint8),
     ),
 }

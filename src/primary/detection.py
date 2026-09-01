@@ -1359,7 +1359,17 @@ def findSingleObjectUsingBestShapeGroup(
                     timing_hsv_threshold_s += time.perf_counter() - threshold_start
                     cleanup_start = time.perf_counter()
 
-                cleaned_loose_hsv_roi = cv2.medianBlur(raw_loose_hsv_roi, 3)
+                # Same speck-removal pattern that made the tennis-ball mask quiet:
+                # median -> OPEN removes isolated white noise -> CLOSE fills tiny holes.
+                # Keep the existing 3x3 kernel here so narrow/acute paper-marker geometry
+                # is not eroded as aggressively as it would be by the tennis ball's 5x5.
+                # Generic speck suppression for every marker color. Match the tennis-ball
+                # detector's 5x5 median filtering, while keeping morphology at 3x3 so acute
+                # polygon tips are not unnecessarily eroded.
+                cleaned_loose_hsv_roi = cv2.medianBlur(raw_loose_hsv_roi, 5)
+                cleaned_loose_hsv_roi = cv2.morphologyEx(
+                    cleaned_loose_hsv_roi, cv2.MORPH_OPEN, hsv_cleanup_kernel,
+                )
                 cleaned_loose_hsv_roi = cv2.morphologyEx(
                     cleaned_loose_hsv_roi, cv2.MORPH_CLOSE, hsv_cleanup_kernel,
                 )
