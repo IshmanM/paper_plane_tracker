@@ -14,7 +14,8 @@ from src.primary.geometry import estimateObjectWorldPosition
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpecId
 from src.primary.detection import (
     DetectionDebug, Measurement,
-    findSingleObjectUsingBestShapeGroup, findSingleObjectSphere, detectArucoMarkerV2, detectSingleObject,
+    findSingleObjectUsingBestShapeGroup, findSingleObjectSphere, findSingleObjectTriangleColorBlob,
+    detectArucoMarkerV2, detectPaperPlanePureColor, detectSingleObject,
     createMeasurementUsingShapeGroup, drawDetection, drawModelOrigin, resetArucoOpticalFlowTracker,
 )
 
@@ -46,12 +47,14 @@ class DetectionAlgorithm(Enum):
     SHAPE_GROUP = auto()
     SPHERE = auto()
     ARUCO_MARKER = auto()
+    PURE_COLOR = auto()
 
 
 ALGORITHM_OBJECT_TYPES = {
     DetectionAlgorithm.SHAPE_GROUP: {ObjectType.PAPER_PLANE_SHAPES},
     DetectionAlgorithm.SPHERE: {ObjectType.TENNIS_BALL},
     DetectionAlgorithm.ARUCO_MARKER: {ObjectType.ARUCO_MARKER},
+    DetectionAlgorithm.PURE_COLOR: {ObjectType.PAPER_PLANE_PURE_COLOR},
 }
 
 
@@ -441,6 +444,16 @@ def runDetectionOnImage(
         resetArucoOpticalFlowTracker()
         _, detection, measurement = detectArucoMarkerV2(
             frame, object_vision_spec, camera_calibration, debug)
+
+    elif algorithm == DetectionAlgorithm.PURE_COLOR:
+        # Run the low-level detector once with debug enabled so the LAB/HSV/triangle
+        # stages are visible. The public detector is then used for the measurement.
+        detection = findSingleObjectTriangleColorBlob(frame, object_vision_spec, debug)
+        if detection is not None:
+            detected, _, measurement = detectPaperPlanePureColor(
+                frame, object_vision_spec, camera_calibration)
+            if not detected:
+                measurement = None
 
     else:
         raise ValueError(f"Unsupported detection algorithm: {algorithm}")

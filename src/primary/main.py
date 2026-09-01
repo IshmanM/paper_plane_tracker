@@ -37,6 +37,7 @@ OBJECT_VISION_SPEC_IDS = (
     ObjectVisionSpecId.ARUCO_MARKER_1,        # 2
     ObjectVisionSpecId.PAPER_PLANE_SHAPES_1,  # 3
     ObjectVisionSpecId.PAPER_PLANE_ARUCO_1,   # 4
+    ObjectVisionSpecId.PAPER_PLANE_PURE_COLOR_1, # 5
 )
 
 TRACKER_KWARGS = dict(
@@ -61,7 +62,8 @@ def drawDisplayText(image: np.ndarray, text: str, position: tuple[int, int], col
 if __name__ == "__main__":
     # object_vision_spec_id = ObjectVisionSpecId.TENNIS_BALL_DEFAULT
     # object_vision_spec_id = ObjectVisionSpecId.ARUCO_MARKER_1
-    object_vision_spec_id = ObjectVisionSpecId.PAPER_PLANE_ARUCO_1
+    # object_vision_spec_id = ObjectVisionSpecId.PAPER_PLANE_ARUCO_1
+    object_vision_spec_id = ObjectVisionSpecId.PAPER_PLANE_PURE_COLOR_1
 
     platform_geometry_spec_id = PlatformGeometrySpecId.PLATFORM_1
 
@@ -142,7 +144,7 @@ if __name__ == "__main__":
     cv2.resizeWindow(WINDOW_NAME, config.FRAME_W, config.FRAME_H)
 
     print(
-        "1: tennis ball | 2: ArUco | 3: paper plane shapes | 4: paper plane ArUco | Tab: display size | "
+        "1: tennis ball | 2: ArUco | 3: paper plane shapes | 4: paper plane ArUco | 5: pure color | Tab: display size | "
         "P: pause all | R: resume tracker | L/O: platform off/on | "
         "H/F: triggering | S: screenshot | Q/Esc: quit"
     )
@@ -175,7 +177,7 @@ if __name__ == "__main__":
 
                     if PRINT_DETECTION: # FOR DEBUG ONLY
                         print(
-                            f"BALL | u={detection.u:.2f} v={detection.v:.2f} | "
+                            f"OBJECT | u={detection.u:.2f} v={detection.v:.2f} | "
                             f"w={detection.px_w:.3f} h={detection.px_h:.3f} | "
                             f"xyz=[{measurement.x:.3f}, {measurement.y:.3f}, {measurement.z:.3f}]"
                         ) 
@@ -241,7 +243,7 @@ if __name__ == "__main__":
             # Controls.
             drawDisplayText(
                 display_frame,
-                "1 Tennis | 2 ArUco | 3 Plane Shapes | 4 Plane ArUco | Tab Size",
+                "1 Tennis | 2 ArUco | 3 Plane Shapes | 4 Plane ArUco | 5 Pure Color | Tab Size",
                 (10, config.FRAME_H - 35),
                 (255, 255, 255),
                 display_scale,
@@ -269,7 +271,7 @@ if __name__ == "__main__":
                 stop_event.set()
                 break
 
-            # 1-4 = change object vision spec.
+            # 1-5 = change object vision spec.
             elif ord("1") <= key < ord("1") + len(OBJECT_VISION_SPEC_IDS):
                 new_object_vision_spec_id = OBJECT_VISION_SPEC_IDS[key - ord("1")]
 

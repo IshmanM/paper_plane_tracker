@@ -16,6 +16,7 @@ class ObjectType(Enum):
     TENNIS_BALL = auto()
     PAPER_PLANE_SHAPES = auto()
     ARUCO_MARKER = auto()
+    PAPER_PLANE_PURE_COLOR = auto()
 
 
 class ObjectVisionSpecId(Enum):
@@ -24,6 +25,7 @@ class ObjectVisionSpecId(Enum):
     ARUCO_MARKER_1 = auto()
     PAPER_PLANE_SHAPES_1 = auto()
     PAPER_PLANE_ARUCO_1 = auto()
+    PAPER_PLANE_PURE_COLOR_1 = auto()
 
 
 class ShapeMarkerSpec:
@@ -363,7 +365,7 @@ OBJECT_VISION_SPECS = {
         object_type=ObjectType.ARUCO_MARKER,
         aruco_marker=ArucoMarkerSpec(
             marker_id=0,
-            marker_length_m=0.100, 
+            marker_length_m=0.100,
             dictionary_name="DICT_4X4_50",
         ),
     ),
@@ -372,9 +374,19 @@ OBJECT_VISION_SPECS = {
         object_type=ObjectType.ARUCO_MARKER,
         aruco_marker=ArucoMarkerSpec(
             marker_id=0,
-            marker_length_m=0.080, # TODO: replace with exact printed marker side length
+            marker_length_m=0.100,
             dictionary_name="DICT_4X4_50",
         ),
+    ),
+
+    # Simple experiment: one large solid-color triangular region. width is the
+    # physical longest span of that triangle and is used for scale-only depth.
+    ObjectVisionSpecId.PAPER_PLANE_PURE_COLOR_1: ObjectVisionSpec(
+        object_type=ObjectType.PAPER_PLANE_PURE_COLOR,
+        color_ids=[ColorId.PINK],
+        minimum_contour_area_px=50.0,
+        polygon_epsilon_ratio=0.030,
+        width=0.2552,
     ),
 
     ObjectVisionSpecId.PAPER_PLANE_SHAPES_1: ObjectVisionSpec(
@@ -453,6 +465,5 @@ OBJECT_VISION_SPECS = {
             ('plane_2', 'plane_3', 10.0),
         ],
         width=None, height=None, length=None,
-    )
-
+    ),
 }

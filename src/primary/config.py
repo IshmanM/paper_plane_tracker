@@ -38,22 +38,22 @@ CAMERA_TO_PLATFORM_CALIBRATION_PATH = Path("src/primary/calibration_data/camera_
 CAMERA_INDEX = 0
 
 # Best for Tennis ball: 
-# CAMERA_AUTO_EXPOSURE = False
-# CAMERA_EXPOSURE = -5.0 
-# CAMERA_GAIN = 0.0 
-# CAMERA_AUTO_WHITE_BALANCE = False
-# CAMERA_WHITE_BALANCE_TEMPERATURE = 4600.0
-# CAMERA_AUTOFOCUS = False
-# CAMERA_FOCUS = 0  # tune
-
-# Best for moving ArUco:
 CAMERA_AUTO_EXPOSURE = False
-CAMERA_EXPOSURE = -7.5       # start here; try -10 if blur remains
-CAMERA_GAIN = 45.0           # instead of 0; tune upward if image is dark
+CAMERA_EXPOSURE = -5.0 
+CAMERA_GAIN = 0.0 
 CAMERA_AUTO_WHITE_BALANCE = False
 CAMERA_WHITE_BALANCE_TEMPERATURE = 4600.0
 CAMERA_AUTOFOCUS = False
-CAMERA_FOCUS = 0             # tune specifically for ~3-5 m
+CAMERA_FOCUS = 0  # tune
+
+# # Best for moving ArUco:
+# CAMERA_AUTO_EXPOSURE = False
+# CAMERA_EXPOSURE = -7.5       # start here; try -10 if blur remains
+# CAMERA_GAIN = 40.0           # instead of 0; tune upward if image is dark
+# CAMERA_AUTO_WHITE_BALANCE = False
+# CAMERA_WHITE_BALANCE_TEMPERATURE = 4600.0
+# CAMERA_AUTOFOCUS = False
+# CAMERA_FOCUS = 0             # tune specifically for ~3-5 m
 
 
 CMD_FREQUENCY_HZ = 120.0 # hz
