@@ -1005,7 +1005,7 @@ def refineShapeVerticesUsingLabRays(
     frame: np.ndarray, vertices_px: np.ndarray, color_spec, debug_frame: np.ndarray | None = None,
     draw_bgr: tuple[int, int, int] = (255, 255, 255),
 ) -> np.ndarray:
-    RAYS_PER_EDGE, EDGE_SAMPLE_MARGIN = 6, 0.15
+    RAYS_PER_EDGE, EDGE_SAMPLE_MARGIN = 10, 0.10
     MAX_EDGE_ANGLE_CHANGE_DEG = 20.0
 
     rough = np.asarray(vertices_px, dtype=np.float64).reshape(-1, 2)
@@ -1055,7 +1055,7 @@ def refineShapeVerticesUsingLabRays(
     minimum_inner_response = max(2.0, 0.12*reference_chroma)
 
     centroid = np.mean(rough, axis=0)
-    offsets = np.arange(-search_radius_px, search_radius_px + 1, dtype=np.float32)
+    offsets = np.arange(-search_radius_px, search_radius_px + 0.5, 0.5, dtype=np.float32)
     fitted_lines = []
 
     for edge_index in range(len(rough)):
@@ -1083,20 +1083,39 @@ def refineShapeVerticesUsingLabRays(
             borderMode=cv2.BORDER_REPLICATE,
         )
 
-        # Positive score means target-color LAB response drops while moving OUTWARD.
-        drops = ray_response[:, :-1] - ray_response[:, 1:]
+        # Smooth only along each short ray, then find the target-color response drop
+        # while moving OUTWARD. Half-pixel sampling + a local weighted centroid avoids
+        # the old +/-1 px argmax hopping on tiny distant markers.
+        smoothed_response = ray_response.copy()
+        if ray_response.shape[1] >= 3:
+            smoothed_response[:, 1:-1] = (
+                0.25*ray_response[:, :-2] + 0.50*ray_response[:, 1:-1] + 0.25*ray_response[:, 2:]
+            )
+
+        drops = smoothed_response[:, :-1] - smoothed_response[:, 1:]
         best_indices = np.argmax(drops, axis=1)
         rows = np.arange(RAYS_PER_EDGE)
         best_drops = drops[rows, best_indices]
-        inner_response = ray_response[rows, best_indices]
+        inner_response = smoothed_response[rows, best_indices]
         good = (best_drops >= minimum_edge_drop) & (inner_response >= minimum_inner_response)
-        if np.count_nonzero(good) < 3:
+        if np.count_nonzero(good) < 5:
             return rough
 
-        boundary_offsets = 0.5*(offsets[best_indices] + offsets[best_indices + 1])
+        drop_offsets = 0.5*(offsets[:-1] + offsets[1:])
+        boundary_offsets = np.empty(RAYS_PER_EDGE, dtype=np.float64)
+        for ray_index, best_index in enumerate(best_indices):
+            lo, hi = max(0, best_index - 1), min(drops.shape[1], best_index + 2)
+            weights = np.maximum(drops[ray_index, lo:hi], 0.0)
+            boundary_offsets[ray_index] = (
+                float(np.sum(weights*drop_offsets[lo:hi])/np.sum(weights))
+                if np.sum(weights) > 1e-6 else float(drop_offsets[best_index])
+            )
+
         points = bases + boundary_offsets[:, None]*normal
         good_points = points[good]
-        vx, vy, x0, y0 = cv2.fitLine(good_points.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(4)
+        vx, vy, x0, y0 = cv2.fitLine(
+            good_points.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01,
+        ).reshape(4)
         line_dir = np.array([vx, vy], dtype=np.float64)
         line_dir /= max(float(np.linalg.norm(line_dir)), 1e-12)
         if abs(float(np.dot(line_dir, edge_dir))) < np.cos(np.deg2rad(MAX_EDGE_ANGLE_CHANGE_DEG)):
@@ -1628,9 +1647,8 @@ def findSingleObjectUsingBestShapeGroup(
             debug.addStage(f"Loose HSV mask - {color_name}", color_raw_debug_mask)
             debug.addStage(f"Cleaned loose HSV mask - {color_name}", color_cleaned_debug_mask)
 
-        # Step 5/6: Extract only the selected component's own bounding rectangle, not a full-frame
-        # binary mask. The HSV ROI has already been expanded if the component reached its edge, so
-        # this local contour extraction does not crop the marker geometry.
+        # Step 5/6: cleaned HSV chooses the real component; complete overlapping RAW
+        # HSV components supply geometry. Noise rejection and edge geometry stay separate.
         for (
             x1, y1, x2, y2, raw_loose_hsv_roi, cleaned_loose_hsv_roi,
             seed_labels, seed_stats, num_seed_labels, selected_seeds,
@@ -1672,28 +1690,52 @@ def findSingleObjectUsingBestShapeGroup(
                             keep_labels.append(other_label)
 
                 contour_start = time.perf_counter() if profile_shape_detection else None
-                component_x1 = min(int(seed_stats[label, cv2.CC_STAT_LEFT]) for label in keep_labels)
-                component_y1 = min(int(seed_stats[label, cv2.CC_STAT_TOP]) for label in keep_labels)
-                component_x2 = max(
-                    int(seed_stats[label, cv2.CC_STAT_LEFT] + seed_stats[label, cv2.CC_STAT_WIDTH])
-                    for label in keep_labels
-                )
-                component_y2 = max(
-                    int(seed_stats[label, cv2.CC_STAT_TOP] + seed_stats[label, cv2.CC_STAT_HEIGHT])
-                    for label in keep_labels
-                )
-                component_labels = seed_labels[component_y1:component_y2, component_x1:component_x2]
 
-                if len(keep_labels) == 1:
-                    selected_component_mask = (component_labels == keep_labels[0]).astype(np.uint8)*255
-                else:
-                    selected_component_mask = np.isin(component_labels, keep_labels).astype(np.uint8)*255
+                # CLEANED mask decides which component is real; RAW mask supplies geometry.
+                # Recover the COMPLETE raw HSV component(s) that overlap the selected cleaned
+                # component. This restores sharp tips removed by cleanup without using dilation,
+                # so unrelated nearby raw pixels cannot be pulled into the polygon merely because
+                # they happen to lie within a support radius.
+                selected_clean_component_roi = np.isin(seed_labels, keep_labels).astype(np.uint8)*255
+                num_raw_labels, raw_labels = cv2.connectedComponents(raw_loose_hsv_roi, connectivity=8)
+                overlapping_raw_labels = np.unique(raw_labels[selected_clean_component_roi != 0])
+                overlapping_raw_labels = overlapping_raw_labels[overlapping_raw_labels != 0]
+
+                if len(overlapping_raw_labels) == 0:
+                    continue
+
+                overlapping_raw_component_roi = np.isin(raw_labels, overlapping_raw_labels).astype(np.uint8)*255
+
+                # A raw component can contain a thin noisy tendril connected by only a
+                # pixel or two. Keep the sharp raw boundary, but only within a small,
+                # scale-aware recovery distance from the trusted CLEANED component.
+                clean_points = cv2.findNonZero(selected_clean_component_roi)
+                if clean_points is None:
+                    continue
+
+                _, _, clean_w, clean_h = cv2.boundingRect(clean_points)
+                max_raw_recovery_px = int(np.clip(round(0.06*np.hypot(clean_w, clean_h)), 2, 4))
+                distance_from_clean = cv2.distanceTransform(
+                    cv2.bitwise_not(selected_clean_component_roi), cv2.DIST_L2, 3,
+                )
+                raw_geometry_roi = cv2.bitwise_and(
+                    overlapping_raw_component_roi,
+                    (distance_from_clean <= max_raw_recovery_px).astype(np.uint8)*255,
+                )
+                geometry_points = cv2.findNonZero(raw_geometry_roi)
+                if geometry_points is None:
+                    continue
+
+                geometry_x, geometry_y, geometry_w, geometry_h = cv2.boundingRect(geometry_points)
+                geometry_crop = raw_geometry_roi[
+                    geometry_y:geometry_y + geometry_h,
+                    geometry_x:geometry_x + geometry_w,
+                ]
 
                 contours, _ = cv2.findContours(
-                    selected_component_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
-                    offset=(x1 + component_x1, y1 + component_y1),
+                    geometry_crop.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+                    offset=(x1 + geometry_x, y1 + geometry_y),
                 )
-
                 if profile_shape_detection:
                     timing_contour_s += time.perf_counter() - contour_start
 
@@ -1710,23 +1752,25 @@ def findSingleObjectUsingBestShapeGroup(
                     )
 
                     selected_seed_debug = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
-                    global_component_x1 = x1 + component_x1
-                    global_component_y1 = y1 + component_y1
-                    global_component_x2 = x1 + component_x2
-                    global_component_y2 = y1 + component_y2
-                    selected_seed_debug[
-                        global_component_y1:global_component_y2,
-                        global_component_x1:global_component_x2,
-                    ] = selected_component_mask
+                    selected_seed_debug[y1:y2, x1:x2] = selected_clean_component_roi
                     debug.addStage(
-                        f"{color_name} candidate {candidate_index} selected HSV component", selected_seed_debug,
+                        f"{color_name} candidate {candidate_index} selected CLEANED component",
+                        selected_seed_debug,
+                    )
+
+                    raw_geometry_debug = np.zeros(hsv_frame.shape[:2], dtype=np.uint8)
+                    raw_geometry_debug[y1:y2, x1:x2] = raw_geometry_roi
+                    debug.addStage(
+                        f"{color_name} candidate {candidate_index} RAW geometry mask",
+                        raw_geometry_debug,
                     )
 
                 if not contours:
                     continue
 
-                # Bridge all accepted same-color fragments into the one convex physical marker.
-                # The old recovery accidentally threw every fragment away except the largest.
+                # Cleanup may have joined several legitimate raw fragments of the same marker.
+                # All retained raw fragments overlap the selected cleaned component, so combine
+                # them before the existing convex-polygon path.
                 contour = contours[0] if len(contours) == 1 else cv2.convexHull(np.concatenate(contours, axis=0))
                 contour_area = cv2.contourArea(contour)
 
