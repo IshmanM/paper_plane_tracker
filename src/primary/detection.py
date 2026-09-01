@@ -1141,6 +1141,97 @@ def refineShapeVerticesUsingLabRays(
         refined.append(p1 + t*d1)
 
     refined = np.asarray(refined, dtype=np.float64)
+
+    # Very acute vertices are ill-conditioned when obtained only by intersecting two
+    # nearly parallel fitted edges: a sub-pixel edge-angle change can move the tip by
+    # many pixels. For those vertices, measure the marker's axial extent directly.
+    ACUTE_VERTEX_MAX_ANGLE_DEG = 45.0
+    TIP_SEARCH_INWARD_PX = 2.0
+    tip_search_outward_px = float(np.clip(round(0.20*bbox_diagonal_px), 4, 10))
+    tip_offsets = np.arange(
+        -TIP_SEARCH_INWARD_PX, tip_search_outward_px + 0.5, 0.5, dtype=np.float32,
+    )
+
+    for vertex_index in range(len(rough)):
+        previous_vertex = rough[(vertex_index - 1)%len(rough)]
+        rough_vertex = rough[vertex_index]
+        next_vertex = rough[(vertex_index + 1)%len(rough)]
+        side_1, side_2 = previous_vertex - rough_vertex, next_vertex - rough_vertex
+        side_1_norm, side_2_norm = np.linalg.norm(side_1), np.linalg.norm(side_2)
+        if side_1_norm <= 1e-6 or side_2_norm <= 1e-6:
+            continue
+
+        cosine_angle = np.clip(
+            float(np.dot(side_1, side_2)/(side_1_norm*side_2_norm)), -1.0, 1.0,
+        )
+        vertex_angle_deg = float(np.degrees(np.arccos(cosine_angle)))
+        if vertex_angle_deg >= ACUTE_VERTEX_MAX_ANGLE_DEG:
+            continue
+
+        tip_direction = rough_vertex - centroid
+        tip_direction_norm = float(np.linalg.norm(tip_direction))
+        if tip_direction_norm <= 1e-6:
+            continue
+        tip_direction /= tip_direction_norm
+
+        tip_samples = rough_vertex[None, :] + tip_offsets[:, None]*tip_direction[None, :]
+        tip_local = tip_samples - np.array([x1, y1])
+        tip_response = cv2.remap(
+            response,
+            tip_local[:, 0].astype(np.float32).reshape(1, -1),
+            tip_local[:, 1].astype(np.float32).reshape(1, -1),
+            cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+        ).reshape(-1)
+
+        if len(tip_response) < 4:
+            continue
+
+        smoothed_tip_response = tip_response.copy()
+        smoothed_tip_response[1:-1] = (
+            0.25*tip_response[:-2] + 0.50*tip_response[1:-1] + 0.25*tip_response[2:]
+        )
+        tip_drops = smoothed_tip_response[:-1] - smoothed_tip_response[1:]
+        tip_drop_offsets = 0.5*(tip_offsets[:-1] + tip_offsets[1:])
+
+        # Do not let an internal texture transition well behind the rough tip win.
+        eligible = tip_drop_offsets >= -1.0
+        if not np.any(eligible):
+            continue
+
+        eligible_indices = np.flatnonzero(eligible)
+        best_tip_index = int(eligible_indices[np.argmax(tip_drops[eligible])])
+        best_tip_drop = float(tip_drops[best_tip_index])
+        best_tip_inner_response = float(smoothed_tip_response[best_tip_index])
+        if best_tip_drop < minimum_edge_drop or best_tip_inner_response < minimum_inner_response:
+            continue
+
+        lo, hi = max(0, best_tip_index - 1), min(len(tip_drops), best_tip_index + 2)
+        weights = np.maximum(tip_drops[lo:hi], 0.0)
+        direct_tip_offset = (
+            float(np.sum(weights*tip_drop_offsets[lo:hi])/np.sum(weights))
+            if np.sum(weights) > 1e-6 else float(tip_drop_offsets[best_tip_index])
+        )
+        direct_tip = rough_vertex + direct_tip_offset*tip_direction
+
+        # Direct LAB search determines how far the tip extends along its axis.
+        # Fitted edge intersection still supplies the lateral coordinate.
+        perpendicular = np.array([-tip_direction[1], tip_direction[0]])
+        line_intersection = refined[vertex_index]
+        refined[vertex_index] = (
+            centroid
+            + np.dot(direct_tip - centroid, tip_direction)*tip_direction
+            + np.dot(line_intersection - centroid, perpendicular)*perpendicular
+        )
+
+        if debug_frame is not None:
+            cv2.line(
+                debug_frame,
+                tuple(np.round(rough_vertex - TIP_SEARCH_INWARD_PX*tip_direction).astype(int)),
+                tuple(np.round(rough_vertex + tip_search_outward_px*tip_direction).astype(int)),
+                (255, 255, 0), 1,
+            )
+            cv2.circle(debug_frame, tuple(np.round(direct_tip).astype(int)), 3, (0, 165, 255), -1)
+
     refined_polygon = refined.astype(np.float32).reshape(-1, 1, 2)
     rough_area, refined_area = cv2.contourArea(rough.astype(np.float32)), cv2.contourArea(refined_polygon)
     max_edge = max(np.linalg.norm(rough[i] - rough[(i + 1)%len(rough)]) for i in range(len(rough)))
@@ -1889,7 +1980,10 @@ def findSingleObjectUsingBestShapeGroup(
         debug.addStage("Combined cleaned mask", combined_cleaned_mask)
         debug.addStage("All selected HSV contours", contour_debug_frame)
         debug.addStage("Polygon approximations", polygon_debug_frame)
-        debug.addStage("LAB edge-ray refinement (yellow=rough, magenta=edge samples)", lab_ray_debug_frame)
+        debug.addStage(
+            "LAB edge rays (magenta=edge, cyan=acute-tip ray, orange=direct tip)",
+            lab_ray_debug_frame,
+        )
 
         if not shape_candidates:
             cv2.putText(candidate_debug_frame, "No accepted shapes", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
