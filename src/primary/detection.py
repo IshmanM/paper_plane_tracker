@@ -350,13 +350,17 @@ def solveArucoMarkerPose(corners: np.ndarray, aruco_spec,
     return True, detection, Measurement(x=float(t[0]), y=float(t[1]), z=float(t[2]))
 
 
-def _sharpenAruco(gray: np.ndarray) -> np.ndarray:
-    return cv2.addWeighted(gray, 1.5, cv2.GaussianBlur(gray, (0, 0), 1.0), -0.5, 0)
+def _sharpenAruco(gray: np.ndarray, k: float = 0.5) -> np.ndarray:
+    # Unsharp masking: gray + k * (gray - blurred_gray)
+    return cv2.addWeighted(gray, 1.0 + k, cv2.GaussianBlur(gray, (0, 0), 1.0), -k, 0)
 
 
-def _claheSharpenAruco(gray: np.ndarray) -> np.ndarray:
-    contrast = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-    return _sharpenAruco(contrast)
+def _claheAruco(gray: np.ndarray) -> np.ndarray:
+    return cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+
+
+def _claheSharpenAruco(gray: np.ndarray, k: float = 0.5) -> np.ndarray:
+    return _sharpenAruco(_claheAruco(gray), k)
 
 
 def detectArucoMarkerV2(
@@ -364,8 +368,14 @@ def detectArucoMarkerV2(
     camera_calibration: CameraCalibration, debug: DetectionDebug | None = None,
 ) -> tuple[bool, Detection, Measurement]:
     """
-    raw ArUco -> LK if seeded -> sharpened ArUco -> CLAHE+sharpened ArUco.
-    Enhancement retries run only when there is no LK seed; debug previews show both.
+    ArUco acquisition/tracking priority:
+        raw ArUco
+        -> LK if seeded
+        -> CLAHE ArUco
+        -> CLAHE + strong sharpen (k=1.5) ArUco
+        -> fail
+
+    Any successful ArUco detection reseeds LK using the original grayscale frame.
     """
     global _aruco_optical_flow_spec_key
 
@@ -382,15 +392,10 @@ def detectArucoMarkerV2(
     parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     detector = cv2.aruco.ArucoDetector(dictionary, parameters)
 
-    sharpened = clahe_sharpened = None
     if debug is not None:
         debug.reset(frame)
         debug.addStage("Original image", frame)
         debug.addStage("Grayscale", gray)
-        # Debug-only previews: normal runtime remains lazy.
-        sharpened, clahe_sharpened = _sharpenAruco(gray), _claheSharpenAruco(gray)
-        debug.addStage("Reacquisition preview - mild sharpen", sharpened)
-        debug.addStage("Reacquisition preview - CLAHE + mild sharpen", clahe_sharpened)
 
     def findMarker(image: np.ndarray) -> np.ndarray | None:
         corners, ids, _ = detector.detectMarkers(image)
@@ -399,10 +404,11 @@ def detectArucoMarkerV2(
         matches = np.where(ids.flatten() == spec.marker_id)[0]
         return None if len(matches) == 0 else np.asarray(corners[matches[0]], np.float64).reshape(4, 2)
 
-    def addResultStage(name: str, label: str, corners: np.ndarray, color) -> None:
+    def addCornersStage(name: str, label: str, corners: np.ndarray, color, base: np.ndarray | None = None) -> None:
         if debug is None:
             return
-        stage, points = frame.copy(), np.round(corners).astype(np.int32)
+        stage = frame.copy() if base is None else cv2.cvtColor(base, cv2.COLOR_GRAY2BGR)
+        points = np.round(corners).astype(np.int32)
         cv2.polylines(stage, [points.reshape(-1, 1, 2)], True, color, 2, cv2.LINE_AA)
         cv2.putText(stage, label, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2, cv2.LINE_AA)
         debug.addStage(name, stage)
@@ -411,62 +417,73 @@ def detectArucoMarkerV2(
     corners = findMarker(gray)
     if corners is not None:
         tracker.seed(gray, corners)
-        addResultStage("ArUco result - raw", f"RAW ARUCO ID {spec.marker_id}", corners, (0, 255, 0))
+        addCornersStage("ArUco result - raw", f"RAW ARUCO ID {spec.marker_id}", corners, (0, 255, 0))
         return solveArucoMarkerPose(corners, spec, camera_calibration)
 
-    # 2) LK bridge whenever a previous ArUco/flow frame exists.
+    # 2) If seeded, try the cheap temporal bridge first.
     if tracker.previous_gray is not None and tracker.previous_corners is not None:
         previous, flow_index = tracker.previous_corners.copy(), tracker.flow_only_frames + 1
         corners = tracker.track(gray)
-        if corners is None:
+
+        if corners is not None:
             if debug is not None:
                 stage = frame.copy()
-                cv2.putText(stage, "RAW ARUCO MISSED + LK REJECTED", (10, 26),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 255), 2, cv2.LINE_AA)
-                cv2.putText(stage, tracker.last_rejection_reason or "LK unavailable", (10, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.43, (0, 0, 255), 1, cv2.LINE_AA)
-                debug.addStage("Optical flow - rejected", stage)
-            return failedDetectionResult()
+                prev_px, curr_px = np.round(previous).astype(int), np.round(corners).astype(int)
+                cv2.polylines(stage, [curr_px.reshape(-1, 1, 2)], True, (255, 0, 255), 2, cv2.LINE_AA)
+                for p0, p1 in zip(prev_px, curr_px):
+                    cv2.circle(stage, tuple(p0), 3, (0, 165, 255), -1)
+                    cv2.line(stage, tuple(p0), tuple(p1), (255, 255, 0), 1, cv2.LINE_AA)
+                    cv2.circle(stage, tuple(p1), 3, (255, 0, 255), -1)
+
+                fb = tracker.last_forward_backward_errors_px
+                fb_text = "n/a" if fb is None else "/".join(f"{e:.2f}" for e in fb)
+                cv2.putText(stage, f"LK BRIDGE {flow_index}/{tracker.max_flow_only_frames}", (10, 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 0, 255), 2, cv2.LINE_AA)
+                cv2.putText(stage, f"forward-back px: {fb_text}", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 0), 1, cv2.LINE_AA)
+                debug.addStage("Optical flow - accepted", stage)
+
+            return solveArucoMarkerPose(corners, spec, camera_calibration)
 
         if debug is not None:
             stage = frame.copy()
-            prev_px, curr_px = np.round(previous).astype(int), np.round(corners).astype(int)
-            cv2.polylines(stage, [curr_px.reshape(-1, 1, 2)], True, (255, 0, 255), 2, cv2.LINE_AA)
-            for p0, p1 in zip(prev_px, curr_px):
-                cv2.circle(stage, tuple(p0), 3, (0, 165, 255), -1)
-                cv2.line(stage, tuple(p0), tuple(p1), (255, 255, 0), 1, cv2.LINE_AA)
-                cv2.circle(stage, tuple(p1), 3, (255, 0, 255), -1)
-            fb = tracker.last_forward_backward_errors_px
-            fb_text = "n/a" if fb is None else "/".join(f"{e:.2f}" for e in fb)
-            cv2.putText(stage, f"LK BRIDGE {flow_index}/{tracker.max_flow_only_frames}", (10, 26),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 0, 255), 2, cv2.LINE_AA)
-            cv2.putText(stage, f"forward-back px: {fb_text}", (10, 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 0), 1, cv2.LINE_AA)
-            debug.addStage("Optical flow - accepted", stage)
-        return solveArucoMarkerPose(corners, spec, camera_calibration)
+            cv2.putText(stage, "LK REJECTED - TRYING ENHANCED ARUCO", (10, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 255), 2, cv2.LINE_AA)
+            cv2.putText(stage, tracker.last_rejection_reason or "LK unavailable", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 255), 1, cv2.LINE_AA)
+            debug.addStage("Optical flow - rejected", stage)
 
-    # 3) No LK seed: spend extra compute trying enhanced acquisition.
-    if sharpened is None:
-        sharpened = _sharpenAruco(gray)
-    corners = findMarker(sharpened)
-    if corners is not None:
-        tracker.seed(gray, corners)  # Always seed LK with the original image.
-        addResultStage("ArUco result - sharpen reacquisition", "REACQUIRED WITH SHARPEN", corners, (0, 255, 255))
-        return solveArucoMarkerPose(corners, spec, camera_calibration)
+    # 3) CLAHE reacquisition.
+    clahe = _claheAruco(gray)
+    if debug is not None:
+        debug.addStage("ArUco reacquisition - CLAHE", clahe)
 
-    if clahe_sharpened is None:
-        clahe_sharpened = _claheSharpenAruco(gray)
-    corners = findMarker(clahe_sharpened)
+    corners = findMarker(clahe)
     if corners is not None:
         tracker.seed(gray, corners)
-        addResultStage("ArUco result - CLAHE reacquisition", "REACQUIRED WITH CLAHE + SHARPEN", corners, (0, 255, 255))
+        addCornersStage("ArUco result - CLAHE reacquisition",
+                        "REACQUIRED WITH CLAHE", corners, (0, 255, 255), clahe)
+        return solveArucoMarkerPose(corners, spec, camera_calibration)
+
+    # 4) Last chance: CLAHE + strong unsharp mask, k=1.5.
+    clahe_sharp = _sharpenAruco(clahe, 1.5)
+    if debug is not None:
+        debug.addStage("ArUco reacquisition - CLAHE + sharpen k=1.5", clahe_sharp)
+
+    corners = findMarker(clahe_sharp)
+    if corners is not None:
+        tracker.seed(gray, corners)
+        addCornersStage("ArUco result - strong sharpen reacquisition",
+                        "REACQUIRED WITH CLAHE + SHARPEN k=1.5",
+                        corners, (0, 255, 255), clahe_sharp)
         return solveArucoMarkerPose(corners, spec, camera_calibration)
 
     if debug is not None:
         stage = frame.copy()
-        cv2.putText(stage, "RAW + ENHANCED ARUCO FAILED; NO LK SEED", (10, 26),
+        cv2.putText(stage, "RAW + LK + CLAHE + SHARPEN FAILED", (10, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 0, 255), 2, cv2.LINE_AA)
         debug.addStage("ArUco result - acquisition failed", stage)
+
     return failedDetectionResult()
 
 
