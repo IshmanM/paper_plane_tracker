@@ -135,7 +135,7 @@ def detectSingleObject(frame: np.ndarray, object_vision_spec_id: ObjectVisionSpe
     if object_vision_spec.object_type == ObjectType.TENNIS_BALL:
         return detectTennisBall(frame, object_vision_spec, camera_calibration)
     elif object_vision_spec.object_type == ObjectType.ARUCO_MARKER:
-        return detectArucoMarker(frame, object_vision_spec, camera_calibration)
+        return detectArucoMarkerV2(frame, object_vision_spec, camera_calibration)
     elif object_vision_spec.object_type == ObjectType.PAPER_PLANE_SHAPES:
         return detectPaperPlaneShapes(frame, object_vision_spec, camera_calibration)
 
@@ -205,6 +205,197 @@ def detectArucoMarker(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, c
     measurement = Measurement(x=float(trans_vector[0]), y=float(trans_vector[1]), z=float(trans_vector[2]),)
 
     return True, detection, measurement
+
+
+
+def detectArucoMarkerV2(
+    frame: np.ndarray, object_vision_spec: ObjectVisionSpec,
+    camera_calibration: CameraCalibration, debug: DetectionDebug | None = None,
+) -> tuple[bool, Detection, Measurement]:
+    """Current ArUco detector with debug instrumentation only; detection behavior matches V1."""
+    aruco_spec = object_vision_spec.aruco_marker
+
+    if debug is not None:
+        debug.reset(frame)
+        debug.addStage("Original image", frame)
+
+    dictionary = cv2.aruco.getPredefinedDictionary(
+        getattr(cv2.aruco, aruco_spec.dictionary_name),
+    )
+    parameters = cv2.aruco.DetectorParameters()
+    parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    detector = cv2.aruco.ArucoDetector(dictionary, parameters)
+
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if debug is not None:
+        debug.addStage("Grayscale", gray)
+
+    corners, ids, rejected = detector.detectMarkers(gray)
+
+    if debug is not None:
+        candidates_debug = frame.copy()
+
+        # Rejected quadrilaterals are especially useful for motion debugging:
+        # red quad present -> candidate extraction worked but decoding rejected it.
+        for candidate_index, rejected_corners in enumerate(rejected):
+            points = np.round(np.asarray(rejected_corners).reshape(-1, 2)).astype(np.int32)
+            cv2.polylines(
+                candidates_debug, [points.reshape(-1, 1, 2)], True,
+                (0, 0, 255), 1, cv2.LINE_AA,
+            )
+            center = np.mean(points, axis=0).astype(int)
+            cv2.putText(
+                candidates_debug, f"R{candidate_index}", tuple(center),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 0, 255), 1, cv2.LINE_AA,
+            )
+
+        if ids is not None:
+            cv2.aruco.drawDetectedMarkers(candidates_debug, corners, ids)
+
+        decoded_count = 0 if ids is None else len(ids)
+        cv2.putText(
+            candidates_debug,
+            f"decoded={decoded_count} | rejected quads={len(rejected)}",
+            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            (255, 255, 255), 2, cv2.LINE_AA,
+        )
+        debug.addStage("ArUco candidates (green=decoded, red=rejected)", candidates_debug)
+
+    if ids is None:
+        if debug is not None:
+            failure = frame.copy()
+            cv2.putText(
+                failure, f"NO DECODED MARKER | rejected quads={len(rejected)}",
+                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                (0, 0, 255), 2, cv2.LINE_AA,
+            )
+            debug.addStage("ArUco result - no decoded marker", failure)
+        return failedDetectionResult()
+
+    ids = ids.flatten()
+    matching_indices = np.where(ids == aruco_spec.marker_id)[0]
+
+    if len(matching_indices) == 0:
+        if debug is not None:
+            failure = frame.copy()
+            decoded_ids = ",".join(str(int(marker_id)) for marker_id in ids)
+            cv2.putText(
+                failure,
+                f"TARGET ID {aruco_spec.marker_id} NOT FOUND | decoded: {decoded_ids}",
+                (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                (0, 0, 255), 2, cv2.LINE_AA,
+            )
+            debug.addStage("ArUco result - wrong marker ID", failure)
+        return failedDetectionResult()
+
+    marker_corners = np.asarray(
+        corners[matching_indices[0]], dtype=np.float64,
+    ).reshape(4, 2)
+
+    min_u, max_u = np.min(marker_corners[:, 0]), np.max(marker_corners[:, 0])
+    min_v, max_v = np.min(marker_corners[:, 1]), np.max(marker_corners[:, 1])
+    detection = Detection(
+        u=(max_u + min_u)/2.0,
+        v=(max_v + min_v)/2.0,
+        px_w=max_u - min_u,
+        px_h=max_v - min_v,
+    )
+
+    if debug is not None:
+        selected_debug = frame.copy()
+        points = np.round(marker_corners).astype(np.int32)
+        cv2.polylines(
+            selected_debug, [points.reshape(-1, 1, 2)], True,
+            (0, 255, 0), 2, cv2.LINE_AA,
+        )
+
+        corner_names = ("0 TL", "1 TR", "2 BR", "3 BL")
+        for corner_name, (u, v) in zip(corner_names, points):
+            cv2.circle(selected_debug, (int(u), int(v)), 4, (0, 255, 255), -1)
+            cv2.putText(
+                selected_debug, corner_name, (int(u) + 5, int(v) - 5),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                (0, 255, 255), 1, cv2.LINE_AA,
+            )
+
+        side_lengths = np.linalg.norm(
+            marker_corners - np.roll(marker_corners, -1, axis=0), axis=1,
+        )
+        cv2.putText(
+            selected_debug,
+            "side px: " + ", ".join(f"{length:.1f}" for length in side_lengths),
+            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+            (255, 255, 255), 2, cv2.LINE_AA,
+        )
+        debug.addStage("Selected target marker + refined corners", selected_debug)
+
+    half_side = aruco_spec.marker_length_m/2.0
+    object_points = np.array([
+        [-half_side,  half_side, 0.0],
+        [ half_side,  half_side, 0.0],
+        [ half_side, -half_side, 0.0],
+        [-half_side, -half_side, 0.0],
+    ], dtype=np.float64)
+
+    success, rot_vector, trans_vector = cv2.solvePnP(
+        objectPoints=object_points,
+        imagePoints=marker_corners,
+        cameraMatrix=camera_calibration.camera_matrix,
+        distCoeffs=camera_calibration.distortion_coefficients,
+        flags=cv2.SOLVEPNP_IPPE_SQUARE,
+    )
+
+    if not success:
+        if debug is not None:
+            failure = frame.copy()
+            cv2.putText(
+                failure, "IPPE_SQUARE PnP FAILED", (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                (0, 0, 255), 2, cv2.LINE_AA,
+            )
+            debug.addStage("ArUco PnP failed", failure)
+        return failedDetectionResult(detection)
+
+    trans_vector = trans_vector.reshape(3)
+    measurement = Measurement(
+        x=float(trans_vector[0]),
+        y=float(trans_vector[1]),
+        z=float(trans_vector[2]),
+    )
+
+    if debug is not None:
+        pnp_debug = frame.copy()
+        cv2.aruco.drawDetectedMarkers(
+            pnp_debug,
+            [marker_corners.astype(np.float32).reshape(1, 4, 2)],
+            np.array([[aruco_spec.marker_id]], dtype=np.int32),
+        )
+
+        axis_length = 0.5*aruco_spec.marker_length_m
+        cv2.drawFrameAxes(
+            pnp_debug,
+            camera_calibration.camera_matrix,
+            camera_calibration.distortion_coefficients,
+            rot_vector, trans_vector.reshape(3, 1),
+            axis_length, 2,
+        )
+
+        cv2.putText(
+            pnp_debug,
+            f"xyz=({measurement.x:+.3f}, {measurement.y:+.3f}, {measurement.z:+.3f}) m",
+            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+            (255, 255, 255), 2, cv2.LINE_AA,
+        )
+        cv2.putText(
+            pnp_debug,
+            f"marker bbox={detection.px_w:.1f} x {detection.px_h:.1f} px",
+            (10, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+            (255, 255, 255), 1, cv2.LINE_AA,
+        )
+        debug.addStage("ArUco PnP result", pnp_debug)
+
+    return True, detection, measurement
+
 
 
 def detectPaperPlaneShapes(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration) -> tuple[bool, Detection, Measurement]:

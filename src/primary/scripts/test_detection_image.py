@@ -14,7 +14,7 @@ from src.primary.geometry import estimateObjectWorldPosition
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpecId
 from src.primary.detection import (
     DetectionDebug, Measurement,
-    findSingleObjectUsingBestShapeGroup, findSingleObjectSphere, detectArucoMarker, detectSingleObject,
+    findSingleObjectUsingBestShapeGroup, findSingleObjectSphere, detectArucoMarkerV2, detectSingleObject,
     createMeasurementUsingShapeGroup, drawDetection, drawModelOrigin,
 )
 
@@ -436,7 +436,9 @@ def runDetectionOnImage(
             measurement = Measurement(x, y, z)
 
     elif algorithm == DetectionAlgorithm.ARUCO_MARKER:
-        _, detection, measurement = detectArucoMarker(frame, object_vision_spec, camera_calibration)
+        _, detection, measurement = detectArucoMarkerV2(
+            frame, object_vision_spec, camera_calibration, debug,
+        )
 
     else:
         raise ValueError(f"Unsupported detection algorithm: {algorithm}")
