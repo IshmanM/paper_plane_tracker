@@ -201,10 +201,10 @@ def findSingleObjectTriangleColorBlob(
     """
     Pure-color triangle detector using the tennis-ball detector's color pipeline:
         LAB hotspot -> loose HSV seed -> nearby-component retention
-        -> LAB-gradient radial boundary refinement -> triangle fit.
+        -> loose LAB color support -> HSV-associated support components
+        -> convex hull -> triangle fit.
 
-    HSV only seeds the object. The final triangle comes from LAB-refined boundary
-    evidence, so incomplete HSV coverage is acceptable.
+    HSV only seeds/associates the object. Internal crease gradients are ignored.
     """
     if not object_vision_spec.color_ids:
         raise ValueError("Pure-color triangle detection requires at least one color_id")
@@ -212,10 +212,7 @@ def findSingleObjectTriangleColorBlob(
         raise ValueError("Pure-color triangle detection requires minimum_contour_area_px")
 
     MAX_CANDIDATES = 2
-    NUM_RAYS = 120
-    MIN_BOUNDARY_POINTS = 20
-    LAB_CHROMA_GRADIENT_GAIN = 2.0
-    MIN_LAB_EDGE_STRENGTH = 35.0
+    MIN_LAB_SUPPORT_RESPONSE_FACTOR = 0.12
 
     GLOBAL_BLUR_KERNEL = (5, 5)
     HOTSPOT_PERCENTILE = 98.5
@@ -335,8 +332,6 @@ def findSingleObjectTriangleColorBlob(
             )
         debug.addStage("LAB hotspot candidates", candidate_frame)
 
-    angles = np.linspace(0.0, 2.0*np.pi, NUM_RAYS, endpoint=False)
-    directions_u, directions_v = np.cos(angles)[:, None], np.sin(angles)[:, None]
     best_result, best_score = None, -np.inf
 
     for candidate_index, (_, _, hot_x, hot_y, hot_w, hot_h, _) in enumerate(candidates, start=1):
@@ -458,89 +453,70 @@ def findSingleObjectTriangleColorBlob(
         center_v = y1 + seed_moments["m01"]/seed_moments["m00"]
         seed_size = max(joined_w, joined_h, hot_w, hot_h)
 
-        # Same combined LAB-gradient edge strength as the tennis-ball detector.
-        lab_roi = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2LAB)
-        lab_roi = cv2.GaussianBlur(lab_roi, (3, 3), 0).astype(np.float32)
-        grad_u = cv2.Sobel(lab_roi, cv2.CV_32F, 1, 0, ksize=3)
-        grad_v = cv2.Sobel(lab_roi, cv2.CV_32F, 0, 1, ksize=3)
+        # Do NOT use generic edge strength here. A folded paper plane has strong
+        # internal crease edges that can be stronger than the outer silhouette.
+        #
+        # Instead, use LAB as a loose target-COLOR support mask. HSV only tells us
+        # which support regions belong to this candidate.
+        lab_response_roi = lab_color_response[y1:y2, x1:x2]
+        minimum_lab_support = MIN_LAB_SUPPORT_RESPONSE_FACTOR*reference_chroma_strength
+        lab_support_mask = (lab_response_roi >= minimum_lab_support).astype(np.uint8)*255
 
-        lab_edge_strength = np.sqrt(
-            grad_u[:, :, 0]**2 + grad_v[:, :, 0]**2 +
-            LAB_CHROMA_GRADIENT_GAIN*(
-                grad_u[:, :, 1]**2 + grad_v[:, :, 1]**2 +
-                grad_u[:, :, 2]**2 + grad_v[:, :, 2]**2
-            )
+        # Close small dark gaps caused by folds/shadows. Do not OPEN/erode: preserving
+        # the outer triangle tips matters more than removing a few isolated support pixels.
+        lab_support_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        lab_support_mask = cv2.morphologyEx(
+            lab_support_mask, cv2.MORPH_CLOSE, lab_support_kernel,
         )
 
         if debug is not None:
             roi_debug = frame.copy()
             cv2.rectangle(roi_debug, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
             debug.addStage(f"Candidate {candidate_index} ROI", roi_debug)
+
+            support_debug = np.zeros(frame.shape[:2], dtype=np.uint8)
+            support_debug[y1:y2, x1:x2] = lab_support_mask
             debug.addStage(
-                f"Candidate {candidate_index} LAB edge strength",
-                cv2.normalize(lab_edge_strength, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8),
+                f"Candidate {candidate_index} loose LAB color support",
+                support_debug,
             )
 
-        # Same radial HSV expectation + nearby LAB-edge refinement.
-        center_roi_u, center_roi_v = center_u - x1, center_v - y1
-        radii = np.arange(1, max(1, int(seed_size)) + 1)
-        radius_grid = np.broadcast_to(radii, (NUM_RAYS, len(radii)))
+        # Associate LAB support components with the already-joined HSV blobs. Slightly
+        # dilate HSV only for association so a 1-2 px color-space boundary mismatch
+        # does not prevent a legitimate LAB region from being retained.
+        association_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        hsv_association_mask = cv2.dilate(seed_mask, association_kernel, iterations=1)
 
-        sample_u = np.rint(center_roi_u + directions_u*radii).astype(np.int32)
-        sample_v = np.rint(center_roi_v + directions_v*radii).astype(np.int32)
-        valid = (
-            (sample_u >= 0) & (sample_u < seed_mask.shape[1]) &
-            (sample_v >= 0) & (sample_v < seed_mask.shape[0])
+        num_lab_labels, lab_labels, lab_stats, _ = cv2.connectedComponentsWithStats(
+            lab_support_mask, connectivity=8,
         )
+        overlapping_lab_labels = np.unique(lab_labels[hsv_association_mask != 0])
+        overlapping_lab_labels = overlapping_lab_labels[overlapping_lab_labels != 0]
 
-        safe_u = np.clip(sample_u, 0, seed_mask.shape[1] - 1)
-        safe_v = np.clip(sample_v, 0, seed_mask.shape[0] - 1)
-        seed_hits = (seed_mask[safe_v, safe_u] != 0) & valid
-        expected_radii = np.where(seed_hits, radius_grid, 0).max(axis=1)
-
-        search_before = 3
-        search_after = np.maximum(5, (0.20*expected_radii).astype(np.int32))
-        search_band = (
-            (radius_grid >= (expected_radii - search_before)[:, None]) &
-            (radius_grid <= (expected_radii + search_after)[:, None]) &
-            (expected_radii[:, None] > 0) & valid
-        )
-
-        sampled_edge_strength = lab_edge_strength[safe_v, safe_u]
-        candidate_strength = np.where(search_band, sampled_edge_strength, 0.0)
-        best_edge_indices = np.argmax(candidate_strength, axis=1)
-        best_edge_strengths = candidate_strength[np.arange(NUM_RAYS), best_edge_indices]
-        rays_with_edge = best_edge_strengths >= MIN_LAB_EDGE_STRENGTH
-
-        if np.count_nonzero(rays_with_edge) < MIN_BOUNDARY_POINTS:
+        if len(overlapping_lab_labels) == 0:
             continue
 
-        ray_indices = np.flatnonzero(rays_with_edge)
-        edge_indices = best_edge_indices[rays_with_edge]
-        boundary_points = np.column_stack((
-            sample_u[ray_indices, edge_indices] + x1,
-            sample_v[ray_indices, edge_indices] + y1,
-        )).astype(np.float64)
+        # Keep every LAB color component supported by one of the separate HSV blobs.
+        # This is what lets crease-separated parts of the same pink plane contribute
+        # jointly to the final geometry.
+        selected_lab_mask = np.isin(lab_labels, overlapping_lab_labels).astype(np.uint8)*255
+        selected_lab_points = cv2.findNonZero(selected_lab_mask)
+        if selected_lab_points is None:
+            continue
 
         if debug is not None:
-            boundary_debug = frame.copy()
-            for point_u, point_v in boundary_points:
-                cv2.circle(
-                    boundary_debug,
-                    (int(round(point_u)), int(round(point_v))),
-                    2, (255, 0, 255), -1,
-                )
-            cv2.putText(
-                boundary_debug,
-                f"LAB-refined boundary points: {len(boundary_points)}/{NUM_RAYS}",
-                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-                (255, 0, 255), 2, cv2.LINE_AA,
+            selected_support_debug = np.zeros(frame.shape[:2], dtype=np.uint8)
+            selected_support_debug[y1:y2, x1:x2] = selected_lab_mask
+            debug.addStage(
+                f"Candidate {candidate_index} HSV-associated LAB support",
+                selected_support_debug,
             )
-            debug.addStage(f"Candidate {candidate_index} LAB-refined boundary", boundary_debug)
 
-        # Triangle-specific finish: hull the LAB-refined boundary, then require the
-        # configured polygon epsilon to reduce it to exactly three convex vertices.
-        hull = cv2.convexHull(boundary_points.astype(np.float32))
+        # Geometry comes from the convex envelope of all retained target-color pixels.
+        # Internal crease gaps/lines therefore do not create candidate edges.
+        support_points = selected_lab_points.reshape(-1, 2).astype(np.float32)
+        support_points += np.array([x1, y1], dtype=np.float32)
+        hull = cv2.convexHull(support_points)
         perimeter = float(cv2.arcLength(hull, True))
         if perimeter <= 0.0:
             continue
@@ -551,13 +527,19 @@ def findSingleObjectTriangleColorBlob(
         if len(triangle) != 3 or not cv2.isContourConvex(triangle):
             if debug is not None:
                 rejected = frame.copy()
-                cv2.polylines(rejected, [np.round(hull).astype(np.int32)], True, (0, 0, 255), 1)
+                cv2.polylines(
+                    rejected, [np.round(hull).astype(np.int32)],
+                    True, (0, 0, 255), 1,
+                )
                 cv2.putText(
-                    rejected, f"REJECT: hull approximated to {len(triangle)} sides",
+                    rejected, f"REJECT: color hull approximated to {len(triangle)} sides",
                     (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
                     (0, 0, 255), 2, cv2.LINE_AA,
                 )
-                debug.addStage(f"Candidate {candidate_index} rejected - triangle topology", rejected)
+                debug.addStage(
+                    f"Candidate {candidate_index} rejected - triangle topology",
+                    rejected,
+                )
             continue
 
         triangle = triangle.reshape(3, 2).astype(np.float64)
@@ -566,10 +548,33 @@ def findSingleObjectTriangleColorBlob(
         if triangle_area < object_vision_spec.minimum_contour_area_px or hull_area <= 0.0:
             continue
 
-        # A genuine triangle should explain most of its LAB-refined convex hull.
         fill_ratio = min(hull_area, triangle_area)/max(hull_area, triangle_area)
         if fill_ratio < 0.70:
             continue
+
+        if debug is not None:
+            geometry_debug = frame.copy()
+            cv2.polylines(
+                geometry_debug, [np.round(hull).astype(np.int32)],
+                True, (255, 0, 255), 1,
+            )
+            cv2.polylines(
+                geometry_debug,
+                [np.round(triangle).astype(np.int32).reshape(-1, 1, 2)],
+                True, COLOR_SPECS[object_vision_spec.color_ids[0]].draw_bgr,
+                2, cv2.LINE_AA,
+            )
+            cv2.putText(
+                geometry_debug,
+                f"COLOR HULL -> TRIANGLE | fill={fill_ratio:.2f}",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                COLOR_SPECS[object_vision_spec.color_ids[0]].draw_bgr,
+                2, cv2.LINE_AA,
+            )
+            debug.addStage(
+                f"Candidate {candidate_index} color hull + triangle",
+                geometry_debug,
+            )
 
         moments = cv2.moments(triangle.astype(np.float32))
         if abs(moments["m00"]) <= 1e-9:
@@ -588,7 +593,7 @@ def findSingleObjectTriangleColorBlob(
         score = triangle_area*fill_ratio
         if score > best_score:
             best_score = score
-            best_result = detection, boundary_points, fill_ratio
+            best_result = detection, hull, fill_ratio
 
         if debug is not None:
             triangle_debug = frame.copy()
@@ -608,12 +613,11 @@ def findSingleObjectTriangleColorBlob(
     if best_result is None:
         return None
 
-    detection, boundary_points, fill_ratio = best_result
+    detection, hull, fill_ratio = best_result
 
     if debug is not None:
         final = frame.copy()
-        for point_u, point_v in boundary_points:
-            cv2.circle(final, (int(round(point_u)), int(round(point_v))), 1, (255, 0, 255), -1)
+        cv2.polylines(final, [np.round(hull).astype(np.int32)], True, (255, 0, 255), 1)
         drawDetection(final, detection)
         cv2.putText(
             final, f"BEST PURE-COLOR TRIANGLE | fill={fill_ratio:.2f}",

@@ -110,11 +110,11 @@ COLOR_SPECS = {
     ColorId.PINK: ColorSpec(
         hsv_ranges=[
             (
-                np.array([162, 75, 170], dtype=np.uint8),
-                np.array([179, 150, 255], dtype=np.uint8),
+                np.array([150, 40, 40], dtype=np.uint8),
+                np.array([179, 200, 255], dtype=np.uint8),
             ),
         ],
         draw_bgr=(180, 105, 255),
-        lab_value=np.array([217, 150, 124], dtype=np.uint8),
+        lab_value=np.array([65, 145, 126], dtype=np.uint8),
     ),
 }

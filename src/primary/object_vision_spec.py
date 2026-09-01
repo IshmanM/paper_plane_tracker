@@ -386,7 +386,7 @@ OBJECT_VISION_SPECS = {
         color_ids=[ColorId.PINK],
         minimum_contour_area_px=50.0,
         polygon_epsilon_ratio=0.030,
-        width=0.2552,
+        width=0.2794,
     ),
 
     ObjectVisionSpecId.PAPER_PLANE_SHAPES_1: ObjectVisionSpec(
