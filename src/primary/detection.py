@@ -214,471 +214,260 @@ def detectArucoMarker(frame: np.ndarray, object_vision_spec: ObjectVisionSpec, c
 
 
 class ArucoOpticalFlowTracker:
-    """
-    Short-term image-space bridge between genuine ArUco detections.
-
-    This class only propagates the four marker corners from one image to the next.
-    It does not estimate 3-D state and is independent of the object's KF/tracker.
-    """
+    """Short-term image-space propagation of the four ArUco corners."""
 
     def __init__(self, max_flow_only_frames: int = 8):
         self.max_flow_only_frames = max_flow_only_frames
-        self.previous_gray: np.ndarray | None = None
-        self.previous_corners: np.ndarray | None = None
+        self.previous_gray = self.previous_corners = None
+        self.flow_only_frames = 0
+        self.last_forward_backward_errors_px = self.last_rejection_reason = None
+
+    def _clear(self) -> None:
+        self.previous_gray = self.previous_corners = None
         self.flow_only_frames = 0
 
-        # Debug information from the latest LK attempt.
-        self.last_forward_backward_errors_px: np.ndarray | None = None
-        self.last_rejection_reason: str | None = None
-
-    def _clearTrackingState(self) -> None:
-        self.previous_gray = None
-        self.previous_corners = None
-        self.flow_only_frames = 0
+    def _reject(self, reason: str) -> None:
+        self.last_rejection_reason = reason
+        self._clear()
 
     def reset(self) -> None:
-        self._clearTrackingState()
-        self.last_forward_backward_errors_px = None
-        self.last_rejection_reason = None
+        self._clear()
+        self.last_forward_backward_errors_px = self.last_rejection_reason = None
 
-    def seed(self, gray: np.ndarray, marker_corners: np.ndarray) -> None:
-        """Replace any accumulated optical-flow state with a genuine ArUco result."""
+    def seed(self, gray: np.ndarray, corners: np.ndarray) -> None:
         self.previous_gray = gray.copy()
-        self.previous_corners = np.asarray(
-            marker_corners, dtype=np.float32,
-        ).reshape(4, 2).copy()
+        self.previous_corners = np.asarray(corners, np.float32).reshape(4, 2).copy()
         self.flow_only_frames = 0
-        self.last_forward_backward_errors_px = None
-        self.last_rejection_reason = None
+        self.last_forward_backward_errors_px = self.last_rejection_reason = None
 
     def track(self, gray: np.ndarray) -> np.ndarray | None:
-        """
-        Propagate the previous four ArUco corners into this frame using pyramidal LK.
-
-        Each LK solve is only previous-frame -> current-frame. Successful propagated
-        corners become the reference for the next frame, allowing several consecutive
-        ArUco misses to be bridged without matching all the way back to the last
-        genuine ArUco frame.
-        """
-        self.last_forward_backward_errors_px = None
-        self.last_rejection_reason = None
-
+        self.last_forward_backward_errors_px = self.last_rejection_reason = None
         if self.previous_gray is None or self.previous_corners is None:
             self.last_rejection_reason = "no optical-flow seed"
             return None
-
         if self.previous_gray.shape != gray.shape:
-            self.last_rejection_reason = "frame dimensions changed"
-            self._clearTrackingState()
+            self._reject("frame dimensions changed")
             return None
-
         if self.flow_only_frames >= self.max_flow_only_frames:
-            self.last_rejection_reason = (
-                f"flow-only limit reached ({self.max_flow_only_frames})"
-            )
-            self._clearTrackingState()
+            self._reject(f"flow-only limit reached ({self.max_flow_only_frames})")
             return None
 
-        previous_corners = self.previous_corners.astype(np.float32)
-        previous_diagonal_px = float(
-            np.linalg.norm(np.ptp(previous_corners, axis=0))
-        )
+        prev = self.previous_corners.astype(np.float32)
+        diag = float(np.linalg.norm(np.ptp(prev, axis=0)))
+        win = int(np.clip(round(0.75*diag), 9, 31))
+        win += win % 2 == 0
+        lk = dict(winSize=(win, win), maxLevel=3,
+                  criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.01),
+                  minEigThreshold=1e-4)
 
-        # Scale LK's patch with the observed marker size. Tiny distant markers should
-        # not use the same huge patch as a nearby marker.
-        window_side_px = int(np.clip(
-            round(0.75*previous_diagonal_px), 9, 31,
-        ))
-        if window_side_px % 2 == 0:
-            window_side_px += 1
+        curr, fwd_status, _ = cv2.calcOpticalFlowPyrLK(
+            self.previous_gray, gray, prev.reshape(-1, 1, 2), None, **lk)
+        if curr is None or fwd_status is None:
+            self._reject("forward LK failed")
+            return None
+        curr, fwd_status = curr.reshape(4, 2), fwd_status.reshape(4).astype(bool)
 
-        lk_parameters = dict(
-            winSize=(window_side_px, window_side_px),
-            maxLevel=3,
-            criteria=(
-                cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
-                20, 0.01,
-            ),
-            minEigThreshold=1e-4,
-        )
+        back, back_status, _ = cv2.calcOpticalFlowPyrLK(
+            gray, self.previous_gray, curr.reshape(-1, 1, 2), None, **lk)
+        if back is None or back_status is None:
+            self._reject("backward LK failed")
+            return None
+        back, back_status = back.reshape(4, 2), back_status.reshape(4).astype(bool)
 
-        current_corners, forward_status, _ = cv2.calcOpticalFlowPyrLK(
-            self.previous_gray,
-            gray,
-            previous_corners.reshape(-1, 1, 2),
-            None,
-            **lk_parameters,
-        )
-
-        if current_corners is None or forward_status is None:
-            self.last_rejection_reason = "forward LK failed"
-            self._clearTrackingState()
+        fb = np.linalg.norm(back - prev, axis=1)
+        self.last_forward_backward_errors_px = fb.copy()
+        max_fb = float(np.clip(0.06*diag, 0.75, 2.5))
+        if not np.all(fwd_status & back_status):
+            self._reject("one or more LK corners lost")
+            return None
+        if np.max(fb) > max_fb:
+            self._reject(f"forward/back error {np.max(fb):.2f}px > {max_fb:.2f}px")
+            return None
+        if not np.all(np.isfinite(curr)):
+            self._reject("non-finite tracked corners")
             return None
 
-        current_corners = current_corners.reshape(4, 2)
-        forward_status = forward_status.reshape(4).astype(bool)
-
-        backward_corners, backward_status, _ = cv2.calcOpticalFlowPyrLK(
-            gray,
-            self.previous_gray,
-            current_corners.reshape(-1, 1, 2),
-            None,
-            **lk_parameters,
-        )
-
-        if backward_corners is None or backward_status is None:
-            self.last_rejection_reason = "backward LK failed"
-            self._clearTrackingState()
+        prev_poly = prev.reshape(-1, 1, 2)
+        curr_poly = curr.astype(np.float32).reshape(-1, 1, 2)
+        if not cv2.isContourConvex(curr_poly):
+            self._reject("tracked quad is not convex")
             return None
 
-        backward_corners = backward_corners.reshape(4, 2)
-        backward_status = backward_status.reshape(4).astype(bool)
-
-        forward_backward_errors_px = np.linalg.norm(
-            backward_corners - previous_corners,
-            axis=1,
-        )
-        self.last_forward_backward_errors_px = forward_backward_errors_px.copy()
-
-        # Forward/backward consistency scales gently with marker size but remains
-        # strict for distant markers, where a 2 px corner error is already enormous.
-        maximum_fb_error_px = float(np.clip(
-            0.06*previous_diagonal_px, 0.75, 2.5,
-        ))
-
-        if not np.all(forward_status & backward_status):
-            self.last_rejection_reason = "one or more LK corners lost"
-            self._clearTrackingState()
+        prev_area, curr_area = abs(float(cv2.contourArea(prev_poly))), abs(float(cv2.contourArea(curr_poly)))
+        if prev_area <= 1e-6 or curr_area <= 1e-6:
+            self._reject("degenerate tracked quad")
             return None
-
-        if np.max(forward_backward_errors_px) > maximum_fb_error_px:
-            self.last_rejection_reason = (
-                f"forward/back error {np.max(forward_backward_errors_px):.2f}px "
-                f"> {maximum_fb_error_px:.2f}px"
-            )
-            self._clearTrackingState()
-            return None
-
-        if not np.all(np.isfinite(current_corners)):
-            self.last_rejection_reason = "non-finite tracked corners"
-            self._clearTrackingState()
-            return None
-
-        current_polygon = current_corners.astype(np.float32).reshape(-1, 1, 2)
-        previous_polygon = previous_corners.astype(np.float32).reshape(-1, 1, 2)
-
-        if not cv2.isContourConvex(current_polygon):
-            self.last_rejection_reason = "tracked quad is not convex"
-            self._clearTrackingState()
-            return None
-
-        previous_area_px2 = abs(float(cv2.contourArea(previous_polygon)))
-        current_area_px2 = abs(float(cv2.contourArea(current_polygon)))
-
-        if previous_area_px2 <= 1e-6 or current_area_px2 <= 1e-6:
-            self.last_rejection_reason = "degenerate tracked quad"
-            self._clearTrackingState()
-            return None
-
-        area_ratio = current_area_px2/previous_area_px2
+        area_ratio = curr_area/prev_area
         if not 0.45 <= area_ratio <= 2.20:
-            self.last_rejection_reason = (
-                f"per-frame area ratio {area_ratio:.2f} outside [0.45, 2.20]"
-            )
-            self._clearTrackingState()
+            self._reject(f"per-frame area ratio {area_ratio:.2f} outside [0.45, 2.20]")
             return None
 
-        previous_side_lengths = np.linalg.norm(
-            np.roll(previous_corners, -1, axis=0) - previous_corners,
-            axis=1,
-        )
-        current_side_lengths = np.linalg.norm(
-            np.roll(current_corners, -1, axis=0) - current_corners,
-            axis=1,
-        )
-
-        # Do not let a corner collapse onto its neighbor in one blurry frame.
-        minimum_side_px = max(
-            2.0, 0.35*float(np.min(previous_side_lengths)),
-        )
-        if np.min(current_side_lengths) < minimum_side_px:
-            self.last_rejection_reason = (
-                f"tracked side collapsed to {np.min(current_side_lengths):.2f}px"
-            )
-            self._clearTrackingState()
+        prev_sides = np.linalg.norm(np.roll(prev, -1, axis=0) - prev, axis=1)
+        curr_sides = np.linalg.norm(np.roll(curr, -1, axis=0) - curr, axis=1)
+        min_side = max(2.0, 0.35*float(np.min(prev_sides)))
+        if np.min(curr_sides) < min_side:
+            self._reject(f"tracked side collapsed to {np.min(curr_sides):.2f}px")
             return None
 
-        corner_displacements_px = np.linalg.norm(
-            current_corners - previous_corners,
-            axis=1,
-        )
-        maximum_corner_step_px = max(
-            20.0, 3.0*previous_diagonal_px,
-        )
-
-        if np.max(corner_displacements_px) > maximum_corner_step_px:
-            self.last_rejection_reason = (
-                f"corner step {np.max(corner_displacements_px):.1f}px "
-                f"> {maximum_corner_step_px:.1f}px"
-            )
-            self._clearTrackingState()
+        max_step = max(20.0, 3.0*diag)
+        if np.max(np.linalg.norm(curr - prev, axis=1)) > max_step:
+            self._reject(f"corner step exceeded {max_step:.1f}px")
             return None
 
-        # Accepted: this current frame becomes the one-frame-back reference.
-        self.previous_gray = gray.copy()
-        self.previous_corners = current_corners.astype(np.float32).copy()
+        self.previous_gray, self.previous_corners = gray.copy(), curr.copy()
         self.flow_only_frames += 1
-        self.last_rejection_reason = None
-
-        return current_corners.astype(np.float64)
+        return curr.astype(np.float64)
 
 
-
-# One private image-space tracker shared by all calls in this Python process.
-# Python caches imported modules, so this state naturally persists frame-to-frame
-# without requiring main.py or test scripts to instantiate anything.
 _aruco_optical_flow_tracker = ArucoOpticalFlowTracker(max_flow_only_frames=8)
 _aruco_optical_flow_spec_key = None
 
 
 def resetArucoOpticalFlowTracker() -> None:
-    """Explicit reset hook for unusual cases; normal callers do not need this."""
     global _aruco_optical_flow_spec_key
-
     _aruco_optical_flow_tracker.reset()
     _aruco_optical_flow_spec_key = None
 
 
+def solveArucoMarkerPose(corners: np.ndarray, aruco_spec,
+                         camera_calibration: CameraCalibration) -> tuple[bool, Detection, Measurement]:
+    corners = np.asarray(corners, np.float64).reshape(4, 2)
+    min_u, min_v = np.min(corners, axis=0)
+    max_u, max_v = np.max(corners, axis=0)
+    detection = Detection((min_u + max_u)/2, (min_v + max_v)/2, max_u - min_u, max_v - min_v)
 
-def solveArucoMarkerPose(
-    marker_corners: np.ndarray, aruco_spec,
-    camera_calibration: CameraCalibration,
-) -> tuple[bool, Detection, Measurement]:
-    """Convert four image-space marker corners into the ordinary 3-D measurement."""
-    marker_corners = np.asarray(
-        marker_corners, dtype=np.float64,
-    ).reshape(4, 2)
-
-    min_u, max_u = np.min(marker_corners[:, 0]), np.max(marker_corners[:, 0])
-    min_v, max_v = np.min(marker_corners[:, 1]), np.max(marker_corners[:, 1])
-
-    detection = Detection(
-        u=(max_u + min_u)/2.0,
-        v=(max_v + min_v)/2.0,
-        px_w=max_u - min_u,
-        px_h=max_v - min_v,
-    )
-
-    half_side = aruco_spec.marker_length_m/2.0
-    object_points = np.array([
-        [-half_side,  half_side, 0.0],  # top-left
-        [ half_side,  half_side, 0.0],  # top-right
-        [ half_side, -half_side, 0.0],  # bottom-right
-        [-half_side, -half_side, 0.0],  # bottom-left
-    ], dtype=np.float64)
-
-    success, _, trans_vector = cv2.solvePnP(
-        objectPoints=object_points,
-        imagePoints=marker_corners,
-        cameraMatrix=camera_calibration.camera_matrix,
-        distCoeffs=camera_calibration.distortion_coefficients,
-        flags=cv2.SOLVEPNP_IPPE_SQUARE,
-    )
-
+    h = aruco_spec.marker_length_m/2
+    object_points = np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], np.float64)
+    success, _, t = cv2.solvePnP(
+        object_points, corners, camera_calibration.camera_matrix,
+        camera_calibration.distortion_coefficients, flags=cv2.SOLVEPNP_IPPE_SQUARE)
     if not success:
         return failedDetectionResult(detection)
 
-    trans_vector = trans_vector.reshape(3)
-
-    if (
-        not np.all(np.isfinite(trans_vector))
-        or trans_vector[2] <= 0.0
-    ):
+    t = t.reshape(3)
+    if not np.all(np.isfinite(t)) or t[2] <= 0:
         return failedDetectionResult(detection)
+    return True, detection, Measurement(x=float(t[0]), y=float(t[1]), z=float(t[2]))
 
-    measurement = Measurement(
-        x=float(trans_vector[0]),
-        y=float(trans_vector[1]),
-        z=float(trans_vector[2]),
-    )
-    return True, detection, measurement
+
+def _sharpenAruco(gray: np.ndarray) -> np.ndarray:
+    return cv2.addWeighted(gray, 1.5, cv2.GaussianBlur(gray, (0, 0), 1.0), -0.5, 0)
+
+
+def _claheSharpenAruco(gray: np.ndarray) -> np.ndarray:
+    contrast = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+    return _sharpenAruco(contrast)
 
 
 def detectArucoMarkerV2(
     frame: np.ndarray, object_vision_spec: ObjectVisionSpec,
-    camera_calibration: CameraCalibration,
-    debug: DetectionDebug | None = None,
+    camera_calibration: CameraCalibration, debug: DetectionDebug | None = None,
 ) -> tuple[bool, Detection, Measurement]:
     """
-    Standard ArUco with a short-term four-corner LK bridge.
-
-    Genuine ArUco detections always have authority and reseed the optical flow.
-    If ArUco misses, a module-private image-space tracker propagates the four marker
-    corners from the immediately previous frame. No Shi-Tomasi/FAST features are
-    detected and there is no custom blurred-marker detector.
+    raw ArUco -> LK if seeded -> sharpened ArUco -> CLAHE+sharpened ArUco.
+    Enhancement retries run only when there is no LK seed; debug previews show both.
     """
     global _aruco_optical_flow_spec_key
 
-    aruco_spec = object_vision_spec.aruco_marker
-    optical_flow_tracker = _aruco_optical_flow_tracker
-
-    # Never propagate corners from a different configured marker.
-    spec_key = (
-        aruco_spec.dictionary_name,
-        aruco_spec.marker_id,
-        aruco_spec.marker_length_m,
-    )
+    spec = object_vision_spec.aruco_marker
+    tracker = _aruco_optical_flow_tracker
+    spec_key = (spec.dictionary_name, spec.marker_id, spec.marker_length_m)
     if spec_key != _aruco_optical_flow_spec_key:
-        optical_flow_tracker.reset()
+        tracker.reset()
         _aruco_optical_flow_spec_key = spec_key
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-    if debug is not None:
-        debug.reset(frame)
-        debug.addStage("Original image", frame)
-        debug.addStage("Grayscale", gray)
-
-    dictionary = cv2.aruco.getPredefinedDictionary(
-        getattr(cv2.aruco, aruco_spec.dictionary_name),
-    )
+    dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, spec.dictionary_name))
     parameters = cv2.aruco.DetectorParameters()
     parameters.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
     detector = cv2.aruco.ArucoDetector(dictionary, parameters)
 
-    corners, ids, _ = detector.detectMarkers(gray)
+    sharpened = clahe_sharpened = None
+    if debug is not None:
+        debug.reset(frame)
+        debug.addStage("Original image", frame)
+        debug.addStage("Grayscale", gray)
+        # Debug-only previews: normal runtime remains lazy.
+        sharpened, clahe_sharpened = _sharpenAruco(gray), _claheSharpenAruco(gray)
+        debug.addStage("Reacquisition preview - mild sharpen", sharpened)
+        debug.addStage("Reacquisition preview - CLAHE + mild sharpen", clahe_sharpened)
 
-    if ids is not None:
-        flat_ids = ids.flatten()
-        matching_indices = np.where(
-            flat_ids == aruco_spec.marker_id,
-        )[0]
+    def findMarker(image: np.ndarray) -> np.ndarray | None:
+        corners, ids, _ = detector.detectMarkers(image)
+        if ids is None:
+            return None
+        matches = np.where(ids.flatten() == spec.marker_id)[0]
+        return None if len(matches) == 0 else np.asarray(corners[matches[0]], np.float64).reshape(4, 2)
 
-        if len(matching_indices) > 0:
-            marker_corners = np.asarray(
-                corners[matching_indices[0]], dtype=np.float64,
-            ).reshape(4, 2)
+    def addResultStage(name: str, label: str, corners: np.ndarray, color) -> None:
+        if debug is None:
+            return
+        stage, points = frame.copy(), np.round(corners).astype(np.int32)
+        cv2.polylines(stage, [points.reshape(-1, 1, 2)], True, color, 2, cv2.LINE_AA)
+        cv2.putText(stage, label, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.50, color, 2, cv2.LINE_AA)
+        debug.addStage(name, stage)
 
-            optical_flow_tracker.seed(gray, marker_corners)
+    # 1) Raw ArUco.
+    corners = findMarker(gray)
+    if corners is not None:
+        tracker.seed(gray, corners)
+        addResultStage("ArUco result - raw", f"RAW ARUCO ID {spec.marker_id}", corners, (0, 255, 0))
+        return solveArucoMarkerPose(corners, spec, camera_calibration)
 
+    # 2) LK bridge whenever a previous ArUco/flow frame exists.
+    if tracker.previous_gray is not None and tracker.previous_corners is not None:
+        previous, flow_index = tracker.previous_corners.copy(), tracker.flow_only_frames + 1
+        corners = tracker.track(gray)
+        if corners is None:
             if debug is not None:
                 stage = frame.copy()
-                points = np.round(marker_corners).astype(np.int32)
-                cv2.polylines(
-                    stage, [points.reshape(-1, 1, 2)],
-                    True, (0, 255, 0), 2, cv2.LINE_AA,
-                )
-                cv2.putText(
-                    stage,
-                    f"GENUINE ARUCO ID {aruco_spec.marker_id} - flow reset",
-                    (10, 26),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-                    (0, 255, 0), 2, cv2.LINE_AA,
-                )
-                debug.addStage("ArUco result - genuine detection", stage)
+                cv2.putText(stage, "RAW ARUCO MISSED + LK REJECTED", (10, 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.putText(stage, tracker.last_rejection_reason or "LK unavailable", (10, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.43, (0, 0, 255), 1, cv2.LINE_AA)
+                debug.addStage("Optical flow - rejected", stage)
+            return failedDetectionResult()
 
-            return solveArucoMarkerPose(
-                marker_corners, aruco_spec, camera_calibration,
-            )
-
-    previous_corners = (
-        None
-        if optical_flow_tracker.previous_corners is None
-        else optical_flow_tracker.previous_corners.copy()
-    )
-    previous_flow_only_frames = optical_flow_tracker.flow_only_frames
-
-    marker_corners = optical_flow_tracker.track(gray)
-
-    if marker_corners is None:
         if debug is not None:
             stage = frame.copy()
-            reason = (
-                optical_flow_tracker.last_rejection_reason
-                or "optical flow unavailable"
-            )
-            cv2.putText(
-                stage, "ARUCO MISSED + LK REJECTED",
-                (10, 26),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-                (0, 0, 255), 2, cv2.LINE_AA,
-            )
-            cv2.putText(
-                stage, reason,
-                (10, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.44,
-                (0, 0, 255), 1, cv2.LINE_AA,
-            )
-            debug.addStage("Optical flow - rejected", stage)
+            prev_px, curr_px = np.round(previous).astype(int), np.round(corners).astype(int)
+            cv2.polylines(stage, [curr_px.reshape(-1, 1, 2)], True, (255, 0, 255), 2, cv2.LINE_AA)
+            for p0, p1 in zip(prev_px, curr_px):
+                cv2.circle(stage, tuple(p0), 3, (0, 165, 255), -1)
+                cv2.line(stage, tuple(p0), tuple(p1), (255, 255, 0), 1, cv2.LINE_AA)
+                cv2.circle(stage, tuple(p1), 3, (255, 0, 255), -1)
+            fb = tracker.last_forward_backward_errors_px
+            fb_text = "n/a" if fb is None else "/".join(f"{e:.2f}" for e in fb)
+            cv2.putText(stage, f"LK BRIDGE {flow_index}/{tracker.max_flow_only_frames}", (10, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (255, 0, 255), 2, cv2.LINE_AA)
+            cv2.putText(stage, f"forward-back px: {fb_text}", (10, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 0), 1, cv2.LINE_AA)
+            debug.addStage("Optical flow - accepted", stage)
+        return solveArucoMarkerPose(corners, spec, camera_calibration)
 
-        return failedDetectionResult()
+    # 3) No LK seed: spend extra compute trying enhanced acquisition.
+    if sharpened is None:
+        sharpened = _sharpenAruco(gray)
+    corners = findMarker(sharpened)
+    if corners is not None:
+        tracker.seed(gray, corners)  # Always seed LK with the original image.
+        addResultStage("ArUco result - sharpen reacquisition", "REACQUIRED WITH SHARPEN", corners, (0, 255, 255))
+        return solveArucoMarkerPose(corners, spec, camera_calibration)
+
+    if clahe_sharpened is None:
+        clahe_sharpened = _claheSharpenAruco(gray)
+    corners = findMarker(clahe_sharpened)
+    if corners is not None:
+        tracker.seed(gray, corners)
+        addResultStage("ArUco result - CLAHE reacquisition", "REACQUIRED WITH CLAHE + SHARPEN", corners, (0, 255, 255))
+        return solveArucoMarkerPose(corners, spec, camera_calibration)
 
     if debug is not None:
         stage = frame.copy()
-        current_points = np.round(marker_corners).astype(np.int32)
-
-        cv2.polylines(
-            stage, [current_points.reshape(-1, 1, 2)],
-            True, (255, 0, 255), 2, cv2.LINE_AA,
-        )
-
-        if previous_corners is not None:
-            previous_points = np.round(
-                previous_corners,
-            ).astype(np.int32)
-
-            for previous_point, current_point in zip(
-                previous_points, current_points,
-            ):
-                cv2.circle(
-                    stage, tuple(previous_point),
-                    3, (0, 165, 255), -1,
-                )
-                cv2.line(
-                    stage,
-                    tuple(previous_point),
-                    tuple(current_point),
-                    (255, 255, 0), 1, cv2.LINE_AA,
-                )
-                cv2.circle(
-                    stage, tuple(current_point),
-                    3, (255, 0, 255), -1,
-                )
-
-        fb_errors = optical_flow_tracker.last_forward_backward_errors_px
-        fb_text = (
-            "n/a"
-            if fb_errors is None
-            else "/".join(f"{error:.2f}" for error in fb_errors)
-        )
-
-        cv2.putText(
-            stage,
-            (
-                f"LK BRIDGE frame "
-                f"{previous_flow_only_frames + 1}/"
-                f"{optical_flow_tracker.max_flow_only_frames}"
-            ),
-            (10, 26),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-            (255, 0, 255), 2, cv2.LINE_AA,
-        )
-        cv2.putText(
-            stage,
-            f"forward-back errors px: {fb_text}",
-            (10, 50),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.43,
-            (255, 255, 0), 1, cv2.LINE_AA,
-        )
-        debug.addStage(
-            "Optical flow - accepted "
-            "(orange=previous, magenta=current)",
-            stage,
-        )
-
-    return solveArucoMarkerPose(
-        marker_corners, aruco_spec, camera_calibration,
-    )
+        cv2.putText(stage, "RAW + ENHANCED ARUCO FAILED; NO LK SEED", (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 0, 255), 2, cv2.LINE_AA)
+        debug.addStage("ArUco result - acquisition failed", stage)
+    return failedDetectionResult()
 
 
 

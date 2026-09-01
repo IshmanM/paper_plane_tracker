@@ -15,7 +15,7 @@ from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, Obje
 from src.primary.detection import (
     DetectionDebug, Measurement,
     findSingleObjectUsingBestShapeGroup, findSingleObjectSphere, detectArucoMarkerV2, detectSingleObject,
-    createMeasurementUsingShapeGroup, drawDetection, drawModelOrigin,
+    createMeasurementUsingShapeGroup, drawDetection, drawModelOrigin, resetArucoOpticalFlowTracker,
 )
 
 
@@ -327,6 +327,7 @@ def createMainEquivalentBenchmarkStage(
     camera_calibration: CameraCalibration, debug: DetectionDebug,
 ) -> np.ndarray:
     """Benchmark the exact public detection call used by main.py on this static frame."""
+    resetArucoOpticalFlowTracker()
     for _ in range(MAIN_BENCHMARK_WARMUP_RUNS):
         detectSingleObject(frame, object_vision_spec_id, camera_calibration)
 
@@ -436,9 +437,10 @@ def runDetectionOnImage(
             measurement = Measurement(x, y, z)
 
     elif algorithm == DetectionAlgorithm.ARUCO_MARKER:
+        # Saved images are independent test cases, not adjacent video frames.
+        resetArucoOpticalFlowTracker()
         _, detection, measurement = detectArucoMarkerV2(
-            frame, object_vision_spec, camera_calibration, debug,
-        )
+            frame, object_vision_spec, camera_calibration, debug)
 
     else:
         raise ValueError(f"Unsupported detection algorithm: {algorithm}")
