@@ -213,7 +213,11 @@ def detectPaperPlaneShapes(frame: np.ndarray, object_vision_spec: ObjectVisionSp
 
     measurement = createMeasurementUsingShapeGroup(detection, object_vision_spec, camera_calibration)
 
-    if measurement.x is None:
+    if (
+        measurement.x is None or measurement.y is None or measurement.z is None
+        or not np.all(np.isfinite([measurement.x, measurement.y, measurement.z]))
+        or measurement.z <= 0.0
+    ):
         return failedDetectionResult(detection)
 
     # findSingleObjectUsingBestShapeGroup initially centers Detection on the
@@ -227,6 +231,21 @@ def detectPaperPlaneShapes(frame: np.ndarray, object_vision_spec: ObjectVisionSp
         camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
     )
     center_u, center_v = origin_px.reshape(2)
+
+    if not np.all(np.isfinite([center_u, center_v])):
+        return failedDetectionResult(detection)
+
+    # Degenerate/false PnP solutions can put the model origin absurdly far from the
+    # marker group even though all solved marker points happen to remain in front of
+    # the camera. Reject those before they pollute the tracker or overflow OpenCV's
+    # integer drawing coordinates. The limit is intentionally very generous.
+    frame_diagonal_px = float(np.hypot(frame.shape[1], frame.shape[0]))
+    bbox_diagonal_px = float(np.hypot(detection.px_w, detection.px_h))
+    model_origin_offset_px = float(np.hypot(center_u - bbox_center_u, center_v - bbox_center_v))
+    maximum_origin_offset_px = max(frame_diagonal_px, 3.0*bbox_diagonal_px)
+
+    if model_origin_offset_px > maximum_origin_offset_px:
+        return failedDetectionResult(detection)
 
     detection.u = float(center_u)
     detection.v = float(center_v)
@@ -248,18 +267,30 @@ def failedDetectionResult(detection: Detection | None = None) -> tuple[bool, Det
 def drawDetection(frame: np.ndarray, detection: Detection,) -> None:
     if detection.u is None or detection.v is None or detection.px_w is None or detection.px_h is None:
         return
+    if not np.all(np.isfinite([detection.u, detection.v, detection.px_w, detection.px_h])):
+        return
 
     bbox_offset = detection.bbox_center_offset_px
     bbox_center_u = detection.u + (0.0 if bbox_offset is None else bbox_offset[0])
     bbox_center_v = detection.v + (0.0 if bbox_offset is None else bbox_offset[1])
 
-    x_min = int(round(bbox_center_u - detection.px_w/2.0))
-    y_min = int(round(bbox_center_v - detection.px_h/2.0))
-    x_max = int(round(bbox_center_u + detection.px_w/2.0))
-    y_max = int(round(bbox_center_v + detection.px_h/2.0))
+    if not np.all(np.isfinite([bbox_center_u, bbox_center_v])):
+        return
 
-    cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), color=(0, 255, 0), thickness=2,)
-    cv2.circle(frame, (int(round(detection.u)), int(round(detection.v))), radius=5, color=(0, 255, 0), thickness=-1,)
+    # Keep coordinates inside OpenCV's signed 32-bit point range. Normal off-screen
+    # coordinates are fine; only absurd values from a bad pose are suppressed.
+    int32_limit = np.iinfo(np.int32).max
+    bbox_coordinates = (
+        bbox_center_u - detection.px_w/2.0, bbox_center_v - detection.px_h/2.0,
+        bbox_center_u + detection.px_w/2.0, bbox_center_v + detection.px_h/2.0,
+    )
+
+    if all(abs(value) <= int32_limit for value in bbox_coordinates):
+        x_min, y_min, x_max, y_max = (int(round(value)) for value in bbox_coordinates)
+        cv2.rectangle(frame, (x_min, y_min), (x_max, y_max), color=(0, 255, 0), thickness=2,)
+
+    if abs(detection.u) <= int32_limit and abs(detection.v) <= int32_limit:
+        cv2.circle(frame, (int(round(detection.u)), int(round(detection.v))), radius=5, color=(0, 255, 0), thickness=-1,)
 
     for shape in detection.shapes:
         color_spec = COLOR_SPECS[shape.color_id]
@@ -1567,34 +1598,56 @@ def findSingleObjectUsingBestShapeGroup(
                         timing_polygon_refine_s += time.perf_counter() - polygon_start
                     continue
 
-                base_polygon = cv2.approxPolyDP(
-                    hull, object_vision_spec.polygon_epsilon_ratio*perimeter, True,
-                )
+                base_epsilon_ratio = object_vision_spec.polygon_epsilon_ratio
+                base_polygon = cv2.approxPolyDP(hull, base_epsilon_ratio*perimeter, True)
+                expected_num_sides = expected_num_sides_by_color[color_id]
+                initial_num_sides = len(base_polygon)
+
+                # Keep the same computational ceiling as before: one normal approxPolyDP call,
+                # plus at most ONE retry when the initial count misses a configured polygon by
+                # exactly one vertex. The retry moves epsilon in the useful direction:
+                #   too few vertices -> smaller epsilon, recover a shallow/missing corner
+                #   too many vertices -> larger epsilon, suppress one extra/noisy corner
+                if initial_num_sides in expected_num_sides:
+                    candidate_polygons = [(initial_num_sides, base_polygon)]
+                    retry_polygon = None
+                    retry_epsilon_ratio = None
+                else:
+                    candidate_polygons = []
+                    retry_polygon = None
+                    retry_epsilon_ratio = None
+
+                    nearest_expected_num_sides = min(
+                        expected_num_sides,
+                        key=lambda num_sides: abs(num_sides - initial_num_sides),
+                    )
+
+                    if abs(nearest_expected_num_sides - initial_num_sides) == 1:
+                        epsilon_direction = -1.0 if initial_num_sides < nearest_expected_num_sides else +1.0
+                        retry_epsilon_ratio = max(0.005, base_epsilon_ratio + epsilon_direction*0.02)
+                        retry_polygon = cv2.approxPolyDP(hull, retry_epsilon_ratio*perimeter, True)
+
+                        if len(retry_polygon) in expected_num_sides:
+                            candidate_polygons.append((len(retry_polygon), retry_polygon))
 
                 if polygon_debug_frame is not None:
                     cv2.polylines(polygon_debug_frame, [base_polygon], True, draw_bgr, 1)
                     polygon_center = np.mean(base_polygon.reshape(-1, 2), axis=0).astype(np.int32)
+
+                    if retry_polygon is not None and candidate_polygons:
+                        recovered_num_sides = len(candidate_polygons[0][1])
+                        debug_text = (
+                            f"{color_name}: observed={initial_num_sides}, expected={expected_num_sides}, "
+                            f"recovered={recovered_num_sides}"
+                        )
+                        cv2.polylines(polygon_debug_frame, [candidate_polygons[0][1]], True, draw_bgr, 2)
+                    else:
+                        debug_text = f"{color_name}: observed={initial_num_sides}, expected={expected_num_sides}"
+
                     cv2.putText(
-                        polygon_debug_frame, f"{color_name}: {len(base_polygon)} vertices", tuple(polygon_center),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_bgr, 1, cv2.LINE_AA,
+                        polygon_debug_frame, debug_text, tuple(polygon_center),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, draw_bgr, 1, cv2.LINE_AA,
                     )
-
-                expected_num_sides = expected_num_sides_by_color[color_id]
-
-                # Prefer an exact N-sided match. Only use the N+1 retry when no configured shape matches directly.
-                if len(base_polygon) in expected_num_sides:
-                    candidate_polygons = [(len(base_polygon), base_polygon)]
-                else:
-                    candidate_polygons = []
-
-                    for num_sides in expected_num_sides:
-                        if len(base_polygon) == num_sides + 1:
-                            retry_polygon = cv2.approxPolyDP(
-                                contour, (object_vision_spec.polygon_epsilon_ratio + 0.02)*perimeter, True,
-                            )
-
-                            if len(retry_polygon) == num_sides:
-                                candidate_polygons.append((num_sides, retry_polygon))
 
                 for num_sides, polygon in candidate_polygons:
                     if not cv2.isContourConvex(polygon):

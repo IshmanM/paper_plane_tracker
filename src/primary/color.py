@@ -7,6 +7,9 @@ class ColorId(Enum):
     GREEN = auto()
     CYAN = auto()
     MAGENTA = auto()
+    FERN = auto()
+    ORANGE_CIRCUIT = auto()
+    PINK = auto()
 
 
 class ColorSpec:
@@ -41,16 +44,23 @@ COLOR_SPECS = {
         draw_bgr=(0, 255, 0),
         lab_value=np.array([242, 95, 201], dtype=np.uint8),
     ),
-    
+
     ColorId.GREEN: ColorSpec(
         hsv_ranges=[
+            # Dark / shadowed green
             (
-                np.array([60, 50, 65], dtype=np.uint8),
-                np.array([82, 180, 235], dtype=np.uint8),
+                np.array([68, 80, 45], dtype=np.uint8),
+                np.array([86, 175, 130], dtype=np.uint8),
+            ),
+
+            # Brighter / farther green
+            (
+                np.array([74, 65, 120], dtype=np.uint8),
+                np.array([91, 175, 220], dtype=np.uint8),
             ),
         ],
-        lab_value=np.array([145, 96, 144], dtype=np.uint8),
         draw_bgr=(0, 255, 0),
+        lab_value=np.array([105, 110, 133], dtype=np.uint8),
     ),
 
     ColorId.CYAN: ColorSpec(
@@ -73,5 +83,38 @@ COLOR_SPECS = {
         ],
         lab_value=np.array([114, 193, 91], dtype=np.uint8),
         draw_bgr=(255, 0, 255),
+    ),
+
+    ColorId.FERN: ColorSpec(
+        hsv_ranges=[
+            (
+                np.array([45, 35, 55], dtype=np.uint8),
+                np.array([72, 165, 235], dtype=np.uint8),
+            ),
+        ],
+        lab_value=np.array([100, 111, 144], dtype=np.uint8),
+        draw_bgr=(0, 255, 0),
+    ),
+
+    ColorId.ORANGE_CIRCUIT: ColorSpec(
+        hsv_ranges=[
+            (
+                np.array([8, 65, 85], dtype=np.uint8),
+                np.array([23, 220, 220], dtype=np.uint8),
+            ),
+        ],
+        lab_value=np.array([120, 141, 156], dtype=np.uint8),
+        draw_bgr=(0, 165, 255),
+    ),
+
+    ColorId.PINK: ColorSpec(
+        hsv_ranges=[
+            (
+                np.array([165, 70, 110], dtype=np.uint8),
+                np.array([179, 130, 255], dtype=np.uint8),
+            ),
+        ],
+        draw_bgr=(180, 105, 255),
+        lab_value=np.array([203, 150, 127], dtype=np.uint8),
     ),
 }

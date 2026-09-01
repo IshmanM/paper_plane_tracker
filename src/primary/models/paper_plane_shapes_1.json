@@ -3,7 +3,9 @@
   "object_type": "PAPER_PLANE_SHAPES",
   "color_ids": [
     "GREEN",
-    "CYAN"
+    "CYAN",
+    "TENNIS_GREEN",
+    "PINK"
   ],
   "minimum_contour_area_px": 80.0,
   "polygon_epsilon_ratio": 0.04,
@@ -11,8 +13,10 @@
   "width": null,
   "height": null,
   "length": null,
+  "aruco_marker": null,
   "rigid_planes": [
     {
+      "plane_id": "plane_0",
       "rotation_object_from_plane": [
         [
           1.0,
@@ -21,36 +25,40 @@
         ],
         [
           0.0,
-          -1.0,
-          0.0
+          0.93969262,
+          0.3420201406416154
         ],
         [
           0.0,
-          0.0,
-          -1.0
+          -0.34202014,
+          0.939692621762824
         ]
       ],
       "translation_object_from_plane_m": [
         0.0,
         0.0,
-        0.0
+        0.01
       ],
       "shape_markers": [
         {
           "color_id": "GREEN",
-          "num_sides": 3,
+          "num_sides": 4,
           "object_vertices_m": [
-            [
-              0.019,
-              -0.02
-            ],
-            [
-              -0.09,
-              -0.02
-            ],
             [
               -0.09,
               0.02
+            ],
+            [
+              0.044000000000000004,
+              0.02
+            ],
+            [
+              0.034,
+              0.0
+            ],
+            [
+              -0.09,
+              -0.02
             ]
           ],
           "minimum_contour_area_px": 60.0
@@ -58,27 +66,28 @@
       ]
     },
     {
+      "plane_id": "plane_1",
       "rotation_object_from_plane": [
         [
           0.96605224,
-          -0.17034108,
-          0.19423435
+          -0.22650031,
+          0.12426050957502129
         ],
         [
           0.19128349,
-          -0.033728441,
-          -0.98095516
+          0.30381206,
+          -0.9333321268079458
         ],
         [
           0.17364818,
-          0.98480775,
-          6.0302083e-17
+          0.92541658,
+          0.3368240888480406
         ]
       ],
       "translation_object_from_plane_m": [
         -0.004,
-        -0.0125,
-        0.025
+        -0.0075,
+        0.045
       ],
       "shape_markers": [
         {
@@ -101,6 +110,119 @@
           "minimum_contour_area_px": 60.0
         }
       ]
+    },
+    {
+      "plane_id": "plane_2",
+      "rotation_object_from_plane": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.8660254,
+          -0.5000000016387101
+        ],
+        [
+          0.0,
+          0.5,
+          0.8660254028383291
+        ]
+      ],
+      "translation_object_from_plane_m": [
+        0.0,
+        0.001,
+        -0.01
+      ],
+      "shape_markers": [
+        {
+          "color_id": "TENNIS_GREEN",
+          "num_sides": 4,
+          "object_vertices_m": [
+            [
+              -0.09,
+              -0.02
+            ],
+            [
+              0.032,
+              0.0
+            ],
+            [
+              0.032,
+              0.02
+            ],
+            [
+              -0.09,
+              0.02
+            ]
+          ],
+          "minimum_contour_area_px": null
+        }
+      ]
+    },
+    {
+      "plane_id": "plane_3",
+      "rotation_object_from_plane": [
+        [
+          0.96605224,
+          0.22650031,
+          0.12426050957502129
+        ],
+        [
+          0.19128349,
+          -0.30381206,
+          -0.9333321268079458
+        ],
+        [
+          -0.17364818,
+          0.92541658,
+          -0.3368240888480406
+        ]
+      ],
+      "translation_object_from_plane_m": [
+        -0.004,
+        -0.0075,
+        -0.045
+      ],
+      "shape_markers": [
+        {
+          "color_id": "PINK",
+          "num_sides": 3,
+          "object_vertices_m": [
+            [
+              0.0,
+              0.0
+            ],
+            [
+              -0.091,
+              0.0
+            ],
+            [
+              -0.091,
+              -0.035
+            ]
+          ],
+          "minimum_contour_area_px": null
+        }
+      ]
     }
+  ],
+  "rigid_plane_connections": [
+    [
+      "plane_0",
+      "plane_1",
+      15.0
+    ],
+    [
+      "plane_0",
+      "plane_2",
+      15.0
+    ],
+    [
+      "plane_2",
+      "plane_3",
+      15.0
+    ]
   ]
 }

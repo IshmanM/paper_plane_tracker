@@ -369,58 +369,80 @@ OBJECT_VISION_SPECS = {
 
     ObjectVisionSpecId.PAPER_PLANE_SHAPES_1: ObjectVisionSpec(
         object_type=ObjectType.PAPER_PLANE_SHAPES,
-        color_ids=[ColorId.GREEN, ColorId.CYAN, ColorId.MAGENTA],
+        color_ids=[ColorId.GREEN, ColorId.CYAN, ColorId.TENNIS_GREEN, ColorId.PINK],
+        minimum_contour_area_px=80.0,
         polygon_epsilon_ratio=0.04,
         shape_group_distance_factor=3.0,
-        minimum_contour_area_px=80.0,
         rigid_planes=[
-            # Rough current model; replace with accurately measured final geometry.
             RigidPlaneSpec(
-                plane_id="plane_0",
+                plane_id='plane_0',
                 rotation_object_from_plane=np.array([
                     [1.0, 0.0, 0.0],
-                    [0.0, -1.0, 0.0],
-                    [0.0, 0.0, -1.0],
+                    [0.0, 0.93969262, 0.3420201406416154],
+                    [0.0, -0.34202014, 0.939692621762824],
                 ], dtype=np.float64),
-                translation_object_from_plane_m=np.array([0.000, 0.000, 0.000], dtype=np.float64),
+                translation_object_from_plane_m=np.array([0.0, 0.0, 0.01], dtype=np.float64),
                 shape_markers=[
                     ShapeMarkerSpec(
-                        color_id=ColorId.GREEN,
-                        num_sides=3,
-                        object_vertices_m=np.array([
-                            [0.019, -0.020],
-                            [-0.090, -0.020],
-                            [-0.090, 0.020],
-                        ], dtype=np.float64),
+                        color_id=ColorId.GREEN, num_sides=4,
+                        object_vertices_m=np.array([[-0.09, 0.02], [0.044000000000000004, 0.02], [0.034, 0.0], [-0.09, -0.02]], dtype=np.float64),
                         minimum_contour_area_px=60.0,
                     ),
                 ],
             ),
             RigidPlaneSpec(
-                plane_id="plane_1",
+                plane_id='plane_1',
                 rotation_object_from_plane=np.array([
-                    [0.96605224, -0.17034108, 0.19423435],
-                    [0.19128349, -0.033728441, -0.98095516],
-                    [0.17364818, 0.98480775, 6.0302083e-17],
+                    [0.96605224, -0.22650031, 0.12426050957502129],
+                    [0.19128349, 0.30381206, -0.9333321268079458],
+                    [0.17364818, 0.92541658, 0.3368240888480406],
                 ], dtype=np.float64),
-                translation_object_from_plane_m=np.array([-0.004, -0.0125, 0.025], dtype=np.float64),
+                translation_object_from_plane_m=np.array([-0.004, -0.0075, 0.045], dtype=np.float64),
                 shape_markers=[
                     ShapeMarkerSpec(
-                        color_id=ColorId.CYAN,
-                        num_sides=3,
-                        object_vertices_m=np.array([
-                            [0.000, 0.000],
-                            [-0.091, 0.000],
-                            [-0.091, 0.035],
-                        ], dtype=np.float64),
+                        color_id=ColorId.CYAN, num_sides=3,
+                        object_vertices_m=np.array([[0.0, 0.0], [-0.091, 0.0], [-0.091, 0.035]], dtype=np.float64),
                         minimum_contour_area_px=60.0,
+                    ),
+                ],
+            ),
+            RigidPlaneSpec(
+                plane_id='plane_2',
+                rotation_object_from_plane=np.array([
+                    [1.0, 0.0, 0.0],
+                    [0.0, 0.8660254, -0.5000000016387101],
+                    [0.0, 0.5, 0.8660254028383291],
+                ], dtype=np.float64),
+                translation_object_from_plane_m=np.array([0.0, 0.001, -0.01], dtype=np.float64),
+                shape_markers=[
+                    ShapeMarkerSpec(
+                        color_id=ColorId.TENNIS_GREEN, num_sides=4,
+                        object_vertices_m=np.array([[-0.09, -0.02], [0.032, 0.0], [0.032, 0.02], [-0.09, 0.02]], dtype=np.float64),
+                    ),
+                ],
+            ),
+            RigidPlaneSpec(
+                plane_id='plane_3',
+                rotation_object_from_plane=np.array([
+                    [0.96605224, 0.22650031, 0.12426050957502129],
+                    [0.19128349, -0.30381206, -0.9333321268079458],
+                    [-0.17364818, 0.92541658, -0.3368240888480406],
+                ], dtype=np.float64),
+                translation_object_from_plane_m=np.array([-0.004, -0.0075, -0.045], dtype=np.float64),
+                shape_markers=[
+                    ShapeMarkerSpec(
+                        color_id=ColorId.PINK, num_sides=3,
+                        object_vertices_m=np.array([[0.0, 0.0], [-0.091, 0.0], [-0.091, -0.035]], dtype=np.float64),
                     ),
                 ],
             ),
         ],
         rigid_plane_connections=[
-            ("plane_0", "plane_1", 15.0),
+            ('plane_0', 'plane_1', 15.0),
+            ('plane_0', 'plane_2', 15.0),
+            ('plane_2', 'plane_3', 15.0),
         ],
         width=None, height=None, length=None,
-    ),
+    )
+
 }
