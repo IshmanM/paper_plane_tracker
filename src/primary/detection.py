@@ -2625,37 +2625,73 @@ def getFlexedObjectPoints(pnp_markers: list[tuple], flex_angle_deg: float, conne
     return result
 
 
-def solvePnPAtFlexAngle(flex_angle_deg: float, pnp_markers: list[tuple], marker_matches: list[list[tuple[np.ndarray, float]]],
-                        correspondence_indices: list[int], connection: tuple[str, str, float] | None, hinge_point: np.ndarray | None,
-                        hinge_direction: np.ndarray | None, camera_calibration: CameraCalibration,
-                        previous_translation: np.ndarray | None) -> tuple[np.ndarray | None, float]:
-    object_groups = getFlexedObjectPoints(pnp_markers, flex_angle_deg, connection, hinge_point, hinge_direction)
-    object_points = np.concatenate(object_groups, axis=0)
-    image_points = np.concatenate([marker_matches[i][correspondence_indices[i]][0] for i in range(len(pnp_markers))], axis=0)
-    result = cv2.solvePnPGeneric(object_points, image_points, camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
-                                 flags=cv2.SOLVEPNP_SQPNP)
+def getSQPnPSolutions(
+    object_points: np.ndarray, image_points: np.ndarray, camera_calibration: CameraCalibration,
+) -> list[tuple[np.ndarray, float]]:
+    result = cv2.solvePnPGeneric(
+        object_points, image_points, camera_calibration.camera_matrix,
+        camera_calibration.distortion_coefficients, flags=cv2.SOLVEPNP_SQPNP,
+    )
     solution_count, rotation_vectors, translation_vectors = result[:3]
     if not solution_count:
-        return None, float('inf')
+        return []
 
-    valid_solutions = []
+    solutions = []
     for rotation_vector, translation_vector in zip(rotation_vectors, translation_vectors):
         rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
         camera_points = (rotation_matrix@object_points.T + translation_vector.reshape(3, 1)).T
         if np.any(camera_points[:, 2] <= 0.0):
             continue
-        projected, _ = cv2.projectPoints(object_points, rotation_vector, translation_vector, camera_calibration.camera_matrix,
-                                         camera_calibration.distortion_coefficients)
-        error = float(np.sqrt(np.mean(np.sum((projected.reshape(-1, 2) - image_points)**2, axis=1))))
-        valid_solutions.append((translation_vector.reshape(3), error))
+
+        projected, _ = cv2.projectPoints(
+            object_points, rotation_vector, translation_vector,
+            camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
+        )
+        error = float(np.sqrt(np.mean(np.sum(
+            (projected.reshape(-1, 2) - image_points)**2, axis=1,
+        ))))
+        solutions.append((translation_vector.reshape(3), error))
+
+    return solutions
+
+
+def solvePnPAtFlexAngle(
+    flex_angle_deg: float, pnp_markers: list[tuple],
+    marker_matches: list[list[tuple[np.ndarray, float]]], correspondence_indices: list[int],
+    connection: tuple[str, str, float] | None, hinge_point: np.ndarray | None,
+    hinge_direction: np.ndarray | None, camera_calibration: CameraCalibration,
+    previous_translation: np.ndarray | None,
+) -> tuple[np.ndarray | None, float]:
+    object_groups = getFlexedObjectPoints(
+        pnp_markers, flex_angle_deg, connection, hinge_point, hinge_direction,
+    )
+    object_points = np.concatenate(object_groups, axis=0)
+    image_points = np.concatenate([
+        marker_matches[i][correspondence_indices[i]][0]
+        for i in range(len(pnp_markers))
+    ], axis=0)
+
+    valid_solutions = getSQPnPSolutions(object_points, image_points, camera_calibration)
     if not valid_solutions:
-        return None, float('inf')
+        return None, float("inf")
 
     minimum_error = min(error for _, error in valid_solutions)
-    near_best = [(translation, error) for translation, error in valid_solutions if error <= minimum_error + 0.50]
+    near_best = [
+        (translation, error) for translation, error in valid_solutions
+        if error <= minimum_error + 0.50
+    ]
+
     if previous_translation is None or len(near_best) == 1:
         return min(near_best, key=lambda item: item[1])
-    return min(near_best, key=lambda item: (float(np.linalg.norm(item[0] - previous_translation)), item[1]))
+
+    return min(
+        near_best,
+        key=lambda item: (
+            float(np.linalg.norm(item[0] - previous_translation)),
+            item[1],
+        ),
+    )
+
 
 
 def searchFlexAngles(search_angles_deg: np.ndarray, solve_angle) -> tuple[np.ndarray | None, float, float]:
@@ -2755,6 +2791,105 @@ def rescueCorrespondences(best_flex_angle_deg: float, coarse_angles_deg: np.ndar
     return best_indices, best_angle, best_error, len(tested)
 
 
+
+def addPnPDiagnosticsStage(
+    debug: DetectionDebug, detection: Detection, pnp_markers: list[tuple],
+    marker_matches: list[list[tuple[np.ndarray, float]]], correspondence_indices: list[int],
+    connection: tuple[str, str, float] | None, hinge_point: np.ndarray | None,
+    hinge_direction: np.ndarray | None, camera_calibration: CameraCalibration,
+    best_translation: np.ndarray, best_error: float, best_angle: float,
+    previous_translation: np.ndarray | None, search_trace: list[tuple[float, float | None, float]],
+    accepted_warm: bool, rescue_angles_tested: int,
+) -> None:
+    plane_group = tuple(detection.plane_ids)
+    object_groups = getFlexedObjectPoints(
+        pnp_markers, best_angle, connection, hinge_point, hinge_direction,
+    )
+    image_groups = [
+        marker_matches[i][correspondence_indices[i]][0]
+        for i in range(len(pnp_markers))
+    ]
+
+    joint_solutions = getSQPnPSolutions(
+        np.concatenate(object_groups, axis=0),
+        np.concatenate(image_groups, axis=0),
+        camera_calibration,
+    )
+
+    lines = [
+        "PNP DIAGNOSTICS (debug only; no estimator behavior changes)",
+        f"planes={'+'.join(plane_group)} | bbox_diag={np.hypot(detection.px_w or 0.0, detection.px_h or 0.0):.1f}px",
+        f"final: z={best_translation[2]:.3f}m | xyz=({best_translation[0]:+.3f}, {best_translation[1]:+.3f}, {best_translation[2]:+.3f})m",
+        f"reproj={best_error:.3f}px | flex={best_angle:+.1f}deg | warm_accepted={accepted_warm} | rescue_angles={rescue_angles_tested}",
+        f"previous z={'none' if previous_translation is None else f'{previous_translation[2]:.3f}m'}",
+        f"correspondence indices={correspondence_indices}",
+        "",
+        f"FINAL JOINT SQPnP BRANCHES ({len(joint_solutions)} valid):",
+    ]
+
+    for index, (translation, error) in enumerate(sorted(joint_solutions, key=lambda item: item[1])):
+        chosen = (
+            np.linalg.norm(translation - best_translation) < 1e-6
+            and abs(error - best_error) < 1e-6
+        )
+        lines.append(
+            f"  {'*' if chosen else ' '} branch {index}: "
+            f"z={translation[2]:.3f}m | xyz=({translation[0]:+.3f},{translation[1]:+.3f},{translation[2]:+.3f}) "
+            f"| err={error:.3f}px"
+        )
+
+    lines.append("")
+    lines.append("SINGLE-PLANE SQPnP AT FINAL FLEX (diagnostic only):")
+
+    for plane_id in plane_group:
+        indices = [i for i, marker_data in enumerate(pnp_markers) if marker_data[1] == plane_id]
+        if not indices:
+            lines.append(f"  {plane_id}: no selected marker")
+            continue
+
+        object_points = np.concatenate([object_groups[i] for i in indices], axis=0)
+        image_points = np.concatenate([image_groups[i] for i in indices], axis=0)
+        plane_solutions = getSQPnPSolutions(object_points, image_points, camera_calibration)
+
+        if not plane_solutions:
+            lines.append(f"  {plane_id}: no valid SQPnP solution")
+            continue
+
+        branch_text = ", ".join(
+            f"z={translation[2]:.3f}m/e={error:.2f}px"
+            for translation, error in sorted(plane_solutions, key=lambda item: item[1])
+        )
+        lines.append(f"  {plane_id}: {branch_text}")
+
+    if search_trace:
+        lines.append("")
+        lines.append("FLEX SEARCH BEST SOLUTION PER SOLVE CALL:")
+        for angle, z, error in search_trace[-20:]:
+            z_text = "none" if z is None else f"{z:.3f}m"
+            error_text = "inf" if not np.isfinite(error) else f"{error:.2f}px"
+            lines.append(f"  angle={angle:+5.1f}deg -> z={z_text:>8} | err={error_text}")
+
+        if len(search_trace) > 20:
+            lines.append(f"  ... {len(search_trace) - 20} earlier solve calls omitted")
+
+    width = max(900, debug._reference_image.shape[1] if debug._reference_image is not None else 900)
+    height = max(480, 48 + 24*len(lines))
+    image = np.full((height, width, 3), 25, dtype=np.uint8)
+
+    y = 30
+    for index, line in enumerate(lines):
+        font_scale = 0.58 if index == 0 else 0.48
+        thickness = 2 if index == 0 else 1
+        cv2.putText(
+            image, line, (14, y), cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale, (235, 235, 235), thickness, cv2.LINE_AA,
+        )
+        y += 24
+
+    debug.addStage("PnP diagnostics", image)
+
+
+
 # Convert the already-selected one-plane or one-hinge shape group into a camera-frame measurement.
 def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration,
                                      _timing_warmup: bool = False) -> Measurement:
@@ -2797,10 +2932,21 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
     pnp_setup_seconds = time.perf_counter() - timing_start
     pnp_warm_seconds = pnp_full_seconds = pnp_rescue_seconds = 0.0
     rescue_angles_tested = 0
+    pnp_search_trace = [] if measurement_debug is not None else None
 
     def solveAngle(angle: float, indices: list[int] | None = None):
-        return solvePnPAtFlexAngle(angle, pnp_markers, marker_matches, correspondence_indices if indices is None else indices,
-                                   connection, hinge_point, hinge_direction, camera_calibration, previous_translation)
+        translation, error = solvePnPAtFlexAngle(
+            angle, pnp_markers, marker_matches,
+            correspondence_indices if indices is None else indices,
+            connection, hinge_point, hinge_direction, camera_calibration, previous_translation,
+        )
+        if pnp_search_trace is not None:
+            pnp_search_trace.append((
+                float(angle),
+                None if translation is None else float(translation[2]),
+                float(error),
+            ))
+        return translation, error
 
     best_translation, best_error, best_angle = None, float('inf'), 0.0
     accepted_warm = False
@@ -2863,6 +3009,13 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
 
     pnp_total_seconds = time.perf_counter() - timing_start
     if measurement_debug is not None:
+        addPnPDiagnosticsStage(
+            measurement_debug, detection, pnp_markers, marker_matches,
+            correspondence_indices, connection, hinge_point, hinge_direction,
+            camera_calibration, best_translation, best_error, best_angle,
+            previous_translation, pnp_search_trace or [], accepted_warm,
+            rescue_angles_tested,
+        )
         measurement_debug.setTiming('PnP setup + correspondences', pnp_setup_seconds)
         measurement_debug.setTiming('PnP warm-start search', pnp_warm_seconds)
         measurement_debug.setTiming('PnP full flex search', pnp_full_seconds)
