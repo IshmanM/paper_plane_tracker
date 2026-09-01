@@ -1005,15 +1005,28 @@ def refineShapeVerticesUsingLabRays(
     frame: np.ndarray, vertices_px: np.ndarray, color_spec, debug_frame: np.ndarray | None = None,
     draw_bgr: tuple[int, int, int] = (255, 255, 255),
 ) -> np.ndarray:
-    RAYS_PER_EDGE, EDGE_SAMPLE_MARGIN = 10, 0.10
+    CLOSE_BBOX_DIAG_PX, MID_BBOX_DIAG_PX = 120.0, 70.0
+    MAX_RAYS_PER_EDGE, EDGE_SAMPLE_MARGIN = 10, 0.10
     MAX_EDGE_ANGLE_CHANGE_DEG = 20.0
+    ACUTE_VERTEX_MAX_ANGLE_DEG = 45.0
+    SHORT_EDGE_FACTOR, MIN_SHORT_EDGE_PX = 0.18, 10.0
 
     rough = np.asarray(vertices_px, dtype=np.float64).reshape(-1, 2)
     if len(rough) < 3 or color_spec.lab_value is None:
         return rough
 
     bbox_diagonal_px = float(np.linalg.norm(np.ptp(rough, axis=0)))
-    search_radius_px = int(np.clip(round(0.08*bbox_diagonal_px), 2, 5))
+
+    # Close markers already have enough contour geometry; LAB rays mostly add wobble there.
+    if bbox_diagonal_px >= CLOSE_BBOX_DIAG_PX:
+        return rough
+
+    blend_alpha = (
+        1.0 if bbox_diagonal_px < MID_BBOX_DIAG_PX
+        else float((CLOSE_BBOX_DIAG_PX - bbox_diagonal_px)/(CLOSE_BBOX_DIAG_PX - MID_BBOX_DIAG_PX))
+    )
+
+    search_radius_px = int(np.clip(round(0.10*bbox_diagonal_px), 3, 6))
     pad = search_radius_px + 3
     x1, y1 = max(0, int(np.floor(rough[:, 0].min())) - pad), max(0, int(np.floor(rough[:, 1].min())) - pad)
     x2 = min(frame.shape[1], int(np.ceil(rough[:, 0].max())) + pad + 1)
@@ -1021,21 +1034,14 @@ def refineShapeVerticesUsingLabRays(
     if x2 - x1 < 3 or y2 - y1 < 3:
         return rough
 
-    # Tiny/partially clipped distant-marker ROIs can occasionally upset OpenCV on
-    # some builds when passed as a sliced view. Validate it and make it contiguous;
-    # if anything is unusual, simply keep the existing polygon refinement.
     frame_roi = frame[y1:y2, x1:x2]
     if (
-        frame_roi.size == 0
-        or frame_roi.ndim != 3
-        or frame_roi.shape[0] < 3
-        or frame_roi.shape[1] < 3
-        or frame_roi.shape[2] != 3
+        frame_roi.size == 0 or frame_roi.ndim != 3 or frame_roi.shape[0] < 3
+        or frame_roi.shape[1] < 3 or frame_roi.shape[2] != 3
     ):
         return rough
 
     frame_roi = np.ascontiguousarray(frame_roi)
-
     try:
         lab_roi = cv2.cvtColor(frame_roi, cv2.COLOR_BGR2LAB)
         lab_roi = cv2.GaussianBlur(lab_roi, (3, 3), 0)
@@ -1056,6 +1062,7 @@ def refineShapeVerticesUsingLabRays(
 
     centroid = np.mean(rough, axis=0)
     offsets = np.arange(-search_radius_px, search_radius_px + 0.5, 0.5, dtype=np.float32)
+    short_edge_px = max(MIN_SHORT_EDGE_PX, SHORT_EDGE_FACTOR*bbox_diagonal_px)
     fitted_lines = []
 
     for edge_index in range(len(rough)):
@@ -1065,27 +1072,25 @@ def refineShapeVerticesUsingLabRays(
         if edge_length <= 2.0:
             return rough
 
+        rays_per_edge = int(np.clip(round(edge_length/4.0), 4, MAX_RAYS_PER_EDGE))
+        minimum_good_rays = max(3, min(rays_per_edge, 5))
+
         edge_dir = edge/edge_length
         normal = np.array([-edge_dir[1], edge_dir[0]])
         midpoint = 0.5*(start + end)
         if np.dot(normal, midpoint - centroid) < 0.0:
             normal = -normal
 
-        fractions = np.linspace(EDGE_SAMPLE_MARGIN, 1.0 - EDGE_SAMPLE_MARGIN, RAYS_PER_EDGE)
+        fractions = np.linspace(EDGE_SAMPLE_MARGIN, 1.0 - EDGE_SAMPLE_MARGIN, rays_per_edge)
         bases = start + fractions[:, None]*edge
         samples = bases[:, None, :] + offsets[None, :, None]*normal
         local = samples - np.array([x1, y1])
 
-        map_x = local[:, :, 0].astype(np.float32)
-        map_y = local[:, :, 1].astype(np.float32)
         ray_response = cv2.remap(
-            response, map_x, map_y, cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_REPLICATE,
+            response, local[:, :, 0].astype(np.float32), local[:, :, 1].astype(np.float32),
+            cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
         )
 
-        # Smooth only along each short ray, then find the target-color response drop
-        # while moving OUTWARD. Half-pixel sampling + a local weighted centroid avoids
-        # the old +/-1 px argmax hopping on tiny distant markers.
         smoothed_response = ray_response.copy()
         if ray_response.shape[1] >= 3:
             smoothed_response[:, 1:-1] = (
@@ -1094,15 +1099,15 @@ def refineShapeVerticesUsingLabRays(
 
         drops = smoothed_response[:, :-1] - smoothed_response[:, 1:]
         best_indices = np.argmax(drops, axis=1)
-        rows = np.arange(RAYS_PER_EDGE)
+        rows = np.arange(rays_per_edge)
         best_drops = drops[rows, best_indices]
         inner_response = smoothed_response[rows, best_indices]
         good = (best_drops >= minimum_edge_drop) & (inner_response >= minimum_inner_response)
-        if np.count_nonzero(good) < 5:
+        if np.count_nonzero(good) < minimum_good_rays:
             return rough
 
         drop_offsets = 0.5*(offsets[:-1] + offsets[1:])
-        boundary_offsets = np.empty(RAYS_PER_EDGE, dtype=np.float64)
+        boundary_offsets = np.empty(rays_per_edge, dtype=np.float64)
         for ray_index, best_index in enumerate(best_indices):
             lo, hi = max(0, best_index - 1), min(drops.shape[1], best_index + 2)
             weights = np.maximum(drops[ray_index, lo:hi], 0.0)
@@ -1112,15 +1117,21 @@ def refineShapeVerticesUsingLabRays(
             )
 
         points = bases + boundary_offsets[:, None]*normal
-        good_points = points[good]
-        vx, vy, x0, y0 = cv2.fitLine(
-            good_points.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01,
-        ).reshape(4)
-        line_dir = np.array([vx, vy], dtype=np.float64)
-        line_dir /= max(float(np.linalg.norm(line_dir)), 1e-12)
-        if abs(float(np.dot(line_dir, edge_dir))) < np.cos(np.deg2rad(MAX_EDGE_ANGLE_CHANGE_DEG)):
-            return rough
-        fitted_lines.append((np.array([x0, y0], dtype=np.float64), line_dir))
+
+        if edge_length <= short_edge_px:
+            median_offset = float(np.median(boundary_offsets[good]))
+            line_point = midpoint + median_offset*normal
+            fitted_lines.append((line_point, edge_dir))
+        else:
+            good_points = points[good]
+            vx, vy, x0, y0 = cv2.fitLine(
+                good_points.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01,
+            ).reshape(4)
+            line_dir = np.array([vx, vy], dtype=np.float64)
+            line_dir /= max(float(np.linalg.norm(line_dir)), 1e-12)
+            if abs(float(np.dot(line_dir, edge_dir))) < np.cos(np.deg2rad(MAX_EDGE_ANGLE_CHANGE_DEG)):
+                return rough
+            fitted_lines.append((np.array([x0, y0], dtype=np.float64), line_dir))
 
         if debug_frame is not None:
             for base, point, is_good in zip(bases, points, good):
@@ -1142,28 +1153,20 @@ def refineShapeVerticesUsingLabRays(
 
     refined = np.asarray(refined, dtype=np.float64)
 
-    # Very acute vertices are ill-conditioned when obtained only by intersecting two
-    # nearly parallel fitted edges: a sub-pixel edge-angle change can move the tip by
-    # many pixels. For those vertices, measure the marker's axial extent directly.
-    ACUTE_VERTEX_MAX_ANGLE_DEG = 45.0
+    # Direct acute-tip search: use LAB only for how far the tip extends along its axis.
     TIP_SEARCH_INWARD_PX = 2.0
     tip_search_outward_px = float(np.clip(round(0.20*bbox_diagonal_px), 4, 10))
-    tip_offsets = np.arange(
-        -TIP_SEARCH_INWARD_PX, tip_search_outward_px + 0.5, 0.5, dtype=np.float32,
-    )
+    tip_offsets = np.arange(-TIP_SEARCH_INWARD_PX, tip_search_outward_px + 0.5, 0.5, dtype=np.float32)
 
     for vertex_index in range(len(rough)):
-        previous_vertex = rough[(vertex_index - 1)%len(rough)]
-        rough_vertex = rough[vertex_index]
+        previous_vertex, rough_vertex = rough[(vertex_index - 1)%len(rough)], rough[vertex_index]
         next_vertex = rough[(vertex_index + 1)%len(rough)]
         side_1, side_2 = previous_vertex - rough_vertex, next_vertex - rough_vertex
         side_1_norm, side_2_norm = np.linalg.norm(side_1), np.linalg.norm(side_2)
         if side_1_norm <= 1e-6 or side_2_norm <= 1e-6:
             continue
 
-        cosine_angle = np.clip(
-            float(np.dot(side_1, side_2)/(side_1_norm*side_2_norm)), -1.0, 1.0,
-        )
+        cosine_angle = np.clip(float(np.dot(side_1, side_2)/(side_1_norm*side_2_norm)), -1.0, 1.0)
         vertex_angle_deg = float(np.degrees(np.arccos(cosine_angle)))
         if vertex_angle_deg >= ACUTE_VERTEX_MAX_ANGLE_DEG:
             continue
@@ -1193,7 +1196,6 @@ def refineShapeVerticesUsingLabRays(
         tip_drops = smoothed_tip_response[:-1] - smoothed_tip_response[1:]
         tip_drop_offsets = 0.5*(tip_offsets[:-1] + tip_offsets[1:])
 
-        # Do not let an internal texture transition well behind the rough tip win.
         eligible = tip_drop_offsets >= -1.0
         if not np.any(eligible):
             continue
@@ -1213,8 +1215,6 @@ def refineShapeVerticesUsingLabRays(
         )
         direct_tip = rough_vertex + direct_tip_offset*tip_direction
 
-        # Direct LAB search determines how far the tip extends along its axis.
-        # Fitted edge intersection still supplies the lateral coordinate.
         perpendicular = np.array([-tip_direction[1], tip_direction[0]])
         line_intersection = refined[vertex_index]
         refined[vertex_index] = (
@@ -1232,8 +1232,13 @@ def refineShapeVerticesUsingLabRays(
             )
             cv2.circle(debug_frame, tuple(np.round(direct_tip).astype(int)), 3, (0, 165, 255), -1)
 
+    # Mid-range blending: let LAB help, but do not let it fully override already decent contour geometry.
+    if blend_alpha < 1.0:
+        refined = (1.0 - blend_alpha)*rough + blend_alpha*refined
+
     refined_polygon = refined.astype(np.float32).reshape(-1, 1, 2)
-    rough_area, refined_area = cv2.contourArea(rough.astype(np.float32)), cv2.contourArea(refined_polygon)
+    rough_area = cv2.contourArea(rough.astype(np.float32))
+    refined_area = cv2.contourArea(refined_polygon)
     max_edge = max(np.linalg.norm(rough[i] - rough[(i + 1)%len(rough)]) for i in range(len(rough)))
     if (
         rough_area <= 0.0 or not cv2.isContourConvex(refined_polygon)

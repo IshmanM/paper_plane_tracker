@@ -371,7 +371,7 @@ OBJECT_VISION_SPECS = {
         object_type=ObjectType.PAPER_PLANE_SHAPES,
         color_ids=[ColorId.GREEN, ColorId.CYAN, ColorId.PINK],
         minimum_contour_area_px=50.0,
-        polygon_epsilon_ratio=0.04,
+        polygon_epsilon_ratio=0.015,
         shape_group_distance_factor=3.0,
         rigid_planes=[
             RigidPlaneSpec(

@@ -47,9 +47,16 @@ COLOR_SPECS = {
 
     ColorId.GREEN: ColorSpec(
         hsv_ranges=[
+            # Normal / shadowed green, including weak-saturation edges.
             (
-                np.array([57, 60, 85], dtype=np.uint8),
-                np.array([86, 170, 240], dtype=np.uint8),
+                np.array([62, 55, 85], dtype=np.uint8),
+                np.array([84, 155, 195], dtype=np.uint8),
+            ),
+
+            # Bright / washed-out green.
+            (
+                np.array([68, 85, 180], dtype=np.uint8),
+                np.array([86, 155, 255], dtype=np.uint8),
             ),
         ],
         draw_bgr=(0, 255, 0),
