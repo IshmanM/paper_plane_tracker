@@ -33,10 +33,10 @@ PRINT_DETECTION = False # FOR DEBUG ONLY
 TIMING_WINDOW_FRAMES = 30
 
 OBJECT_VISION_SPEC_IDS = (
-    ObjectVisionSpecId.TENNIS_BALL_DEFAULT,  # 1
-    ObjectVisionSpecId.ARUCO_MARKER_1,       # 2
-    ObjectVisionSpecId.PAPER_PLANE_SHAPES_1, # 3
-    ObjectVisionSpecId.PAPER_PLANE_ARUCO_1,
+    ObjectVisionSpecId.TENNIS_BALL_DEFAULT,   # 1
+    ObjectVisionSpecId.ARUCO_MARKER_1,        # 2
+    ObjectVisionSpecId.PAPER_PLANE_SHAPES_1,  # 3
+    ObjectVisionSpecId.PAPER_PLANE_ARUCO_1,   # 4
 )
 
 TRACKER_KWARGS = dict(
@@ -142,7 +142,7 @@ if __name__ == "__main__":
     cv2.resizeWindow(WINDOW_NAME, config.FRAME_W, config.FRAME_H)
 
     print(
-        "1: tennis ball | 2: ArUco | 3: paper plane | Tab: display size | "
+        "1: tennis ball | 2: ArUco | 3: paper plane shapes | 4: paper plane ArUco | Tab: display size | "
         "P: pause all | R: resume tracker | L/O: platform off/on | "
         "H/F: triggering | S: screenshot | Q/Esc: quit"
     )
@@ -241,7 +241,7 @@ if __name__ == "__main__":
             # Controls.
             drawDisplayText(
                 display_frame,
-                "1 Tennis | 2 ArUco | 3 Plane | Tab Size",
+                "1 Tennis | 2 ArUco | 3 Plane Shapes | 4 Plane ArUco | Tab Size",
                 (10, config.FRAME_H - 35),
                 (255, 255, 255),
                 display_scale,
@@ -269,7 +269,7 @@ if __name__ == "__main__":
                 stop_event.set()
                 break
 
-            # 1-3 = change object vision spec.
+            # 1-4 = change object vision spec.
             elif ord("1") <= key < ord("1") + len(OBJECT_VISION_SPEC_IDS):
                 new_object_vision_spec_id = OBJECT_VISION_SPEC_IDS[key - ord("1")]
 
