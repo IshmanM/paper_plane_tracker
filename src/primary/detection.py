@@ -977,19 +977,156 @@ def selectPolygonTopology(
 
 
 
+
+def snapTopologyCornersToHull(hull: np.ndarray, polygon: np.ndarray) -> np.ndarray:
+    """Place the chosen N topology corners using image-space hull evidence."""
+    FAR_BBOX_DIAG_PX, CLOSE_BBOX_DIAG_PX = 70.0, 120.0
+
+    proposal = polygon.reshape(-1, 2).astype(np.float64)
+    hull_points = hull.reshape(-1, 2).astype(np.float64)
+    num_sides = len(proposal)
+
+    if num_sides < 3 or len(hull_points) < num_sides:
+        return proposal
+
+    bbox_diagonal_px = float(np.linalg.norm(np.ptp(hull_points, axis=0)))
+    if bbox_diagonal_px < FAR_BBOX_DIAG_PX:
+        return proposal
+
+    segment_lengths = np.linalg.norm(np.roll(hull_points, -1, axis=0) - hull_points, axis=1)
+    perimeter = float(np.sum(segment_lengths))
+    if perimeter <= 1e-6:
+        return proposal
+
+    cumulative = np.concatenate(([0.0], np.cumsum(segment_lengths)))
+
+    def arcDistance(index_1: int, index_2: int) -> float:
+        distance = abs(float(cumulative[index_2] - cumulative[index_1]))
+        return min(distance, perimeter - distance)
+
+    corner_window_px = float(np.clip(0.06*bbox_diagonal_px, 4.0, 12.0))
+    strengths = np.zeros(len(hull_points), dtype=np.float64)
+
+    for index in range(len(hull_points)):
+        previous_index, distance = index, 0.0
+        while distance < corner_window_px:
+            next_index = (previous_index - 1) % len(hull_points)
+            distance += float(np.linalg.norm(hull_points[next_index] - hull_points[previous_index]))
+            previous_index = next_index
+            if previous_index == index:
+                break
+
+        following_index, distance = index, 0.0
+        while distance < corner_window_px:
+            next_index = (following_index + 1) % len(hull_points)
+            distance += float(np.linalg.norm(hull_points[next_index] - hull_points[following_index]))
+            following_index = next_index
+            if following_index == index:
+                break
+
+        previous, vertex, following = (
+            hull_points[previous_index], hull_points[index], hull_points[following_index],
+        )
+        chord = following - previous
+        chord_length = float(np.linalg.norm(chord))
+        local_scale = 0.5*(
+            float(np.linalg.norm(vertex - previous))
+            + float(np.linalg.norm(following - vertex))
+        )
+
+        if chord_length <= 1e-6 or local_scale <= 1e-6:
+            continue
+
+        deviation = abs(
+            chord[0]*(vertex - previous)[1] - chord[1]*(vertex - previous)[0]
+        )/chord_length
+        strengths[index] = deviation/local_scale
+
+    if bbox_diagonal_px < CLOSE_BBOX_DIAG_PX:
+        # Mid range: proposal remains the prior, but may snap to a stronger nearby
+        # actual hull turn.
+        snap_radius_px = float(np.clip(0.10*bbox_diagonal_px, 5.0, 12.0))
+        snapped = []
+        used_indices = set()
+
+        for vertex in proposal:
+            distances = np.linalg.norm(hull_points - vertex, axis=1)
+            candidate_indices = np.flatnonzero(distances <= snap_radius_px)
+            if len(candidate_indices) == 0:
+                candidate_indices = np.array([int(np.argmin(distances))])
+
+            candidates = sorted(
+                candidate_indices,
+                key=lambda index: (-strengths[index], distances[index]),
+            )
+            selected_index = next(
+                (int(index) for index in candidates if int(index) not in used_indices),
+                None,
+            )
+            if selected_index is None:
+                return proposal
+
+            used_indices.add(selected_index)
+            snapped.append(hull_points[selected_index])
+
+        return np.asarray(snapped, dtype=np.float64)
+
+    # Close range: use the N strongest well-separated actual hull turns directly.
+    minimum_corner_separation_px = float(np.clip(0.05*perimeter, 6.0, 20.0))
+    selected_indices = []
+
+    for index in np.argsort(-strengths):
+        index = int(index)
+        if all(
+            arcDistance(index, selected_index) >= minimum_corner_separation_px
+            for selected_index in selected_indices
+        ):
+            selected_indices.append(index)
+
+        if len(selected_indices) == num_sides:
+            break
+
+    if len(selected_indices) != num_sides:
+        return proposal
+
+    selected_indices.sort()
+    return hull_points[selected_indices]
+
+
+
 def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> np.ndarray:
     rough_vertices = polygon.reshape(-1, 2).astype(np.float64)
     contour_points = contour.reshape(-1, 2).astype(np.float64)
-    num_sides = len(rough_vertices)
+    num_sides, num_contour_points = len(rough_vertices), len(contour_points)
 
-    if num_sides < 3:
+    if num_sides < 3 or num_contour_points < num_sides:
         return rough_vertices
+
+    # Topology vertices only identify where the contour should be split. Never assign
+    # contour pixels by distance to the proposed straight edges: a rough proposal can
+    # be visibly offset even when the underlying HSV contour is excellent.
+    corner_indices = np.array([
+        int(np.argmin(np.sum((contour_points - vertex)**2, axis=1)))
+        for vertex in rough_vertices
+    ])
+
+    if len(set(corner_indices.tolist())) != num_sides:
+        return rough_vertices
+
+    forward_steps = np.array([
+        (corner_indices[(i + 1)%num_sides] - corner_indices[i]) % num_contour_points
+        for i in range(num_sides)
+    ])
+    reverse_steps = np.array([
+        (corner_indices[i] - corner_indices[(i + 1)%num_sides]) % num_contour_points
+        for i in range(num_sides)
+    ])
+    contour_direction = 1 if np.sum(forward_steps) <= np.sum(reverse_steps) else -1
 
     bbox_diagonal_px = float(np.linalg.norm(np.ptp(rough_vertices, axis=0)))
     short_edge_px = max(10.0, 0.18*bbox_diagonal_px)
-    edge_distances = []
+    fitted_lines = []
 
-    # Assign every original HSV-contour point to its nearest proposed edge.
     for edge_index in range(num_sides):
         start = rough_vertices[edge_index]
         end = rough_vertices[(edge_index + 1)%num_sides]
@@ -999,35 +1136,34 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
         if edge_length <= 1e-6:
             return rough_vertices
 
-        relative = contour_points - start
-        edge_distances.append(
-            np.abs(edge[0]*relative[:, 1] - edge[1]*relative[:, 0])/edge_length
-        )
+        start_index = int(corner_indices[edge_index])
+        end_index = int(corner_indices[(edge_index + 1)%num_sides])
+        indices = []
+        index = start_index
 
-    assignments = np.argmin(np.stack(edge_distances, axis=1), axis=1)
-    fitted_lines = []
+        while True:
+            indices.append(index)
+            if index == end_index:
+                break
+            index = (index + contour_direction) % num_contour_points
+            if len(indices) > num_contour_points:
+                return rough_vertices
 
-    for edge_index in range(num_sides):
-        start = rough_vertices[edge_index]
-        end = rough_vertices[(edge_index + 1)%num_sides]
-        edge = end - start
-        edge_length = float(np.linalg.norm(edge))
+        edge_points = contour_points[np.asarray(indices)]
+        trim = int(round(0.10*len(edge_points)))
+
+        if trim > 0 and len(edge_points) - 2*trim >= 3:
+            edge_points = edge_points[trim:-trim]
+
+        if len(edge_points) < 3:
+            return rough_vertices
+
         edge_dir = edge/edge_length
-        edge_points = contour_points[assignments == edge_index]
-
-        if len(edge_points) < 3:
-            return rough_vertices
-
-        projection = ((edge_points - start)@edge)/(edge_length*edge_length)
-        edge_points = edge_points[(projection >= 0.10) & (projection <= 0.90)]
-
-        if len(edge_points) < 3:
-            return rough_vertices
 
         if edge_length <= short_edge_px:
-            # A short edge has too little leverage to estimate angle stably frame-to-frame.
-            # Preserve the topology proposal's direction and use contour evidence only to
-            # slide that line in the normal direction.
+            # Short edges do not have enough lever arm for a stable free angle fit.
+            # Keep the topology direction, but use this edge's OWN contiguous contour arc
+            # to determine its normal position.
             normal = np.array([-edge_dir[1], edge_dir[0]])
             normal_offsets = (edge_points - start)@normal
             median_offset = float(np.median(normal_offsets))
@@ -1509,9 +1645,11 @@ def findSingleObjectUsingBestShapeGroup(
     if debug is not None:
         debug.addStage("Original image", frame)
         contour_debug_frame, polygon_debug_frame = frame.copy(), frame.copy()
-        lab_ray_debug_frame, candidate_debug_frame = frame.copy(), frame.copy()
+        snapped_corner_debug_frame, lab_ray_debug_frame = frame.copy(), frame.copy()
+        candidate_debug_frame = frame.copy()
     else:
-        contour_debug_frame = polygon_debug_frame = lab_ray_debug_frame = candidate_debug_frame = None
+        contour_debug_frame = polygon_debug_frame = snapped_corner_debug_frame = None
+        lab_ray_debug_frame = candidate_debug_frame = None
 
     for color_id in unique_color_ids:
         color_spec = COLOR_SPECS[color_id]
@@ -1995,7 +2133,11 @@ def findSingleObjectUsingBestShapeGroup(
                     if polygon is None:
                         debug_text = f"{color_name}: observed={observed_num_sides}, expected={expected_num_sides}, REJECT"
                     else:
-                        cv2.polylines(polygon_debug_frame, [np.round(polygon).astype(np.int32)], True, draw_bgr, 1)
+                        for vertex_u, vertex_v in np.round(polygon.reshape(-1, 2)).astype(np.int32):
+                            cv2.circle(
+                                polygon_debug_frame, (int(vertex_u), int(vertex_v)),
+                                4, draw_bgr, -1,
+                            )
                         pruned_text = (
                             f", pruned={len(removed_corner_strengths)}"
                             if removed_corner_strengths else ""
@@ -2011,10 +2153,21 @@ def findSingleObjectUsingBestShapeGroup(
 
                 if polygon is not None and cv2.isContourConvex(polygon):
                     num_sides = len(polygon)
+                    geometry_corners = snapTopologyCornersToHull(hull, polygon)
 
-                    # The selected polygon supplies topology/rough edge ownership only.
-                    # Actual edge geometry is fitted from the ORIGINAL selected HSV contour.
-                    vertices_px = refineShapeVerticesUsingEdges(contour, polygon)
+                    if snapped_corner_debug_frame is not None:
+                        for proposal_vertex, snapped_vertex in zip(polygon.reshape(-1, 2), geometry_corners):
+                            proposal_point = tuple(np.round(proposal_vertex).astype(int))
+                            snapped_point = tuple(np.round(snapped_vertex).astype(int))
+                            cv2.line(snapped_corner_debug_frame, proposal_point, snapped_point, (220, 220, 220), 1)
+                            cv2.circle(snapped_corner_debug_frame, proposal_point, 3, draw_bgr, -1)
+                            cv2.circle(snapped_corner_debug_frame, snapped_point, 6, draw_bgr, 2)
+
+                    # VisionSpec/topology chooses N. Pixel-scale hull evidence chooses where
+                    # those N corners sit. Final edge geometry comes from the ORIGINAL HSV
+                    # contour arcs between those corners.
+                    geometry_polygon = geometry_corners.astype(np.float32).reshape(-1, 1, 2)
+                    vertices_px = refineShapeVerticesUsingEdges(contour, geometry_polygon)
                     vertices_px = refineShapeVerticesUsingLabRays(
                         frame, vertices_px, color_spec, lab_ray_debug_frame, draw_bgr,
                     )
@@ -2036,8 +2189,12 @@ def findSingleObjectUsingBestShapeGroup(
 
                     if debug is not None:
                         topology_debug = frame.copy()
-                        cv2.polylines(topology_debug, [np.round(polygon).astype(np.int32)], True, draw_bgr, 2)
-                        debug.addStage(f"{color_name} candidate {candidate_index} selected topology", topology_debug)
+                        for vertex_u, vertex_v in np.round(polygon.reshape(-1, 2)).astype(np.int32):
+                            cv2.circle(topology_debug, (int(vertex_u), int(vertex_v)), 5, draw_bgr, -1)
+                        debug.addStage(
+                            f"{color_name} candidate {candidate_index} topology corners (not geometry)",
+                            topology_debug,
+                        )
 
                         refined_debug = frame.copy()
                         refined_points = np.round(vertices_px).astype(np.int32).reshape(-1, 1, 2)
@@ -2056,7 +2213,11 @@ def findSingleObjectUsingBestShapeGroup(
         debug.addStage("Combined raw mask", combined_raw_mask)
         debug.addStage("Combined cleaned mask", combined_cleaned_mask)
         debug.addStage("All selected HSV contours", contour_debug_frame)
-        debug.addStage("Polygon topology proposals", polygon_debug_frame)
+        debug.addStage("Topology corner proposals (not geometry)", polygon_debug_frame)
+        debug.addStage(
+            "Scale-aware geometry corners (dot=proposal, ring=used corner)",
+            snapped_corner_debug_frame,
+        )
         debug.addStage(
             "LAB edge rays (magenta=edge, cyan=acute-tip ray, orange=direct tip)",
             lab_ray_debug_frame,
