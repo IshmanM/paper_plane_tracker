@@ -997,6 +997,121 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
 
     return refined_vertices
 
+
+# Refine straight marker edges using the same idea as the tennis-ball LAB rays:
+# HSV gives an approximate boundary; short edge-normal rays find the strongest
+# target-color LAB transition, then straight lines are refit and intersected.
+def refineShapeVerticesUsingLabRays(
+    frame: np.ndarray, vertices_px: np.ndarray, color_spec, debug_frame: np.ndarray | None = None,
+    draw_bgr: tuple[int, int, int] = (255, 255, 255),
+) -> np.ndarray:
+    RAYS_PER_EDGE, SEARCH_RADIUS_PX = 6, 5
+    EDGE_SAMPLE_MARGIN, MIN_LAB_EDGE_STRENGTH = 0.15, 8.0
+    MAX_EDGE_ANGLE_CHANGE_DEG = 20.0
+
+    rough = np.asarray(vertices_px, dtype=np.float64).reshape(-1, 2)
+    if len(rough) < 3 or color_spec.lab_value is None:
+        return rough
+
+    pad = SEARCH_RADIUS_PX + 3
+    x1 = max(0, int(np.floor(rough[:, 0].min())) - pad)
+    y1 = max(0, int(np.floor(rough[:, 1].min())) - pad)
+    x2 = min(frame.shape[1], int(np.ceil(rough[:, 0].max())) + pad + 1)
+    y2 = min(frame.shape[0], int(np.ceil(rough[:, 1].max())) + pad + 1)
+    if x2 - x1 < 3 or y2 - y1 < 3:
+        return rough
+
+    lab_roi = cv2.GaussianBlur(cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2LAB), (3, 3), 0)
+    direction = color_spec.lab_value[1:3].astype(np.float32) - 128.0
+    direction_norm = float(np.linalg.norm(direction))
+    if direction_norm <= 1e-6:
+        return rough
+    direction /= direction_norm
+
+    a = lab_roi[:, :, 1].astype(np.float32) - 128.0
+    b = lab_roi[:, :, 2].astype(np.float32) - 128.0
+    response = a*float(direction[0]) + b*float(direction[1])
+    edge_strength = np.hypot(
+        cv2.Sobel(response, cv2.CV_32F, 1, 0, ksize=3),
+        cv2.Sobel(response, cv2.CV_32F, 0, 1, ksize=3),
+    )
+
+    offsets = np.arange(-SEARCH_RADIUS_PX, SEARCH_RADIUS_PX + 1, dtype=np.float64)
+    fitted_lines = []
+
+    for edge_index in range(len(rough)):
+        start, end = rough[edge_index], rough[(edge_index + 1)%len(rough)]
+        edge = end - start
+        edge_length = float(np.linalg.norm(edge))
+        if edge_length <= 2.0:
+            return rough
+
+        edge_dir = edge/edge_length
+        normal = np.array([-edge_dir[1], edge_dir[0]])
+        fractions = np.linspace(EDGE_SAMPLE_MARGIN, 1.0 - EDGE_SAMPLE_MARGIN, RAYS_PER_EDGE)
+        bases = start + fractions[:, None]*edge
+        samples = bases[:, None, :] + offsets[None, :, None]*normal
+        local = samples - np.array([x1, y1])
+
+        u = np.rint(local[:, :, 0]).astype(np.int32)
+        v = np.rint(local[:, :, 1]).astype(np.int32)
+        valid = (u >= 0) & (u < edge_strength.shape[1]) & (v >= 0) & (v < edge_strength.shape[0])
+        safe_u, safe_v = np.clip(u, 0, edge_strength.shape[1] - 1), np.clip(v, 0, edge_strength.shape[0] - 1)
+        strengths = np.where(valid, edge_strength[safe_v, safe_u], -1.0)
+
+        best_indices = np.argmax(strengths, axis=1)
+        best_strengths = strengths[np.arange(RAYS_PER_EDGE), best_indices]
+        good = best_strengths >= MIN_LAB_EDGE_STRENGTH
+        if np.count_nonzero(good) < 3:
+            return rough
+
+        points = samples[np.arange(RAYS_PER_EDGE), best_indices][good]
+        vx, vy, x0, y0 = cv2.fitLine(points.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(4)
+        line_dir = np.array([vx, vy], dtype=np.float64)
+        line_dir /= max(float(np.linalg.norm(line_dir)), 1e-12)
+        if abs(float(np.dot(line_dir, edge_dir))) < np.cos(np.deg2rad(MAX_EDGE_ANGLE_CHANGE_DEG)):
+            return rough
+
+        fitted_lines.append((np.array([x0, y0], dtype=np.float64), line_dir))
+
+        if debug_frame is not None:
+            selected = samples[np.arange(RAYS_PER_EDGE), best_indices]
+            for base, point in zip(bases, selected):
+                cv2.line(debug_frame, tuple(np.round(base).astype(int)), tuple(np.round(point).astype(int)), (220, 220, 220), 1)
+                cv2.circle(debug_frame, tuple(np.round(point).astype(int)), 2, (255, 0, 255), -1)
+
+    refined = []
+    for vertex_index in range(len(rough)):
+        p1, d1 = fitted_lines[(vertex_index - 1)%len(rough)]
+        p2, d2 = fitted_lines[vertex_index]
+        cross = d1[0]*d2[1] - d1[1]*d2[0]
+        if abs(cross) <= 1e-4:
+            return rough
+
+        delta = p2 - p1
+        t = (delta[0]*d2[1] - delta[1]*d2[0])/cross
+        refined.append(p1 + t*d1)
+
+    refined = np.asarray(refined, dtype=np.float64)
+    refined_polygon = refined.astype(np.float32).reshape(-1, 1, 2)
+    rough_area = cv2.contourArea(rough.astype(np.float32))
+    refined_area = cv2.contourArea(refined_polygon)
+    max_edge = max(np.linalg.norm(rough[i] - rough[(i + 1)%len(rough)]) for i in range(len(rough)))
+
+    if (
+        not cv2.isContourConvex(refined_polygon)
+        or rough_area <= 0.0
+        or not 0.60 <= refined_area/rough_area <= 1.50
+        or np.any(np.linalg.norm(refined - rough, axis=1) > 0.50*max_edge)
+    ):
+        return rough
+
+    if debug_frame is not None:
+        cv2.polylines(debug_frame, [np.round(rough).astype(np.int32).reshape(-1, 1, 2)], True, (0, 255, 255), 1)
+        cv2.polylines(debug_frame, [np.round(refined).astype(np.int32).reshape(-1, 1, 2)], True, draw_bgr, 2)
+
+    return refined
+
 # Shape path: find color-based convex polygon candidates, group nearby markers, then select the best group.
 def findSingleObjectUsingBestShapeGroup(
     frame: np.ndarray, object_vision_spec: ObjectVisionSpec, debug: DetectionDebug | None = None,
@@ -1037,7 +1152,7 @@ def findSingleObjectUsingBestShapeGroup(
 
     # Optional seam/shadow recovery analogous to the tennis-ball path. Off initially because
     # the paper-plane markers should normally be continuous colored regions on white paper.
-    KEEP_FRAGMENTED_HSV_COMPONENTS = True
+    KEEP_FRAGMENTED_HSV_COMPONENTS = False
     MIN_SECONDARY_SEED_AREA_FACTOR = 0.15
     MAX_SECONDARY_SEED_DISTANCE_FACTOR = 1.25
 
@@ -1154,9 +1269,10 @@ def findSingleObjectUsingBestShapeGroup(
 
     if debug is not None:
         debug.addStage("Original image", frame)
-        contour_debug_frame, polygon_debug_frame, candidate_debug_frame = frame.copy(), frame.copy(), frame.copy()
+        contour_debug_frame, polygon_debug_frame = frame.copy(), frame.copy()
+        lab_ray_debug_frame, candidate_debug_frame = frame.copy(), frame.copy()
     else:
-        contour_debug_frame = polygon_debug_frame = candidate_debug_frame = None
+        contour_debug_frame = polygon_debug_frame = lab_ray_debug_frame = candidate_debug_frame = None
 
     for color_id in unique_color_ids:
         color_spec = COLOR_SPECS[color_id]
@@ -1366,7 +1482,7 @@ def findSingleObjectUsingBestShapeGroup(
                 # Generic speck suppression for every marker color. Match the tennis-ball
                 # detector's 5x5 median filtering, while keeping morphology at 3x3 so acute
                 # polygon tips are not unnecessarily eroded.
-                cleaned_loose_hsv_roi = cv2.medianBlur(raw_loose_hsv_roi, 5)
+                cleaned_loose_hsv_roi = cv2.medianBlur(raw_loose_hsv_roi, 3)
                 cleaned_loose_hsv_roi = cv2.morphologyEx(
                     cleaned_loose_hsv_roi, cv2.MORPH_OPEN, hsv_cleanup_kernel,
                 )
@@ -1665,6 +1781,9 @@ def findSingleObjectUsingBestShapeGroup(
                         continue
 
                     vertices_px = refineShapeVerticesUsingEdges(contour, polygon)
+                    vertices_px = refineShapeVerticesUsingLabRays(
+                        frame, vertices_px, color_spec, lab_ray_debug_frame, draw_bgr,
+                    )
                     shape_candidates.append(
                         ShapeDetection(vertices_px=vertices_px, color_id=color_id, num_sides=num_sides),
                     )
@@ -1706,6 +1825,7 @@ def findSingleObjectUsingBestShapeGroup(
         debug.addStage("Combined cleaned mask", combined_cleaned_mask)
         debug.addStage("All selected HSV contours", contour_debug_frame)
         debug.addStage("Polygon approximations", polygon_debug_frame)
+        debug.addStage("LAB edge-ray refinement (yellow=rough, magenta=edge samples)", lab_ray_debug_frame)
 
         if not shape_candidates:
             cv2.putText(candidate_debug_frame, "No accepted shapes", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
