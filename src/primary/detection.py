@@ -1037,7 +1037,7 @@ def findSingleObjectUsingBestShapeGroup(
 
     # Optional seam/shadow recovery analogous to the tennis-ball path. Off initially because
     # the paper-plane markers should normally be continuous colored regions on white paper.
-    KEEP_FRAGMENTED_HSV_COMPONENTS = False
+    KEEP_FRAGMENTED_HSV_COMPONENTS = True
     MIN_SECONDARY_SEED_AREA_FACTOR = 0.15
     MAX_SECONDARY_SEED_DISTANCE_FACTOR = 1.25
 
@@ -1589,7 +1589,9 @@ def findSingleObjectUsingBestShapeGroup(
                 if not contours:
                     continue
 
-                contour = max(contours, key=cv2.contourArea)
+                # Bridge all accepted same-color fragments into the one convex physical marker.
+                # The old recovery accidentally threw every fragment away except the largest.
+                contour = contours[0] if len(contours) == 1 else cv2.convexHull(np.concatenate(contours, axis=0))
                 contour_area = cv2.contourArea(contour)
 
                 if contour_debug_frame is not None:
@@ -1599,9 +1601,6 @@ def findSingleObjectUsingBestShapeGroup(
                     continue
 
                 polygon_start = time.perf_counter() if profile_shape_detection else None
-
-                # Existing polygon geometry path: convex hull -> approxPolyDP -> straight-edge fitting
-                # and line intersection. This is intentionally retained before trying LAB edge refinement.
                 hull = cv2.convexHull(contour)
                 perimeter = cv2.arcLength(hull, True)
 
@@ -1744,6 +1743,8 @@ def findSingleObjectUsingBestShapeGroup(
             debug.updateTimingStage()
         return None
 
+    if debug is not None:
+        debug.addStage("Plane / hinge selection diagnostics", makeTextDebugStage(frame, getPlaneSelectionDebugLines(shape_candidates, object_vision_spec)))
     grouping_start = time.perf_counter() if profile_shape_detection else None
     selected_group = selectBestPlaneShapeGroup(shape_candidates, object_vision_spec)
 
@@ -1835,6 +1836,24 @@ def findSingleObjectUsingBestShapeGroup(
         debug.updateTimingStage()
 
     return detection
+
+
+# Explain marker compatibility only for debug; the normal selector still uses getShapeMarkerError().
+def describeShapeMarkerMatch(shape: ShapeDetection, marker: ShapeMarkerSpec, minimum_area_px: float | None) -> str:
+    if shape.color_id != marker.color_id:
+        return "color"
+    if shape.num_sides != marker.num_sides:
+        return f"N {shape.num_sides}!={marker.num_sides}"
+    if shape.vertices_px is None or marker.object_vertices_m is None:
+        return "missing vertices"
+    vertices = np.asarray(shape.vertices_px, dtype=np.float64)
+    if vertices.shape != (shape.num_sides, 2) or not np.all(np.isfinite(vertices)):
+        return "bad image vertices"
+    area = cv2.contourArea(vertices.astype(np.float32))
+    if minimum_area_px is not None and area < minimum_area_px:
+        return f"area {area:.0f}<{minimum_area_px:.0f}"
+    error = getShapeMarkerError(shape, marker, minimum_area_px)
+    return "geometry" if error is None else f"OK err={error:.3f}"
 
 
 # Compare one detected polygon with one physical marker. None means incompatible.
@@ -1939,6 +1958,66 @@ def selectBestPlaneShapeGroup(shape_candidates: list[ShapeDetection], object_vis
     if result is not None:
         return result
     return evaluatePlaneGroups(shape_candidates, object_vision_spec, [(plane_id,) for plane_id in plane_ids], require_all_planes=False)
+
+
+def getPlaneSelectionDebugLines(shape_candidates: list[ShapeDetection], object_vision_spec: ObjectVisionSpec) -> list[str]:
+    planes = {plane.plane_id: plane for plane in object_vision_spec.rigid_planes}
+    lines = ["RAW SHAPES"]
+
+    for shape_index, shape in enumerate(shape_candidates):
+        area = cv2.contourArea(np.asarray(shape.vertices_px, dtype=np.float32)) if shape.vertices_px is not None else 0.0
+        color_name = getattr(shape.color_id, "name", str(shape.color_id))
+        lines.append(f"S{shape_index}: {color_name} N={shape.num_sides} area={area:.0f}")
+        matches = []
+        for plane_id, plane in planes.items():
+            for marker_index, marker in enumerate(plane.shape_markers):
+                if marker.num_sides == 0:
+                    continue
+                minimum_area = marker.minimum_contour_area_px if marker.minimum_contour_area_px is not None else object_vision_spec.minimum_contour_area_px
+                status = describeShapeMarkerMatch(shape, marker, minimum_area)
+                if status != "color":
+                    marker_color = getattr(marker.color_id, "name", str(marker.color_id))
+                    matches.append(f"{plane_id}:M{marker_index} {marker_color}/N{marker.num_sides} {status}")
+        lines.extend([f"  {match}" for match in matches] or ["  no same-color physical marker"] )
+
+    lines.append("HINGES")
+    for plane_id_1, plane_id_2, _ in object_vision_spec.rigid_plane_connections:
+        if plane_id_1 not in planes or plane_id_2 not in planes:
+            lines.append(f"{plane_id_1}<->{plane_id_2}: FAIL missing plane")
+            continue
+        entries = []
+        for plane_id in (plane_id_1, plane_id_2):
+            for marker_index, marker in enumerate(planes[plane_id].shape_markers):
+                if marker.num_sides == 0:
+                    continue
+                minimum_area = marker.minimum_contour_area_px if marker.minimum_contour_area_px is not None else object_vision_spec.minimum_contour_area_px
+                entries.append((plane_id, marker_index, marker, minimum_area))
+        result = findBestShapeMarkerAssignment(shape_candidates, entries, {plane_id_1, plane_id_2})
+        if result is None:
+            compatible_planes = set()
+            for shape in shape_candidates:
+                for plane_id, _, marker, minimum_area in entries:
+                    if getShapeMarkerError(shape, marker, minimum_area) is not None:
+                        compatible_planes.add(plane_id)
+            missing = [plane_id for plane_id in (plane_id_1, plane_id_2) if plane_id not in compatible_planes]
+            reason = "missing evidence: " + ",".join(missing) if missing else "no valid one-to-one assignment"
+            lines.append(f"{plane_id_1}<->{plane_id_2}: FAIL {reason}")
+            continue
+        assignment, error = result
+        mapping = ", ".join(f"S{s}->{entries[m][0]}:M{entries[m][1]}" for s, m in assignment)
+        lines.append(f"{plane_id_1}<->{plane_id_2}: PASS {mapping} | err={error:.3f}")
+
+    selected = selectBestPlaneShapeGroup(shape_candidates, object_vision_spec)
+    lines.append("SELECTED: none" if selected is None else f"SELECTED: {'+'.join(selected[1])}")
+    return lines
+
+
+def makeTextDebugStage(reference_frame: np.ndarray, lines: list[str]) -> np.ndarray:
+    width = max(reference_frame.shape[1], 900)
+    image = np.full((max(160, 34 + 22*len(lines)), width, 3), 25, dtype=np.uint8)
+    for i, line in enumerate(lines):
+        cv2.putText(image, line, (12, 25 + 22*i), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (235, 235, 235), 1, cv2.LINE_AA)
+    return image
 
 
 # Build the exact physical marker data selected in 2D. PnP never reselects planes, hinges, or marker identities.

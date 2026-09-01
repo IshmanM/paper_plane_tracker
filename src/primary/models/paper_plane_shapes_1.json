@@ -137,18 +137,14 @@
       "shape_markers": [
         {
           "color_id": "GREEN",
-          "num_sides": 4,
+          "num_sides": 3,
           "object_vertices_m": [
             [
               -0.09,
               -0.02
             ],
             [
-              0.032,
-              0.0
-            ],
-            [
-              0.032,
+              0.162,
               0.02
             ],
             [

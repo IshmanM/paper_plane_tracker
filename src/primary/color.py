@@ -48,12 +48,12 @@ COLOR_SPECS = {
     ColorId.GREEN: ColorSpec(
         hsv_ranges=[
             (
-                np.array([56, 55, 90], dtype=np.uint8),
-                np.array([84, 155, 225], dtype=np.uint8),
+                np.array([57, 60, 85], dtype=np.uint8),
+                np.array([86, 170, 240], dtype=np.uint8),
             ),
         ],
         draw_bgr=(0, 255, 0),
-        lab_value=np.array([150, 108, 137], dtype=np.uint8),
+        lab_value=np.array([180, 105, 137], dtype=np.uint8),
     ),
 
     ColorId.CYAN: ColorSpec(
@@ -103,11 +103,11 @@ COLOR_SPECS = {
     ColorId.PINK: ColorSpec(
         hsv_ranges=[
             (
-                np.array([168, 85, 175], dtype=np.uint8),
-                np.array([179, 135, 245], dtype=np.uint8),
+                np.array([162, 75, 170], dtype=np.uint8),
+                np.array([179, 150, 255], dtype=np.uint8),
             ),
         ],
         draw_bgr=(180, 105, 255),
-        lab_value=np.array([176, 155, 131], dtype=np.uint8),
+        lab_value=np.array([217, 150, 124], dtype=np.uint8),
     ),
 }

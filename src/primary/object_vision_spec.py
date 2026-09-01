@@ -369,8 +369,8 @@ OBJECT_VISION_SPECS = {
 
     ObjectVisionSpecId.PAPER_PLANE_SHAPES_1: ObjectVisionSpec(
         object_type=ObjectType.PAPER_PLANE_SHAPES,
-        color_ids=[ColorId.GREEN, ColorId.CYAN, ColorId.TENNIS_GREEN, ColorId.PINK],
-        minimum_contour_area_px=80.0,
+        color_ids=[ColorId.GREEN, ColorId.CYAN, ColorId.PINK],
+        minimum_contour_area_px=50.0,
         polygon_epsilon_ratio=0.04,
         shape_group_distance_factor=3.0,
         rigid_planes=[
@@ -386,7 +386,7 @@ OBJECT_VISION_SPECS = {
                     ShapeMarkerSpec(
                         color_id=ColorId.GREEN, num_sides=4,
                         object_vertices_m=np.array([[-0.09, 0.02], [0.044000000000000004, 0.02], [0.034, 0.0], [-0.09, -0.02]], dtype=np.float64),
-                        minimum_contour_area_px=60.0,
+                        minimum_contour_area_px=30.0,
                     ),
                 ],
             ),
@@ -402,7 +402,7 @@ OBJECT_VISION_SPECS = {
                     ShapeMarkerSpec(
                         color_id=ColorId.CYAN, num_sides=3,
                         object_vertices_m=np.array([[0.0, 0.0], [-0.091, 0.0], [-0.091, 0.035]], dtype=np.float64),
-                        minimum_contour_area_px=60.0,
+                        minimum_contour_area_px=30.0,
                     ),
                 ],
             ),
@@ -416,8 +416,8 @@ OBJECT_VISION_SPECS = {
                 translation_object_from_plane_m=np.array([0.0, 0.001, -0.01], dtype=np.float64),
                 shape_markers=[
                     ShapeMarkerSpec(
-                        color_id=ColorId.GREEN, num_sides=4,
-                        object_vertices_m=np.array([[-0.09, -0.02], [0.032, 0.0], [0.032, 0.02], [-0.09, 0.02]], dtype=np.float64),
+                        color_id=ColorId.GREEN, num_sides=3,
+                        object_vertices_m=np.array([[-0.09, -0.02], [0.162, 0.02], [-0.09, 0.02]], dtype=np.float64),
                     ),
                 ],
             ),
