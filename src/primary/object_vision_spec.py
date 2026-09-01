@@ -23,6 +23,7 @@ class ObjectVisionSpecId(Enum):
     TENNIS_BALL_DEFAULT = auto()
     ARUCO_MARKER_1 = auto()
     PAPER_PLANE_SHAPES_1 = auto()
+    PAPER_PLANE_ARUCO_1 = auto()
 
 
 class ShapeMarkerSpec:
@@ -362,7 +363,16 @@ OBJECT_VISION_SPECS = {
         object_type=ObjectType.ARUCO_MARKER,
         aruco_marker=ArucoMarkerSpec(
             marker_id=0,
-            marker_length_m=0.10, # TODO: replace with exact printed marker side length
+            marker_length_m=0.100, 
+            dictionary_name="DICT_4X4_50",
+        ),
+    ),
+
+    ObjectVisionSpecId.PAPER_PLANE_ARUCO_1: ObjectVisionSpec(
+        object_type=ObjectType.ARUCO_MARKER,
+        aruco_marker=ArucoMarkerSpec(
+            marker_id=0,
+            marker_length_m=0.080, # TODO: replace with exact printed marker side length
             dictionary_name="DICT_4X4_50",
         ),
     ),

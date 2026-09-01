@@ -395,12 +395,15 @@ def findBlurredArucoOuterQuad(
     debug: DetectionDebug | None = None,
 ) -> np.ndarray | None:
     """
-    Fallback for motion-blurred markers.
+    Motion-blur fallback for one known ArUco marker.
 
-    Standard ArUco requires a successfully extracted/decoded marker candidate. This
-    fallback instead finds dark convex quadrilaterals, perspective-warps each one,
-    and softly compares it with the configured marker image. It therefore uses the
-    known ArUco payload as evidence without requiring hard bit decoding.
+    A quadrilateral is accepted only if it looks like the configured marker:
+      1. its perspective-warped module intensities match the configured ArUco ID;
+      2. its outer edge has the normal ArUco polarity: dark border inside,
+         lighter margin immediately outside.
+
+    This prevents unrelated rectangular scene objects (e.g. ceiling lights) from
+    being selected merely because they form a quadrilateral.
     """
     ADAPTIVE_BLOCK_SIZE = 31
     ADAPTIVE_C = 7
@@ -409,8 +412,13 @@ def findBlurredArucoOuterQuad(
     MIN_SIDE_PX = 8.0
     MAX_SIDE_RATIO = 3.0
     MAX_ABS_CORNER_COSINE = 0.75
-    TEMPLATE_SIZE_PX = 96
-    MIN_TEMPLATE_CORRELATION = 0.45
+
+    MARKER_BORDER_BITS = 1
+    CELL_SAMPLE_SIZE_PX = 12
+    MIN_MODULE_CORRELATION = 0.35
+    MIN_MODULE_CONTRAST = 10.0
+    MIN_EDGE_POLARITY_DELTA = 6.0
+    MIN_POSITIVE_POLARITY_EDGES = 3
 
     dark_mask = cv2.adaptiveThreshold(
         gray, 255,
@@ -430,17 +438,76 @@ def findBlurredArucoOuterQuad(
         dark_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE,
     )
 
+    marker_modules = int(dictionary.markerSize) + 2*MARKER_BORDER_BITS
+    warp_size_px = marker_modules*CELL_SAMPLE_SIZE_PX
+
     expected_marker = cv2.aruco.generateImageMarker(
-        dictionary, aruco_spec.marker_id, TEMPLATE_SIZE_PX,
+        dictionary, aruco_spec.marker_id, warp_size_px,
+        borderBits=MARKER_BORDER_BITS,
     )
-    expected_marker = cv2.GaussianBlur(expected_marker, (3, 3), 0).astype(np.float32)
+    expected_cells = expected_marker.reshape(
+        marker_modules, CELL_SAMPLE_SIZE_PX,
+        marker_modules, CELL_SAMPLE_SIZE_PX,
+    ).mean(axis=(1, 3)).astype(np.float64)
 
     destination = np.array([
         [0.0, 0.0],
-        [TEMPLATE_SIZE_PX - 1.0, 0.0],
-        [TEMPLATE_SIZE_PX - 1.0, TEMPLATE_SIZE_PX - 1.0],
-        [0.0, TEMPLATE_SIZE_PX - 1.0],
+        [warp_size_px - 1.0, 0.0],
+        [warp_size_px - 1.0, warp_size_px - 1.0],
+        [0.0, warp_size_px - 1.0],
     ], dtype=np.float32)
+
+    gray_float = gray.astype(np.float32)
+
+    def getEdgePolarity(quad: np.ndarray) -> tuple[float, int]:
+        """Positive means lighter immediately outside than inside the black border."""
+        centroid = np.mean(quad, axis=0)
+        bbox_diagonal_px = float(np.linalg.norm(np.ptp(quad, axis=0)))
+        sample_offset_px = float(np.clip(0.035*bbox_diagonal_px, 1.5, 5.0))
+        edge_deltas = []
+
+        for edge_index in range(4):
+            start = quad[edge_index]
+            end = quad[(edge_index + 1)%4]
+            edge = end - start
+            edge_length = float(np.linalg.norm(edge))
+
+            if edge_length <= 1e-6:
+                return -float("inf"), 0
+
+            edge_direction = edge/edge_length
+            outward_normal = np.array(
+                [-edge_direction[1], edge_direction[0]],
+                dtype=np.float64,
+            )
+            midpoint = 0.5*(start + end)
+
+            if np.dot(outward_normal, midpoint - centroid) < 0.0:
+                outward_normal = -outward_normal
+
+            fractions = np.linspace(0.18, 0.82, 7)
+            bases = start + fractions[:, None]*edge
+            inside = bases - sample_offset_px*outward_normal
+            outside = bases + sample_offset_px*outward_normal
+
+            inside_values = cv2.remap(
+                gray_float,
+                inside[:, 0].astype(np.float32).reshape(1, -1),
+                inside[:, 1].astype(np.float32).reshape(1, -1),
+                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            ).reshape(-1)
+            outside_values = cv2.remap(
+                gray_float,
+                outside[:, 0].astype(np.float32).reshape(1, -1),
+                outside[:, 1].astype(np.float32).reshape(1, -1),
+                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+            ).reshape(-1)
+
+            edge_deltas.append(float(np.median(outside_values - inside_values)))
+
+        return float(np.median(edge_deltas)), sum(
+            delta >= MIN_EDGE_POLARITY_DELTA for delta in edge_deltas
+        )
 
     candidates = []
 
@@ -460,8 +527,14 @@ def findBlurredArucoOuterQuad(
             continue
 
         polygon = None
-        for epsilon_ratio in (0.010, 0.015, 0.020, 0.025, 0.030, 0.040, 0.050, 0.060, 0.080):
-            proposal = cv2.approxPolyDP(hull, epsilon_ratio*perimeter, True)
+
+        for epsilon_ratio in (
+            0.010, 0.015, 0.020, 0.025, 0.030,
+            0.040, 0.050, 0.060, 0.080,
+        ):
+            proposal = cv2.approxPolyDP(
+                hull, epsilon_ratio*perimeter, True,
+            )
 
             if len(proposal) == 4 and cv2.isContourConvex(proposal):
                 polygon = proposal.reshape(4, 2)
@@ -480,14 +553,14 @@ def findBlurredArucoOuterQuad(
         ):
             continue
 
-        # Perspective may make the projected square non-rectangular, but reject
-        # extreme slivers/random polygons before template scoring.
         corner_cosines = []
 
         for corner_index in range(4):
             previous_vector = quad[(corner_index - 1)%4] - quad[corner_index]
             next_vector = quad[(corner_index + 1)%4] - quad[corner_index]
-            denominator = float(np.linalg.norm(previous_vector)*np.linalg.norm(next_vector))
+            denominator = float(
+                np.linalg.norm(previous_vector)*np.linalg.norm(next_vector)
+            )
 
             if denominator <= 1e-6:
                 corner_cosines = [1.0]
@@ -500,79 +573,161 @@ def findBlurredArucoOuterQuad(
         if max(corner_cosines) > MAX_ABS_CORNER_COSINE:
             continue
 
-        transform = cv2.getPerspectiveTransform(quad, destination)
+        transform = cv2.getPerspectiveTransform(
+            quad.astype(np.float32), destination,
+        )
         warped = cv2.warpPerspective(
-            gray, transform, (TEMPLATE_SIZE_PX, TEMPLATE_SIZE_PX),
+            gray, transform, (warp_size_px, warp_size_px),
             flags=cv2.INTER_LINEAR,
         )
-        warped = cv2.GaussianBlur(warped, (3, 3), 0).astype(np.float32)
 
-        # The marker can be rotated in the image. Compare all four rotations of
-        # the configured marker; normalized correlation tolerates brightness/gain.
-        correlations = [
-            float(cv2.matchTemplate(
-                warped, np.rot90(expected_marker, rotation).copy(),
-                cv2.TM_CCOEFF_NORMED,
-            )[0, 0])
-            for rotation in range(4)
-        ]
-        best_rotation = int(np.argmax(correlations))
-        correlation = correlations[best_rotation]
+        candidate_cells = warped.reshape(
+            marker_modules, CELL_SAMPLE_SIZE_PX,
+            marker_modules, CELL_SAMPLE_SIZE_PX,
+        ).mean(axis=(1, 3)).astype(np.float64)
+
+        edge_polarity_delta, positive_polarity_edges = getEdgePolarity(quad)
+
+        best_rotation = 0
+        best_module_correlation = -1.0
+        best_module_contrast = -float("inf")
+
+        for rotation in range(4):
+            rotated_expected = np.rot90(expected_cells, rotation)
+            expected_flat = rotated_expected.ravel()
+            candidate_flat = candidate_cells.ravel()
+
+            expected_centered = expected_flat - np.mean(expected_flat)
+            candidate_centered = candidate_flat - np.mean(candidate_flat)
+            denominator = float(
+                np.linalg.norm(expected_centered)
+                * np.linalg.norm(candidate_centered)
+            )
+
+            module_correlation = (
+                float(np.dot(expected_centered, candidate_centered)/denominator)
+                if denominator > 1e-6 else -1.0
+            )
+
+            white_cells = candidate_cells[rotated_expected > 127.5]
+            black_cells = candidate_cells[rotated_expected <= 127.5]
+            module_contrast = (
+                float(np.mean(white_cells) - np.mean(black_cells))
+                if len(white_cells) and len(black_cells)
+                else -float("inf")
+            )
+
+            if (
+                module_correlation, module_contrast
+            ) > (
+                best_module_correlation, best_module_contrast
+            ):
+                best_rotation = rotation
+                best_module_correlation = module_correlation
+                best_module_contrast = module_contrast
+
+        passed = (
+            best_module_correlation >= MIN_MODULE_CORRELATION
+            and best_module_contrast >= MIN_MODULE_CONTRAST
+            and positive_polarity_edges >= MIN_POSITIVE_POLARITY_EDGES
+        )
 
         candidates.append((
-            correlation, contour_area, quad,
-            warped.astype(np.uint8), best_rotation,
+            passed,
+            best_module_correlation,
+            best_module_contrast,
+            edge_polarity_delta,
+            positive_polarity_edges,
+            contour_area,
+            quad,
+            warped,
+            best_rotation,
         ))
 
-    candidates.sort(key=lambda candidate: (candidate[0], candidate[1]), reverse=True)
+    candidates.sort(
+        key=lambda candidate: (
+            candidate[0],
+            candidate[1],
+            candidate[2],
+            candidate[4],
+            candidate[5],
+        ),
+        reverse=True,
+    )
 
     if debug is not None:
         proposals_debug = frame.copy()
 
-        for candidate_index, (correlation, _, quad, _, _) in enumerate(candidates):
+        for candidate_index, candidate in enumerate(candidates):
+            (
+                passed, correlation, contrast, polarity_delta,
+                positive_edges, _, quad, _, _,
+            ) = candidate
             points = np.round(quad).astype(np.int32)
-            accepted = correlation >= MIN_TEMPLATE_CORRELATION
-            color = (0, 255, 0) if accepted else (0, 165, 255)
+            color = (0, 255, 0) if passed else (0, 165, 255)
 
             cv2.polylines(
-                proposals_debug, [points.reshape(-1, 1, 2)],
+                proposals_debug,
+                [points.reshape(-1, 1, 2)],
                 True, color, 1, cv2.LINE_AA,
             )
             center = np.mean(points, axis=0).astype(int)
             cv2.putText(
                 proposals_debug,
-                f"Q{candidate_index} corr={correlation:.2f}",
+                (
+                    f"Q{candidate_index} corr={correlation:.2f} "
+                    f"d={contrast:.0f} edge={polarity_delta:.0f}/{positive_edges}"
+                ),
                 (int(center[0]), int(center[1])),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.40,
+                cv2.FONT_HERSHEY_SIMPLEX, 0.36,
                 color, 1, cv2.LINE_AA,
             )
 
         cv2.putText(
             proposals_debug,
-            f"quad candidates={len(candidates)} | accept corr>={MIN_TEMPLATE_CORRELATION:.2f}",
-            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+            (
+                f"accept: corr>={MIN_MODULE_CORRELATION:.2f}, "
+                f"cell d>={MIN_MODULE_CONTRAST:.0f}, "
+                f"polarity edges>={MIN_POSITIVE_POLARITY_EDGES}/4"
+            ),
+            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
             (255, 255, 255), 2, cv2.LINE_AA,
         )
-        debug.addStage("Blur fallback - outer quad proposals", proposals_debug)
+        debug.addStage(
+            "Blur fallback - marker-validated quad proposals",
+            proposals_debug,
+        )
 
-    if not candidates or candidates[0][0] < MIN_TEMPLATE_CORRELATION:
+    passing_candidates = [
+        candidate for candidate in candidates if candidate[0]
+    ]
+
+    if not passing_candidates:
         if debug is not None:
             failure = frame.copy()
-            best_correlation = None if not candidates else candidates[0][0]
-            text = (
-                "NO BLUR-FALLBACK QUAD"
-                if best_correlation is None
-                else f"BEST TEMPLATE CORRELATION {best_correlation:.2f} < {MIN_TEMPLATE_CORRELATION:.2f}"
-            )
+            if candidates:
+                best = candidates[0]
+                reason = (
+                    f"NO VALID MARKER | best corr={best[1]:.2f}, "
+                    f"cell d={best[2]:.0f}, "
+                    f"edge d={best[3]:.0f} ({best[4]}/4)"
+                )
+            else:
+                reason = "NO QUADRILATERAL CANDIDATES"
+
             cv2.putText(
-                failure, text, (10, 28),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                failure, reason, (10, 28),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.48,
                 (0, 0, 255), 2, cv2.LINE_AA,
             )
             debug.addStage("Blur fallback - rejected", failure)
+
         return None
 
-    correlation, _, best_quad, best_warp, best_rotation = candidates[0]
+    (
+        _, correlation, contrast, polarity_delta, positive_edges,
+        _, best_quad, best_warp, best_rotation,
+    ) = passing_candidates[0]
 
     edge_refinement_debug = frame.copy() if debug is not None else None
     refined_quad = refineArucoOuterQuadUsingGrayEdges(
@@ -593,8 +748,12 @@ def findBlurredArucoOuterQuad(
             selected_debug, [points.reshape(-1, 1, 2)],
             True, (255, 0, 255), 2, cv2.LINE_AA,
         )
+
         for corner_index, (u, v) in enumerate(points):
-            cv2.circle(selected_debug, (int(u), int(v)), 4, (0, 255, 255), -1)
+            cv2.circle(
+                selected_debug, (int(u), int(v)),
+                4, (0, 255, 255), -1,
+            )
             cv2.putText(
                 selected_debug, str(corner_index),
                 (int(u) + 5, int(v) - 5),
@@ -604,28 +763,44 @@ def findBlurredArucoOuterQuad(
 
         cv2.putText(
             selected_debug,
-            f"blur fallback | template corr={correlation:.3f} | rotation={90*best_rotation} deg",
-            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+            (
+                f"blur fallback | corr={correlation:.3f} | "
+                f"cell d={contrast:.1f} | "
+                f"edge d={polarity_delta:.1f} ({positive_edges}/4)"
+            ),
+            (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.46,
             (255, 255, 255), 2, cv2.LINE_AA,
         )
-        debug.addStage("Blur fallback - selected outer square", selected_debug)
+        debug.addStage(
+            "Blur fallback - selected validated marker",
+            selected_debug,
+        )
 
         expected_rotated = np.rot90(
-            expected_marker.astype(np.uint8), best_rotation,
+            expected_marker, best_rotation,
         ).copy()
         comparison = np.hstack((best_warp, expected_rotated))
-        comparison = cv2.cvtColor(comparison, cv2.COLOR_GRAY2BGR)
+        comparison = cv2.cvtColor(
+            comparison, cv2.COLOR_GRAY2BGR,
+        )
         cv2.putText(
             comparison, "warped candidate", (5, 18),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+            (0, 255, 255), 1, cv2.LINE_AA,
         )
         cv2.putText(
-            comparison, "expected marker", (TEMPLATE_SIZE_PX + 5, 18),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1, cv2.LINE_AA,
+            comparison, "expected marker",
+            (warp_size_px + 5, 18),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.36,
+            (0, 255, 255), 1, cv2.LINE_AA,
         )
-        debug.addStage("Blur fallback - template comparison", comparison)
+        debug.addStage(
+            "Blur fallback - module/template comparison",
+            comparison,
+        )
 
     return refined_quad.astype(np.float64)
+
 
 
 def solveArucoMarkerPose(
