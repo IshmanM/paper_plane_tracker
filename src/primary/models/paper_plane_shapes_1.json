@@ -4,7 +4,6 @@
   "color_ids": [
     "GREEN",
     "CYAN",
-    "TENNIS_GREEN",
     "PINK"
   ],
   "minimum_contour_area_px": 80.0,
@@ -137,7 +136,7 @@
       ],
       "shape_markers": [
         {
-          "color_id": "TENNIS_GREEN",
+          "color_id": "GREEN",
           "num_sides": 4,
           "object_vertices_m": [
             [
@@ -212,17 +211,17 @@
     [
       "plane_0",
       "plane_1",
-      15.0
+      10.0
     ],
     [
       "plane_0",
       "plane_2",
-      15.0
+      10.0
     ],
     [
       "plane_2",
       "plane_3",
-      15.0
+      10.0
     ]
   ]
 }

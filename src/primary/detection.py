@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import cv2
 import numpy as np
 import time
@@ -6,14 +8,15 @@ from itertools import combinations, permutations
 
 from src.primary.camera.camera_calibration import CameraCalibration
 from src.primary.geometry import estimateObjectWorldPosition
-from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec, ObjectVisionSpecId, getRigidPlaneIntersection
+from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpec, ObjectVisionSpecId, ShapeMarkerSpec, getRigidPlaneIntersection
 from src.primary.color import COLOR_SPECS, ColorId
 
 
-# Previous successful flexible-plane solution. This is only a hint: if the local
-# warm-start search fits poorly, the normal full flex search runs immediately.
+# Small temporal PnP caches. They only warm-start/tie-break; poor geometry still forces a fresh solve.
 _PNP_WARM_START_ANGLES_DEG: dict[tuple[int, frozenset[str]], float] = {}
-_PNP_WARM_START_ORDERED_VERTICES: dict[tuple[int, frozenset[str]], dict[int, np.ndarray]] = {}
+_PNP_WARM_START_ORDERED_VERTICES: dict[tuple[int, frozenset[str]], dict[tuple[str, int], np.ndarray]] = {}
+_PNP_PREVIOUS_PLANE_GROUP: dict[int, tuple[str, ...]] = {}
+_PNP_PREVIOUS_TRANSLATION_M: dict[tuple[int, tuple[str, ...]], np.ndarray] = {}
 
 
 # Detection data passed between image processing, drawing, and measurement conversion.
@@ -38,12 +41,9 @@ class ShapeDetection:
 
 
 class Detection:
-    def __init__(
-        self,
-        u: float | None, v: float | None, px_w: float | None, px_h: float | None,
-        shapes: list[ShapeDetection] | None = None,
-        bbox_center_offset_px: tuple[float, float] | np.ndarray | None = None,
-    ):
+    def __init__(self, u: float | None, v: float | None, px_w: float | None, px_h: float | None, shapes: list[ShapeDetection] | None = None,
+                 bbox_center_offset_px: tuple[float, float] | np.ndarray | None = None, plane_ids: tuple[str, ...] | None = None,
+                 shape_marker_keys: list[tuple[str, int]] | None = None):
         """
         u, v are the detected object's center in image pixels.
 
@@ -58,6 +58,8 @@ class Detection:
         self.px_w = px_w
         self.px_h = px_h
         self.shapes = shapes if shapes is not None else []
+        self.plane_ids = None if plane_ids is None else tuple(plane_ids)
+        self.shape_marker_keys = None if shape_marker_keys is None else list(shape_marker_keys)
 
         if bbox_center_offset_px is None:
             self.bbox_center_offset_px = None
@@ -1699,7 +1701,7 @@ def findSingleObjectUsingBestShapeGroup(
         if not shape_candidates:
             cv2.putText(candidate_debug_frame, "No accepted shapes", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
 
-        debug.addStage("Accepted shape candidates", candidate_debug_frame)
+        debug.addStage("All raw shape candidates (pre-plane selection)", candidate_debug_frame)
 
     if not shape_candidates:
         if profile_shape_detection:
@@ -1733,29 +1735,9 @@ def findSingleObjectUsingBestShapeGroup(
         return None
 
     grouping_start = time.perf_counter() if profile_shape_detection else None
-    shape_groups = groupShapeCandidates(shape_candidates, object_vision_spec)
+    selected_group = selectBestPlaneShapeGroup(shape_candidates, object_vision_spec)
 
-    if debug is not None:
-        group_debug_frame = frame.copy()
-
-        for group_index, shape_group in enumerate(shape_groups):
-            all_group_vertices = np.concatenate([shape.vertices_px for shape in shape_group], axis=0)
-
-            for shape in shape_group:
-                draw_bgr = COLOR_SPECS[shape.color_id].draw_bgr
-                shape_points = np.round(shape.vertices_px).astype(np.int32).reshape(-1, 1, 2)
-                cv2.polylines(group_debug_frame, [shape_points], True, draw_bgr, 1)
-
-            bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(all_group_vertices.astype(np.float32))
-            cv2.rectangle(group_debug_frame, (bbox_x, bbox_y), (bbox_x + bbox_w, bbox_y + bbox_h), (255, 255, 255), 2)
-            cv2.putText(group_debug_frame, f"G{group_index}: {len(shape_group)}/{len(polygon_markers)} markers", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-
-        if not shape_groups:
-            cv2.putText(group_debug_frame, "No groups matched shape_markers", (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
-
-        debug.addStage("Matching shape groups", group_debug_frame)
-
-    if not shape_groups:
+    if selected_group is None:
         if profile_shape_detection:
             timing_total_s = time.perf_counter() - timing_start
             timing_grouping_s = time.perf_counter() - grouping_start
@@ -1774,50 +1756,40 @@ def findSingleObjectUsingBestShapeGroup(
                     "2D component contours": timing_contour_s,
                     "2D polygon + refinement": timing_polygon_refine_s,
                     "2D HSV + polygons": timing_hsv_polygon_seconds,
-                    "2D grouping + selection": timing_grouping_s,
+                    "2D plane selection": timing_grouping_s,
                     "2D detection total": timing_total_s,
                 })
-            if PRINT_SHAPE_DETECTION_TIMING:
-                print(
-                    f"shape timing: model={timing_model_setup_s*1000.0:.1f} ms | resize+blur={timing_resize_blur_s*1000.0:.1f} ms | "
-                    f"LABprep={timing_lab_prep_s*1000.0:.1f} ms | HSVconv={timing_hsv_conversion_s*1000.0:.1f} ms | "
-                    f"LAB={timing_lab_seconds*1000.0:.1f} ms | HSV+polygon={timing_hsv_polygon_seconds*1000.0:.1f} ms | "
-                    f"grouping={timing_grouping_s*1000.0:.1f} ms | total={timing_total_s*1000.0:.1f} ms (no groups)"
-                )
         if debug is not None:
             debug.updateTimingStage()
         return None
 
-    best_shape_group = selectBestShapeGroup(shape_groups, object_vision_spec)
-
-    if debug is not None:
-        best_group_debug_frame = frame.copy()
-        all_best_vertices = np.concatenate([shape.vertices_px for shape in best_shape_group], axis=0)
-
-        for shape in best_shape_group:
-            draw_bgr = COLOR_SPECS[shape.color_id].draw_bgr
-            shape_points = np.round(shape.vertices_px).astype(np.int32).reshape(-1, 1, 2)
-            cv2.polylines(best_group_debug_frame, [shape_points], True, draw_bgr, 1)
-
-        bbox_x, bbox_y, bbox_w, bbox_h = cv2.boundingRect(all_best_vertices.astype(np.float32))
-        cv2.rectangle(best_group_debug_frame, (bbox_x, bbox_y), (bbox_x + bbox_w, bbox_y + bbox_h), (0, 255, 0), 2)
-        cv2.putText(best_group_debug_frame, f"Selected best group: {len(best_shape_group)}/{len(polygon_markers)} markers", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
-        debug.addStage("Selected best shape group", best_group_debug_frame)
-
+    best_shape_group, selected_plane_ids, selected_marker_keys = selected_group
     all_best_vertices = np.concatenate([shape.vertices_px for shape in best_shape_group], axis=0)
     bbox_x, bbox_y, px_w, px_h = cv2.boundingRect(all_best_vertices.astype(np.float32))
     detection = Detection(
-        u=bbox_x + px_w/2.0, v=bbox_y + px_h/2.0,
-        px_w=float(px_w), px_h=float(px_h), shapes=best_shape_group,
+        u=bbox_x + px_w/2.0, v=bbox_y + px_h/2.0, px_w=float(px_w), px_h=float(px_h),
+        shapes=best_shape_group, plane_ids=selected_plane_ids, shape_marker_keys=selected_marker_keys,
     )
 
     if debug is not None:
+        selected_debug_frame = frame.copy()
+        for shape in best_shape_group:
+            draw_bgr = COLOR_SPECS[shape.color_id].draw_bgr
+            shape_points = np.round(shape.vertices_px).astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(selected_debug_frame, [shape_points], True, draw_bgr, 2)
+        cv2.rectangle(
+            selected_debug_frame, (bbox_x, bbox_y), (bbox_x + px_w, bbox_y + px_h), (0, 255, 0), 2,
+        )
+        selection_mode = "HINGE" if len(selected_plane_ids) == 2 else "SINGLE-PLANE FALLBACK"
+        cv2.putText(
+            selected_debug_frame,
+            f"{selection_mode}: planes={'+'.join(selected_plane_ids)} | markers={len(best_shape_group)}",
+            (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA,
+        )
+        debug.addStage("Selected best two planes / single-plane fallback", selected_debug_frame)
+
         final_debug_frame = frame.copy()
-        bbox_x, bbox_y = int(round(detection.u - detection.px_w/2.0)), int(round(detection.v - detection.px_h/2.0))
-        bbox_x_2, bbox_y_2 = int(round(detection.u + detection.px_w/2.0)), int(round(detection.v + detection.px_h/2.0))
-        cv2.rectangle(final_debug_frame, (bbox_x, bbox_y), (bbox_x_2, bbox_y_2), (0, 0, 255), 2)
-        cv2.circle(final_debug_frame, (int(round(detection.u)), int(round(detection.v))), 5, (0, 0, 255), -1)
-        cv2.putText(final_debug_frame, f"u={detection.u:.1f}, v={detection.v:.1f}, w={detection.px_w:.1f}, h={detection.px_h:.1f}", (bbox_x, max(20, bbox_y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2, cv2.LINE_AA)
+        drawDetection(final_debug_frame, detection)
         debug.addStage("Final object detection", final_debug_frame)
 
     if profile_shape_detection:
@@ -1825,28 +1797,27 @@ def findSingleObjectUsingBestShapeGroup(
         timing_grouping_s = time.perf_counter() - grouping_start
         if _timing_profile is not None:
             _timing_profile.update({
-                    "2D model bookkeeping": timing_model_setup_s,
-                    "2D resize + blur": timing_resize_blur_s,
-                    "2D LAB prep + chroma norm": timing_lab_prep_s,
-                    "2D HSV conversion": timing_hsv_conversion_s,
-                    "2D frame setup": timing_frame_setup_s,
-                    "2D LAB acquisition": timing_lab_seconds,
-                    "2D HSV threshold (ROI)": timing_hsv_threshold_s,
-                    "2D HSV cleanup (ROI)": timing_hsv_cleanup_s,
-                    "2D HSV components (ROI)": timing_hsv_components_s,
-                    "2D HSV hotspot association": timing_hsv_association_s,
-                    "2D component contours": timing_contour_s,
-                    "2D polygon + refinement": timing_polygon_refine_s,
-                    "2D HSV + polygons": timing_hsv_polygon_seconds,
-                "2D grouping + selection": timing_grouping_s,
+                "2D model bookkeeping": timing_model_setup_s,
+                "2D resize + blur": timing_resize_blur_s,
+                "2D LAB prep + chroma norm": timing_lab_prep_s,
+                "2D HSV conversion": timing_hsv_conversion_s,
+                "2D frame setup": timing_frame_setup_s,
+                "2D LAB acquisition": timing_lab_seconds,
+                "2D HSV threshold (ROI)": timing_hsv_threshold_s,
+                "2D HSV cleanup (ROI)": timing_hsv_cleanup_s,
+                "2D HSV components (ROI)": timing_hsv_components_s,
+                "2D HSV hotspot association": timing_hsv_association_s,
+                "2D component contours": timing_contour_s,
+                "2D polygon + refinement": timing_polygon_refine_s,
+                "2D HSV + polygons": timing_hsv_polygon_seconds,
+                "2D plane selection": timing_grouping_s,
                 "2D detection total": timing_total_s,
             })
         if PRINT_SHAPE_DETECTION_TIMING:
             print(
-                f"shape timing: model={timing_model_setup_s*1000.0:.1f} ms | resize+blur={timing_resize_blur_s*1000.0:.1f} ms | "
-                f"LABprep={timing_lab_prep_s*1000.0:.1f} ms | HSVconv={timing_hsv_conversion_s*1000.0:.1f} ms | "
-                f"LAB={timing_lab_seconds*1000.0:.1f} ms | HSV+polygon={timing_hsv_polygon_seconds*1000.0:.1f} ms | "
-                f"grouping+select={timing_grouping_s*1000.0:.1f} ms | total={timing_total_s*1000.0:.1f} ms"
+                f"shape timing: LAB={timing_lab_seconds*1000.0:.1f} ms | "
+                f"HSV+polygon={timing_hsv_polygon_seconds*1000.0:.1f} ms | "
+                f"plane-select={timing_grouping_s*1000.0:.1f} ms | total={timing_total_s*1000.0:.1f} ms"
             )
 
     if debug is not None:
@@ -1856,749 +1827,446 @@ def findSingleObjectUsingBestShapeGroup(
     return detection
 
 
-# Shape grouping and selection helpers.
-def groupShapeCandidates(shape_candidates: list[ShapeDetection], object_vision_spec: ObjectVisionSpec) -> list[list[ShapeDetection]]:
-    polygon_markers = [marker for marker in object_vision_spec.shape_markers if marker.num_sides != 0]
-    required_marker_counts = Counter((marker.color_id, marker.num_sides) for marker in polygon_markers)
-    maximum_group_size = min(len(shape_candidates), len(polygon_markers))
-
-    marker_minimum_areas: dict[tuple[ColorId, int], list[float]] = {}
-    marker_order: dict[tuple[ColorId, int], int] = {}
-
-    for marker_index, marker in enumerate(polygon_markers):
-        marker_key = (marker.color_id, marker.num_sides)
-        minimum_area = marker.minimum_contour_area_px if marker.minimum_contour_area_px is not None else object_vision_spec.minimum_contour_area_px
-        marker_minimum_areas.setdefault(marker_key, []).append(minimum_area)
-        marker_order.setdefault(marker_key, marker_index)
-
-    for minimum_areas in marker_minimum_areas.values():
-        minimum_areas.sort()
-
-    # Prefer the largest valid group, then fall back to partial groups.
-    for group_size in range(maximum_group_size, 0, -1):
-        shape_groups: list[list[ShapeDetection]] = []
-
-        for shape_combination in combinations(shape_candidates, group_size):
-            shape_group = list(shape_combination)
-            group_marker_counts = Counter((shape.color_id, shape.num_sides) for shape in shape_group)
-
-            if any(count > required_marker_counts[marker_key] for marker_key, count in group_marker_counts.items()):
-                continue
-
-            connected_indices, pending_indices = {0}, [0]
-
-            while pending_indices:
-                current_index = pending_indices.pop()
-
-                for candidate_index in range(group_size):
-                    if candidate_index in connected_indices:
-                        continue
-
-                    if shapeCandidatesAreNear(shape_group[current_index], shape_group[candidate_index], object_vision_spec.shape_group_distance_factor):
-                        connected_indices.add(candidate_index)
-                        pending_indices.append(candidate_index)
-
-            if len(connected_indices) != group_size:
-                continue
-
-            valid_group = True
-
-            for marker_key, marker_count in group_marker_counts.items():
-                color_id, num_sides = marker_key
-                shape_areas = sorted(
-                    cv2.contourArea(shape.vertices_px.astype(np.float32))
-                    for shape in shape_group if shape.color_id == color_id and shape.num_sides == num_sides
-                )
-                minimum_areas = marker_minimum_areas[marker_key][:marker_count]
-
-                if any(shape_area < minimum_area for shape_area, minimum_area in zip(shape_areas, minimum_areas)):
-                    valid_group = False
-                    break
-
-            if not valid_group:
-                continue
-
-            shape_group.sort(key=lambda shape: (
-                marker_order[(shape.color_id, shape.num_sides)],
-                float(np.mean(shape.vertices_px[:, 0])), float(np.mean(shape.vertices_px[:, 1])),
-            ))
-            shape_groups.append(shape_group)
-
-        if shape_groups:
-            return shape_groups
-
-    return []
-
-
-def shapeCandidatesAreNear(shape_1: ShapeDetection, shape_2: ShapeDetection, distance_factor: float) -> bool:
-    center_1, center_2 = np.mean(shape_1.vertices_px, axis=0), np.mean(shape_2.vertices_px, axis=0)
-    _, _, width_1, height_1 = cv2.boundingRect(shape_1.vertices_px.astype(np.float32))
-    _, _, width_2, height_2 = cv2.boundingRect(shape_2.vertices_px.astype(np.float32))
-    reference_size = max(np.hypot(width_1, height_1), np.hypot(width_2, height_2))
-    return np.linalg.norm(center_1 - center_2) <= distance_factor*reference_size
-
-
-def selectBestShapeGroup(
-    shape_groups: list[list[ShapeDetection]], object_vision_spec: ObjectVisionSpec,
-    marker_count_weight: float = 0.80, compactness_weight: float = 0.15, area_weight: float = 0.05,
-) -> list[ShapeDetection] | None:
-    # TODO: Perhaps use marker object_vertices_m to reward groups matching the expected physical marker layout.
-    if not shape_groups:
+# Compare one detected polygon with one physical marker. None means incompatible.
+def getShapeMarkerError(shape: ShapeDetection, marker: ShapeMarkerSpec, minimum_area_px: float | None) -> float | None:
+    if shape.color_id != marker.color_id or shape.num_sides != marker.num_sides or shape.vertices_px is None or marker.object_vertices_m is None:
         return None
-
-    polygon_marker_count = sum(marker.num_sides != 0 for marker in object_vision_spec.shape_markers)
-    maximum_average_area = max(
-        sum(cv2.contourArea(shape.vertices_px.astype(np.float32)) for shape in group)/len(group)
-        for group in shape_groups
+    image_vertices = np.asarray(shape.vertices_px, dtype=np.float64)
+    if image_vertices.shape != (shape.num_sides, 2) or not np.all(np.isfinite(image_vertices)):
+        return None
+    if minimum_area_px is not None and cv2.contourArea(image_vertices.astype(np.float32)) < minimum_area_px:
+        return None
+    marker_vertices = np.asarray(marker.object_vertices_m, dtype=np.float64)
+    if marker_vertices.shape != (marker.num_sides, 2) or not np.all(np.isfinite(marker_vertices)):
+        return None
+    image_edges = np.linalg.norm(image_vertices - np.roll(image_vertices, -1, axis=0), axis=1)
+    marker_edges = np.linalg.norm(marker_vertices - np.roll(marker_vertices, -1, axis=0), axis=1)
+    image_norm, marker_norm = np.linalg.norm(image_edges), np.linalg.norm(marker_edges)
+    if image_norm <= 1e-12 or marker_norm <= 1e-12:
+        return None
+    image_edges, marker_edges = image_edges/image_norm, marker_edges/marker_norm
+    reversed_edges = image_edges[::-1]
+    return min(
+        min(float(np.linalg.norm(np.roll(image_edges, shift) - marker_edges)) for shift in range(marker.num_sides)),
+        min(float(np.linalg.norm(np.roll(reversed_edges, shift) - marker_edges)) for shift in range(marker.num_sides)),
     )
-    best_group = None
-    best_score = float("-inf")
-
-    for group in shape_groups:
-        marker_count_score = len(group)/polygon_marker_count
-        maximum_normalized_distance = 0.0
-
-        for i, shape_1 in enumerate(group):
-            for shape_2 in group[i + 1:]:
-                center_1, center_2 = np.mean(shape_1.vertices_px, axis=0), np.mean(shape_2.vertices_px, axis=0)
-                size_1 = np.max(np.linalg.norm(shape_1.vertices_px[:, None] - shape_1.vertices_px[None, :], axis=2))
-                size_2 = np.max(np.linalg.norm(shape_2.vertices_px[:, None] - shape_2.vertices_px[None, :], axis=2))
-                normalized_distance = np.linalg.norm(center_1 - center_2)/max((size_1 + size_2)/2.0, 1e-6)
-                maximum_normalized_distance = max(maximum_normalized_distance, normalized_distance)
-
-        compactness_score = (
-            max(0.0, 1.0 - maximum_normalized_distance/object_vision_spec.shape_group_distance_factor)
-            if len(group) > 1 else 0.0
-        )
-        average_area = sum(cv2.contourArea(shape.vertices_px.astype(np.float32)) for shape in group)/len(group)
-        area_score = average_area/maximum_average_area if maximum_average_area > 0.0 else 0.0
-        score = marker_count_weight*marker_count_score + compactness_weight*compactness_score + area_weight*area_score
-
-        if score > best_score:
-            best_group, best_score = group, score
-
-    return best_group
 
 
-# Convert the selected image-space shape group into a camera-frame measurement.
-def createMeasurementUsingShapeGroup(
-    detection: Detection, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration,
-    _timing_warmup: bool = False,
-) -> Measurement:
-    failed_measurement = Measurement(None, None, None, None, None, None,)
-    measurement_debug = None if _timing_warmup else getattr(detection, "_debug", None)
+def findBestShapeMarkerAssignment(shape_candidates: list[ShapeDetection], marker_entries: list[tuple[str, int, ShapeMarkerSpec, float | None]],
+                                  required_plane_ids: set[str] | None = None) -> tuple[list[tuple[int, int]], float] | None:
+    pair_errors = {}
+    for shape_index, shape in enumerate(shape_candidates):
+        for entry_index, (_, _, marker, minimum_area_px) in enumerate(marker_entries):
+            error = getShapeMarkerError(shape, marker, minimum_area_px)
+            if error is not None:
+                pair_errors[(shape_index, entry_index)] = error
 
-    # Warm the PnP/flex path once before timing it in static-image debug mode.
-    # Normal live calls have no debug object, so there is no extra solve in main.py.
-    if measurement_debug is not None:
-        createMeasurementUsingShapeGroup(
-            detection, object_vision_spec, camera_calibration, _timing_warmup=True,
-        )
-
-    measurement_timing_start = time.perf_counter()
-
-    if not detection.shapes:
-        return failed_measurement
-
-    # Precompute every physical polygon marker in the model. Marker identity is intentionally
-    # plane-level rather than globally unique: different planes may reuse the same color/shape.
-    plane_marker_specs = []
-    marker_counts_by_plane = Counter()
-
-    for rigid_plane in object_vision_spec.rigid_planes:
-        for marker in rigid_plane.shape_markers:
-            if marker.num_sides == 0:
-                continue
-            if marker.object_vertices_m is None:
-                raise ValueError(f"Shape marker {(marker.color_id, marker.num_sides)} has no object_vertices_m")
-
-            marker_vertices_plane_xy_m = np.asarray(marker.object_vertices_m, dtype=np.float64)
-            num_vertices = marker.num_sides
-
-            if marker_vertices_plane_xy_m.shape != (num_vertices, 2):
-                raise ValueError(f"object_vertices_m for {(marker.color_id, marker.num_sides)} must have shape ({num_vertices}, 2)")
-            if not np.all(np.isfinite(marker_vertices_plane_xy_m)):
-                return failed_measurement
-
-            marker_vertices_plane_m = np.column_stack((marker_vertices_plane_xy_m, np.zeros(num_vertices, dtype=np.float64)))
-            marker_vertices_object_m = (rigid_plane.rotation_object_from_plane@marker_vertices_plane_m.T).T + rigid_plane.translation_object_from_plane_m
-
-            edge_pairs = [(i, (i + 1)%num_vertices) for i in range(num_vertices)]
-            object_edge_lengths = np.array([
-                np.linalg.norm(marker_vertices_plane_xy_m[i] - marker_vertices_plane_xy_m[j])
-                for i, j in edge_pairs
-            ])
-            object_shape_norm = np.linalg.norm(object_edge_lengths)
-
-            if object_shape_norm <= 1e-12:
-                raise ValueError(f"object_vertices_m for {(marker.color_id, marker.num_sides)} form a degenerate shape")
-            if not np.all(np.isfinite(marker_vertices_object_m)):
-                return failed_measurement
-
-            plane_marker_specs.append((
-                rigid_plane, marker, marker_vertices_object_m,
-                object_edge_lengths/object_shape_norm,
-            ))
-            marker_counts_by_plane[rigid_plane.plane_id] += 1
-
-    if not plane_marker_specs:
-        return failed_measurement
-
-    # Keep every cyclic/reversed vertex correspondence. 2D edge-length ratios are only
-    # used as a cheap initial ordering; perspective can distort those ratios enough to pick
-    # the wrong vertex mapping, so high-reprojection PnP fits are rescued below by testing
-    # alternate orderings and letting reprojection error decide.
-    marker_matches = {}
-
-    for shape_index, shape in enumerate(detection.shapes):
-        shape_vertices_px = np.asarray(shape.vertices_px, dtype=np.float64)
-
-        if shape_vertices_px.shape != (shape.num_sides, 2) or not np.all(np.isfinite(shape_vertices_px)):
-            return failed_measurement
-
-        for marker_index, (_, marker, _, normalized_object_edge_lengths) in enumerate(plane_marker_specs):
-            if shape.color_id != marker.color_id or shape.num_sides != marker.num_sides:
-                continue
-
-            num_vertices = marker.num_sides
-            edge_pairs = [(i, (i + 1)%num_vertices) for i in range(num_vertices)]
-            orderings = []
-
-            # Polygon vertices arrive in perimeter order, so only cyclic shifts and reversed cyclic shifts are possible.
-            for start_index in range(num_vertices):
-                for direction in (1, -1):
-                    vertex_order = [(start_index + direction*offset)%num_vertices for offset in range(num_vertices)]
-                    ordered_vertices_px = shape_vertices_px[vertex_order]
-                    image_edge_lengths = np.array([
-                        np.linalg.norm(ordered_vertices_px[i] - ordered_vertices_px[j])
-                        for i, j in edge_pairs
-                    ])
-                    image_shape_norm = np.linalg.norm(image_edge_lengths)
-
-                    if image_shape_norm <= 1e-12:
+    for match_count in range(min(len(shape_candidates), len(marker_entries)), 0, -1):
+        best_assignment, best_error = None, float('inf')
+        for shape_indices in combinations(range(len(shape_candidates)), match_count):
+            for entry_indices in combinations(range(len(marker_entries)), match_count):
+                for ordered_entry_indices in permutations(entry_indices):
+                    assignment = list(zip(shape_indices, ordered_entry_indices))
+                    if any(pair not in pair_errors for pair in assignment):
                         continue
+                    represented_planes = {marker_entries[entry_index][0] for _, entry_index in assignment}
+                    if required_plane_ids is not None and not required_plane_ids.issubset(represented_planes):
+                        continue
+                    error = sum(pair_errors[pair] for pair in assignment)
+                    if error < best_error:
+                        best_assignment, best_error = assignment, error
+        if best_assignment is not None:
+            return best_assignment, best_error
+    return None
 
-                    shape_error = float(np.linalg.norm(image_edge_lengths/image_shape_norm - normalized_object_edge_lengths))
-                    orderings.append((ordered_vertices_px, shape_error))
 
-            if orderings:
-                orderings.sort(key=lambda item: item[1])
-                marker_matches[(shape_index, marker_index)] = orderings
+def evaluatePlaneGroups(shape_candidates: list[ShapeDetection], object_vision_spec: ObjectVisionSpec, plane_groups: list[tuple[str, ...]],
+                        require_all_planes: bool) -> tuple[list[ShapeDetection], tuple[str, ...], list[tuple[str, int]]] | None:
+    planes_by_id = {plane.plane_id: plane for plane in object_vision_spec.rigid_planes}
+    previous_plane_group = _PNP_PREVIOUS_PLANE_GROUP.get(id(object_vision_spec))
+    best_result, best_rank = None, None
 
-    if not marker_matches:
-        return failed_measurement
-
-    bbox_diagonal_px = float(np.hypot(
-        0.0 if detection.px_w is None else detection.px_w,
-        0.0 if detection.px_h is None else detection.px_h,
-    ))
-
-    # The same fractional/model error occupies more pixels when the plane is close.
-    # Preserve the original pixel thresholds as minimums so distant detections do not
-    # become more permissive.
-    warm_start_accept_error_px = max(6.0, 0.020*bbox_diagonal_px)
-    warm_start_severe_error_px = max(12.0, 0.040*bbox_diagonal_px)
-    correspondence_rescue_error_px = max(8.0, 0.025*bbox_diagonal_px)
-
-    planes_by_id = {rigid_plane.plane_id: rigid_plane for rigid_plane in object_vision_spec.rigid_planes}
-    marker_indices_by_plane = {
-        plane_id: [
-            marker_index for marker_index, (rigid_plane, _, _, _) in enumerate(plane_marker_specs)
-            if rigid_plane.plane_id == plane_id
-        ]
-        for plane_id in planes_by_id
-    }
-    connections_by_pair = {
-        frozenset((plane_id_1, plane_id_2)): (plane_id_1, plane_id_2, max_rotation_deg)
-        for plane_id_1, plane_id_2, max_rotation_deg in object_vision_spec.rigid_plane_connections
-    }
-
-    # Try each plane independently and each configured hinge pair. If a model has no flexible
-    # connections, also preserve the old behavior of allowing all rigid planes to participate together.
-    candidate_plane_groups = [(plane_id,) for plane_id in planes_by_id]
-    candidate_plane_groups += [(plane_id_1, plane_id_2) for plane_id_1, plane_id_2, _ in object_vision_spec.rigid_plane_connections]
-
-    if not object_vision_spec.rigid_plane_connections and len(planes_by_id) > 1:
-        candidate_plane_groups.append(tuple(planes_by_id))
-
-    pnp_setup_seconds = time.perf_counter() - measurement_timing_start
-    pnp_assignment_seconds = 0.0
-    pnp_warm_start_seconds = 0.0
-    pnp_full_search_seconds = 0.0
-    pnp_rescue_seconds = 0.0
-
-    best_result = None
-    best_rank = None
-
-    for plane_group in candidate_plane_groups:
-        assignment_timing_start = time.perf_counter()
-        group_marker_indices = [marker_index for plane_id in plane_group for marker_index in marker_indices_by_plane[plane_id]]
-        if not group_marker_indices:
-            continue
-
-        # Find the largest one-to-one assignment between detected shapes and the marker multiset
-        # on this plane/group. Partial marker visibility is allowed, but only after larger matches fail.
-        best_assignment, best_assignment_shape_error = None, float("inf")
-        maximum_match_count = min(len(detection.shapes), len(group_marker_indices))
-
-        for match_count in range(maximum_match_count, 0, -1):
-            for shape_indices in combinations(range(len(detection.shapes)), match_count):
-                for selected_marker_indices in combinations(group_marker_indices, match_count):
-                    for ordered_marker_indices in permutations(selected_marker_indices):
-                        assignment = list(zip(shape_indices, ordered_marker_indices))
-
-                        if any(pair not in marker_matches for pair in assignment):
-                            continue
-
-                        represented_plane_ids = {
-                            plane_marker_specs[marker_index][0].plane_id
-                            for _, marker_index in assignment
-                        }
-
-                        # A hinge candidate only counts as a two-plane observation if both sides are actually represented.
-                        if len(plane_group) == 2 and len(represented_plane_ids) != 2:
-                            continue
-
-                        total_shape_error = sum(marker_matches[pair][0][1] for pair in assignment)
-                        if total_shape_error < best_assignment_shape_error:
-                            best_assignment = assignment
-                            best_assignment_shape_error = total_shape_error
-
-            if best_assignment is not None:
-                break
-
-        pnp_assignment_seconds += time.perf_counter() - assignment_timing_start
-
-        if best_assignment is None:
-            continue
-
-        matched_counts_by_plane = Counter(
-            plane_marker_specs[marker_index][0].plane_id
-            for _, marker_index in best_assignment
-        )
-        matched_count = len(best_assignment)
-        represented_plane_count = len(matched_counts_by_plane)
-        full_plane_count = sum(
-            matched_counts_by_plane[plane_id] == marker_counts_by_plane[plane_id]
-            for plane_id in matched_counts_by_plane
-        )
-        total_group_marker_count = sum(marker_counts_by_plane[plane_id] for plane_id in plane_group)
-        marker_coverage = matched_count/max(total_group_marker_count, 1)
-        mean_shape_error = best_assignment_shape_error/matched_count
-
-        connection = connections_by_pair.get(frozenset(plane_group)) if len(plane_group) == 2 else None
-        hinge_point = hinge_direction = None
-        coarse_angles_deg = np.array([0.0])
-        warm_start_key = None
-        warm_start_angle_deg = None
-        warm_start_ordered_vertices_by_marker: dict[int, np.ndarray] = {}
-
-        if connection is not None:
-            plane_id_1, plane_id_2, max_rotation_deg = connection
-            hinge_point, hinge_direction = getRigidPlaneIntersection(planes_by_id[plane_id_1], planes_by_id[plane_id_2])
-            coarse_angles_deg = (
-                np.linspace(-max_rotation_deg, max_rotation_deg, 7)
-                if max_rotation_deg > 0.0 else np.array([0.0])
-            )
-            warm_start_key = (id(object_vision_spec), frozenset((plane_id_1, plane_id_2)))
-            warm_start_angle_deg = _PNP_WARM_START_ANGLES_DEG.get(warm_start_key)
-            warm_start_ordered_vertices_by_marker = _PNP_WARM_START_ORDERED_VERTICES.get(warm_start_key, {})
-
-        def evaluateFlexAngle(
-            flex_angle_deg: float, correspondence_indices: dict[tuple[int, int], int] | None = None,
-            pnp_flag: int = cv2.SOLVEPNP_SQPNP,
-        ) -> tuple[np.ndarray | None, float]:
-            object_point_groups, image_point_groups = [], []
-            rotation_1 = rotation_2 = None
-
-            if connection is not None:
-                half_angle_rad = np.deg2rad(flex_angle_deg/2.0)
-                rotation_1, _ = cv2.Rodrigues(-half_angle_rad*hinge_direction)
-                rotation_2, _ = cv2.Rodrigues(+half_angle_rad*hinge_direction)
-
-            for shape_index, marker_index in best_assignment:
-                rigid_plane, _, nominal_object_points, _ = plane_marker_specs[marker_index]
-                object_points = nominal_object_points
-
-                if connection is not None:
-                    if rigid_plane.plane_id == plane_id_1:
-                        object_points = (rotation_1@(object_points - hinge_point).T).T + hinge_point
-                    elif rigid_plane.plane_id == plane_id_2:
-                        object_points = (rotation_2@(object_points - hinge_point).T).T + hinge_point
-
-                pair = (shape_index, marker_index)
-                correspondence_index = 0 if correspondence_indices is None else correspondence_indices.get(pair, 0)
-                object_point_groups.append(object_points)
-                image_point_groups.append(marker_matches[pair][correspondence_index][0])
-
-            object_points = np.concatenate(object_point_groups, axis=0)
-            image_points = np.concatenate(image_point_groups, axis=0)
-
-            # EPNP is used only as a fast ranking pass during correspondence rescue.
-            # The final pose/flex result is always recomputed with SQPNP.
-            if pnp_flag == cv2.SOLVEPNP_EPNP:
-                if len(object_points) < 4:
-                    return None, float("inf")
-                success, rotation_vector, translation_vector = cv2.solvePnP(
-                    object_points, image_points, camera_calibration.camera_matrix,
-                    camera_calibration.distortion_coefficients, flags=pnp_flag,
-                )
-                if not success:
-                    return None, float("inf")
-                rotation_vectors, translation_vectors = [rotation_vector], [translation_vector]
-            else:
-                solution_count, rotation_vectors, translation_vectors, _ = cv2.solvePnPGeneric(
-                    object_points, image_points,
-                    camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
-                    flags=pnp_flag,
-                )
-                if not solution_count:
-                    return None, float("inf")
-
-            best_translation, best_reprojection_error = None, float("inf")
-
-            for rotation_vector, translation_vector in zip(rotation_vectors, translation_vectors):
-                rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-                camera_points = (rotation_matrix@object_points.T + translation_vector.reshape(3, 1)).T
-
-                if np.any(camera_points[:, 2] <= 0.0):
-                    continue
-
-                projected_points, _ = cv2.projectPoints(
-                    object_points, rotation_vector, translation_vector,
-                    camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
-                )
-                reprojection_error = float(np.sqrt(np.mean(np.sum(
-                    (projected_points.reshape(-1, 2) - image_points)**2, axis=1,
-                ))))
-
-                if reprojection_error < best_reprojection_error:
-                    best_translation = translation_vector.reshape(3)
-                    best_reprojection_error = reprojection_error
-
-            return best_translation, best_reprojection_error
-
-        # Reuse the previous frame's successful physical-vertex ordering. Candidate
-        # ordering *indices* are not stable because marker_matches is sorted by this
-        # frame's edge-ratio score, so compare normalized ordered polygon geometry instead.
-        # Centering/scaling removes image translation and range changes; over one video
-        # frame the remaining rotation/perspective change should be small.
-        correspondence_indices = {}
-
-        for pair in best_assignment:
-            _, marker_index = pair
-            previous_vertices = warm_start_ordered_vertices_by_marker.get(marker_index)
-
-            if previous_vertices is None:
-                correspondence_indices[pair] = 0
+    for plane_group in plane_groups:
+        marker_entries = []
+        for plane_id in plane_group:
+            plane = planes_by_id.get(plane_id)
+            if plane is None:
                 continue
-
-            best_temporal_index, best_temporal_error = 0, float("inf")
-
-            for ordering_index, (ordered_vertices_px, _) in enumerate(marker_matches[pair]):
-                centered_vertices = ordered_vertices_px - np.mean(ordered_vertices_px, axis=0)
-                vertex_scale = float(np.sqrt(np.mean(np.sum(centered_vertices*centered_vertices, axis=1))))
-
-                if vertex_scale <= 1e-12:
+            for marker_index, marker in enumerate(plane.shape_markers):
+                if marker.num_sides == 0:
                     continue
+                minimum_area = marker.minimum_contour_area_px if marker.minimum_contour_area_px is not None else object_vision_spec.minimum_contour_area_px
+                marker_entries.append((plane_id, marker_index, marker, minimum_area))
+        if not marker_entries:
+            continue
 
-                normalized_vertices = centered_vertices/vertex_scale
-                temporal_error = float(np.sqrt(np.mean(np.sum(
-                    (normalized_vertices - previous_vertices)**2, axis=1,
-                ))))
+        assignment_result = findBestShapeMarkerAssignment(shape_candidates, marker_entries, set(plane_group) if require_all_planes else None)
+        if assignment_result is None:
+            continue
+        assignment, assignment_error = assignment_result
+        matched_counts = Counter(marker_entries[entry_index][0] for _, entry_index in assignment)
+        marker_counts = Counter(plane_id for plane_id, _, _, _ in marker_entries)
+        matched_count = len(assignment)
+        full_plane_count = sum(matched_counts[plane_id] == marker_counts[plane_id] for plane_id in matched_counts)
+        coverage = matched_count/max(len(marker_entries), 1)
+        previous_bonus = int(previous_plane_group is not None and frozenset(plane_group) == frozenset(previous_plane_group))
+        rank = (matched_count, full_plane_count, coverage, previous_bonus, -assignment_error/matched_count)
+        if best_rank is not None and rank <= best_rank:
+            continue
 
-                if temporal_error < best_temporal_error:
-                    best_temporal_index = ordering_index
-                    best_temporal_error = temporal_error
+        selected_shapes = [shape_candidates[shape_index] for shape_index, _ in assignment]
+        selected_marker_keys = [(marker_entries[entry_index][0], marker_entries[entry_index][1]) for _, entry_index in assignment]
+        best_result, best_rank = (selected_shapes, tuple(plane_group), selected_marker_keys), rank
 
-            correspondence_indices[pair] = best_temporal_index
+    return best_result
 
-        def searchFlexAngles(search_angles_deg: np.ndarray) -> tuple[np.ndarray | None, float, float]:
-            best_translation_local, best_error_local, best_angle_local = None, float("inf"), 0.0
 
-            for flex_angle_deg in search_angles_deg:
-                translation, reprojection_error = evaluateFlexAngle(float(flex_angle_deg), correspondence_indices)
-                if reprojection_error < best_error_local:
-                    best_translation_local = translation
-                    best_error_local = reprojection_error
-                    best_angle_local = float(flex_angle_deg)
+def selectBestPlaneShapeGroup(shape_candidates: list[ShapeDetection], object_vision_spec: ObjectVisionSpec) -> tuple[list[ShapeDetection], tuple[str, ...], list[tuple[str, int]]] | None:
+    plane_ids = [plane.plane_id for plane in object_vision_spec.rigid_planes]
+    plane_id_set = set(plane_ids)
+    hinge_groups = [(p1, p2) for p1, p2, _ in object_vision_spec.rigid_plane_connections if p1 in plane_id_set and p2 in plane_id_set]
+    result = evaluatePlaneGroups(shape_candidates, object_vision_spec, hinge_groups, require_all_planes=True)
+    if result is not None:
+        return result
+    return evaluatePlaneGroups(shape_candidates, object_vision_spec, [(plane_id,) for plane_id in plane_ids], require_all_planes=False)
 
-            return best_translation_local, best_error_local, best_angle_local
 
-        def searchFullFlex() -> tuple[np.ndarray | None, float, float]:
-            best_translation_local, best_error_local, best_angle_local = searchFlexAngles(coarse_angles_deg)
+# Build the exact physical marker data selected in 2D. PnP never reselects planes, hinges, or marker identities.
+def buildSelectedPnPMarkers(detection: Detection, object_vision_spec: ObjectVisionSpec) -> list[tuple] | None:
+    if not detection.shapes or not detection.plane_ids or len(detection.plane_ids) > 2 or detection.shape_marker_keys is None:
+        return None
+    if len(detection.shapes) != len(detection.shape_marker_keys):
+        return None
+    planes_by_id = {plane.plane_id: plane for plane in object_vision_spec.rigid_planes}
+    selected_plane_ids = set(detection.plane_ids)
+    markers = []
 
-            if connection is not None and max_rotation_deg > 0.0 and best_translation_local is not None:
-                coarse_step_deg = 2.0*max_rotation_deg/6.0
-                fine_min = max(-max_rotation_deg, best_angle_local - coarse_step_deg)
-                fine_max = min(+max_rotation_deg, best_angle_local + coarse_step_deg)
-                fine_angles_deg = np.unique(np.concatenate((
-                    np.arange(fine_min, fine_max + 0.5, 1.0),
-                    np.array([fine_min, best_angle_local, fine_max]),
-                )))
-                fine_translation, fine_error, fine_angle = searchFlexAngles(fine_angles_deg)
+    for shape, (plane_id, marker_index) in zip(detection.shapes, detection.shape_marker_keys):
+        plane = planes_by_id.get(plane_id)
+        if plane is None or plane_id not in selected_plane_ids or marker_index < 0 or marker_index >= len(plane.shape_markers):
+            return None
+        marker = plane.shape_markers[marker_index]
+        if marker.num_sides == 0 or marker.object_vertices_m is None or shape.color_id != marker.color_id or shape.num_sides != marker.num_sides:
+            return None
+        vertices_xy = np.asarray(marker.object_vertices_m, dtype=np.float64)
+        if vertices_xy.shape != (marker.num_sides, 2) or not np.all(np.isfinite(vertices_xy)):
+            return None
+        vertices_plane = np.column_stack((vertices_xy, np.zeros(marker.num_sides, dtype=np.float64)))
+        object_points = (plane.rotation_object_from_plane@vertices_plane.T).T + plane.translation_object_from_plane_m
+        edge_lengths = np.linalg.norm(vertices_xy - np.roll(vertices_xy, -1, axis=0), axis=1)
+        edge_norm = np.linalg.norm(edge_lengths)
+        if edge_norm <= 1e-12 or not np.all(np.isfinite(object_points)):
+            return None
+        markers.append((shape, plane_id, marker_index, marker, object_points, edge_lengths/edge_norm))
+    return markers
 
-                if fine_translation is not None and fine_error < best_error_local:
-                    best_translation_local, best_error_local, best_angle_local = fine_translation, fine_error, fine_angle
 
-            return best_translation_local, best_error_local, best_angle_local
+def getVertexOrderings(shape: ShapeDetection, normalized_object_edges: np.ndarray) -> list[tuple[np.ndarray, float]]:
+    vertices = np.asarray(shape.vertices_px, dtype=np.float64)
+    if vertices.shape != (shape.num_sides, 2) or not np.all(np.isfinite(vertices)):
+        return []
+    orderings = []
+    for start in range(shape.num_sides):
+        for direction in (1, -1):
+            order = [(start + direction*offset)%shape.num_sides for offset in range(shape.num_sides)]
+            ordered = vertices[order]
+            image_edges = np.linalg.norm(ordered - np.roll(ordered, -1, axis=0), axis=1)
+            image_norm = np.linalg.norm(image_edges)
+            if image_norm > 1e-12:
+                orderings.append((ordered, float(np.linalg.norm(image_edges/image_norm - normalized_object_edges))))
+    orderings.sort(key=lambda item: item[1])
+    return orderings
 
-        # Most consecutive video frames should have almost the same fold angle. Try only a
-        # +/-2 degree neighborhood around the previous good solution first. A poor local fit
-        # immediately falls back to the original coarse + fine search, so this does not restrict
-        # how quickly the physical hinge is allowed to move.
-        WARM_START_RADIUS_DEG = 2.0
 
-        best_translation, best_reprojection_error, best_flex_angle_deg = None, float("inf"), 0.0
-        accepted_warm_solution = False
+def normalizeOrderedVertices(vertices_px: np.ndarray) -> np.ndarray | None:
+    centered = vertices_px - np.mean(vertices_px, axis=0)
+    scale = float(np.sqrt(np.mean(np.sum(centered*centered, axis=1))))
+    return None if scale <= 1e-12 else centered/scale
 
-        if connection is not None and warm_start_angle_deg is not None and max_rotation_deg > 0.0:
-            warm_min_deg = max(-max_rotation_deg, warm_start_angle_deg - WARM_START_RADIUS_DEG)
-            warm_max_deg = min(+max_rotation_deg, warm_start_angle_deg + WARM_START_RADIUS_DEG)
-            warm_angles_deg = np.arange(warm_min_deg, warm_max_deg + 0.5, 1.0)
-            warm_angles_deg = np.unique(np.append(
-                warm_angles_deg,
-                np.clip(warm_start_angle_deg, -max_rotation_deg, max_rotation_deg),
-            ))
 
-            warm_start_timing_start = time.perf_counter()
-            best_translation, best_reprojection_error, best_flex_angle_deg = searchFlexAngles(warm_angles_deg)
-            pnp_warm_start_seconds += time.perf_counter() - warm_start_timing_start
+def chooseInitialCorrespondences(pnp_markers: list[tuple], marker_matches: list[list[tuple[np.ndarray, float]]], cached_vertices: dict[tuple[str, int], np.ndarray]) -> list[int]:
+    indices = []
+    for marker_data, orderings in zip(pnp_markers, marker_matches):
+        marker_key = (marker_data[1], marker_data[2])
+        previous_vertices = cached_vertices.get(marker_key)
+        if previous_vertices is None:
+            indices.append(0)
+            continue
+        best_index, best_error = 0, float('inf')
+        for index, (ordered_vertices, _) in enumerate(orderings):
+            normalized = normalizeOrderedVertices(ordered_vertices)
+            if normalized is None:
+                continue
+            error = float(np.sqrt(np.mean(np.sum((normalized - previous_vertices)**2, axis=1))))
+            if error < best_error:
+                best_index, best_error = index, error
+        indices.append(best_index)
+    return indices
 
-            # A blurry frame can have a higher absolute reprojection error even when the
-            # local hinge minimum is still obvious. Expand to the full search only when:
-            #   1) no local solution exists,
-            #   2) the best angle sits on a local-window edge with unexplored hinge range
-            #      beyond that edge, or
-            #   3) the local fit is genuinely terrible.
-            EDGE_TOLERANCE_DEG = 0.51
-            best_at_expandable_lower_edge = (
-                abs(best_flex_angle_deg - warm_min_deg) <= EDGE_TOLERANCE_DEG
-                and warm_min_deg > -max_rotation_deg + 1e-9
-            )
-            best_at_expandable_upper_edge = (
-                abs(best_flex_angle_deg - warm_max_deg) <= EDGE_TOLERANCE_DEG
-                and warm_max_deg < +max_rotation_deg - 1e-9
-            )
-            warm_needs_full_search = (
-                best_translation is None
-                or best_at_expandable_lower_edge
-                or best_at_expandable_upper_edge
-                or best_reprojection_error > warm_start_severe_error_px
-            )
 
-            accepted_warm_solution = not warm_needs_full_search
+def getFlexedObjectPoints(pnp_markers: list[tuple], flex_angle_deg: float, connection: tuple[str, str, float] | None,
+                          hinge_point: np.ndarray | None, hinge_direction: np.ndarray | None) -> list[np.ndarray]:
+    if connection is None:
+        return [marker_data[4] for marker_data in pnp_markers]
+    plane_id_1, plane_id_2, _ = connection
+    half_angle_rad = np.deg2rad(flex_angle_deg/2.0)
+    rotation_1, _ = cv2.Rodrigues(-half_angle_rad*hinge_direction)
+    rotation_2, _ = cv2.Rodrigues(+half_angle_rad*hinge_direction)
+    result = []
+    for marker_data in pnp_markers:
+        plane_id, points = marker_data[1], marker_data[4]
+        rotation = rotation_1 if plane_id == plane_id_1 else rotation_2 if plane_id == plane_id_2 else None
+        result.append(points if rotation is None else (rotation@(points - hinge_point).T).T + hinge_point)
+    return result
 
+
+def solvePnPAtFlexAngle(flex_angle_deg: float, pnp_markers: list[tuple], marker_matches: list[list[tuple[np.ndarray, float]]],
+                        correspondence_indices: list[int], connection: tuple[str, str, float] | None, hinge_point: np.ndarray | None,
+                        hinge_direction: np.ndarray | None, camera_calibration: CameraCalibration,
+                        previous_translation: np.ndarray | None) -> tuple[np.ndarray | None, float]:
+    object_groups = getFlexedObjectPoints(pnp_markers, flex_angle_deg, connection, hinge_point, hinge_direction)
+    object_points = np.concatenate(object_groups, axis=0)
+    image_points = np.concatenate([marker_matches[i][correspondence_indices[i]][0] for i in range(len(pnp_markers))], axis=0)
+    result = cv2.solvePnPGeneric(object_points, image_points, camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
+                                 flags=cv2.SOLVEPNP_SQPNP)
+    solution_count, rotation_vectors, translation_vectors = result[:3]
+    if not solution_count:
+        return None, float('inf')
+
+    valid_solutions = []
+    for rotation_vector, translation_vector in zip(rotation_vectors, translation_vectors):
+        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+        camera_points = (rotation_matrix@object_points.T + translation_vector.reshape(3, 1)).T
+        if np.any(camera_points[:, 2] <= 0.0):
+            continue
+        projected, _ = cv2.projectPoints(object_points, rotation_vector, translation_vector, camera_calibration.camera_matrix,
+                                         camera_calibration.distortion_coefficients)
+        error = float(np.sqrt(np.mean(np.sum((projected.reshape(-1, 2) - image_points)**2, axis=1))))
+        valid_solutions.append((translation_vector.reshape(3), error))
+    if not valid_solutions:
+        return None, float('inf')
+
+    minimum_error = min(error for _, error in valid_solutions)
+    near_best = [(translation, error) for translation, error in valid_solutions if error <= minimum_error + 0.50]
+    if previous_translation is None or len(near_best) == 1:
+        return min(near_best, key=lambda item: item[1])
+    return min(near_best, key=lambda item: (float(np.linalg.norm(item[0] - previous_translation)), item[1]))
+
+
+def searchFlexAngles(search_angles_deg: np.ndarray, solve_angle) -> tuple[np.ndarray | None, float, float]:
+    best_translation, best_error, best_angle = None, float('inf'), 0.0
+    for angle in search_angles_deg:
+        translation, error = solve_angle(float(angle))
+        if error < best_error:
+            best_translation, best_error, best_angle = translation, error, float(angle)
+    return best_translation, best_error, best_angle
+
+
+def searchFullFlex(max_rotation_deg: float, coarse_angles_deg: np.ndarray, solve_angle) -> tuple[np.ndarray | None, float, float]:
+    best_translation, best_error, best_angle = searchFlexAngles(coarse_angles_deg, solve_angle)
+    if max_rotation_deg <= 0.0 or best_translation is None:
+        return best_translation, best_error, best_angle
+    coarse_step = 2.0*max_rotation_deg/6.0
+    fine_min, fine_max = max(-max_rotation_deg, best_angle - coarse_step), min(max_rotation_deg, best_angle + coarse_step)
+    fine_angles = np.unique(np.concatenate((np.arange(fine_min, fine_max + 0.5, 1.0), np.array([fine_min, best_angle, fine_max]))))
+    fine_translation, fine_error, fine_angle = searchFlexAngles(fine_angles, solve_angle)
+    return (fine_translation, fine_error, fine_angle) if fine_translation is not None and fine_error < best_error else (best_translation, best_error, best_angle)
+
+
+def findBestCorrespondenceAtAngle(flex_angle_deg: float, pnp_markers: list[tuple], marker_matches: list[list[tuple[np.ndarray, float]]],
+                                  connection: tuple[str, str, float] | None, hinge_point: np.ndarray | None,
+                                  hinge_direction: np.ndarray | None, camera_calibration: CameraCalibration) -> tuple[list[int] | None, float]:
+    object_groups = getFlexedObjectPoints(pnp_markers, flex_angle_deg, connection, hinge_point, hinge_direction)
+    anchor_index = max(range(len(pnp_markers)), key=lambda i: pnp_markers[i][3].num_sides)
+    anchor_object_points = object_groups[anchor_index]
+    best_indices, best_error = None, float('inf')
+
+    for anchor_ordering_index, (anchor_image_points, _) in enumerate(marker_matches[anchor_index]):
+        if len(anchor_object_points) == 3:
+            solution_count, rotation_vectors, translation_vectors = cv2.solveP3P(anchor_object_points, anchor_image_points,
+                camera_calibration.camera_matrix, camera_calibration.distortion_coefficients, flags=cv2.SOLVEPNP_AP3P)
         else:
-            warm_needs_full_search = True
-
-        if warm_needs_full_search:
-            full_search_timing_start = time.perf_counter()
-            best_translation, best_reprojection_error, best_flex_angle_deg = searchFullFlex()
-            pnp_full_search_seconds += time.perf_counter() - full_search_timing_start
-            accepted_warm_solution = False
-
-        # If the cheap edge-ratio ordering produced a poor fit, let actual pose reprojection
-        # choose the correspondence. Use one detected marker as a PnP anchor, try each of its
-        # cyclic/reversed orderings over the coarse flex angles, then project every other marker
-        # and choose the ordering that lands closest to that pose. This avoids an exponential
-        # Cartesian search over all marker orderings.
-        if (
-            not accepted_warm_solution
-            and best_translation is not None
-            and best_reprojection_error > correspondence_rescue_error_px
-            and len(best_assignment) >= 2
-        ):
-            rescue_timing_start = time.perf_counter()
-            anchor_pair = max(best_assignment, key=lambda pair: plane_marker_specs[pair[1]][1].num_sides)
-            best_rescue_indices = correspondence_indices.copy()
-            best_rescue_error = float("inf")
-            best_rescue_angle_deg = best_flex_angle_deg
-
-            for rescue_angle_deg in coarse_angles_deg:
-                rotation_1 = rotation_2 = None
-                if connection is not None:
-                    half_angle_rad = np.deg2rad(float(rescue_angle_deg)/2.0)
-                    rotation_1, _ = cv2.Rodrigues(-half_angle_rad*hinge_direction)
-                    rotation_2, _ = cv2.Rodrigues(+half_angle_rad*hinge_direction)
-
-                object_points_by_pair = {}
-                for pair in best_assignment:
-                    _, marker_index = pair
-                    rigid_plane, _, nominal_object_points, _ = plane_marker_specs[marker_index]
-                    object_points = nominal_object_points
-
-                    if connection is not None:
-                        if rigid_plane.plane_id == plane_id_1:
-                            object_points = (rotation_1@(object_points - hinge_point).T).T + hinge_point
-                        elif rigid_plane.plane_id == plane_id_2:
-                            object_points = (rotation_2@(object_points - hinge_point).T).T + hinge_point
-
-                    object_points_by_pair[pair] = object_points
-
-                anchor_object_points = object_points_by_pair[anchor_pair]
-
-                for anchor_ordering_index, (anchor_image_points, _) in enumerate(marker_matches[anchor_pair]):
-                    if len(anchor_object_points) == 3:
-                        solution_count, rotation_vectors, translation_vectors = cv2.solveP3P(
-                            anchor_object_points, anchor_image_points,
-                            camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
-                            flags=cv2.SOLVEPNP_AP3P,
-                        )
-                    else:
-                        solution_count, rotation_vectors, translation_vectors, _ = cv2.solvePnPGeneric(
-                            anchor_object_points, anchor_image_points,
-                            camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
-                            flags=cv2.SOLVEPNP_SQPNP,
-                        )
-
-                    if not solution_count:
-                        continue
-
-                    for rotation_vector, translation_vector in zip(rotation_vectors, translation_vectors):
-                        rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
-                        trial_indices = {anchor_pair: anchor_ordering_index}
-                        total_squared_error = 0.0
-                        total_point_count = 0
-                        valid_pose = True
-
-                        for pair in best_assignment:
-                            object_points = object_points_by_pair[pair]
-                            camera_points = (rotation_matrix@object_points.T + translation_vector.reshape(3, 1)).T
-                            if np.any(camera_points[:, 2] <= 0.0):
-                                valid_pose = False
-                                break
-
-                            projected_points, _ = cv2.projectPoints(
-                                object_points, rotation_vector, translation_vector,
-                                camera_calibration.camera_matrix, camera_calibration.distortion_coefficients,
-                            )
-                            projected_points = projected_points.reshape(-1, 2)
-
-                            if pair == anchor_pair:
-                                ordering_index = anchor_ordering_index
-                                squared_error = float(np.sum((anchor_image_points - projected_points)**2))
-                            else:
-                                ordering_index, squared_error = min(
-                                    (
-                                        (ordering_index, float(np.sum((ordered_vertices_px - projected_points)**2)))
-                                        for ordering_index, (ordered_vertices_px, _) in enumerate(marker_matches[pair])
-                                    ),
-                                    key=lambda item: item[1],
-                                )
-
-                            trial_indices[pair] = ordering_index
-                            total_squared_error += squared_error
-                            total_point_count += len(object_points)
-
-                        if not valid_pose or total_point_count == 0:
-                            continue
-
-                        rescue_error = float(np.sqrt(total_squared_error/total_point_count))
-                        if rescue_error < best_rescue_error:
-                            best_rescue_error = rescue_error
-                            best_rescue_indices = trial_indices
-                            best_rescue_angle_deg = float(rescue_angle_deg)
-
-            if best_rescue_indices != correspondence_indices:
-                correspondence_indices = best_rescue_indices
-
-                # The anchor search already identified the best coarse flex bin, so only
-                # run accurate joint SQPNP locally around it rather than repeating the full grid.
-                local_angles_deg = np.array([best_rescue_angle_deg])
-                if connection is not None and max_rotation_deg > 0.0:
-                    coarse_step_deg = 2.0*max_rotation_deg/6.0
-                    fine_min = max(-max_rotation_deg, best_rescue_angle_deg - coarse_step_deg)
-                    fine_max = min(+max_rotation_deg, best_rescue_angle_deg + coarse_step_deg)
-                    local_angles_deg = np.unique(np.concatenate((
-                        np.arange(fine_min, fine_max + 0.5, 1.0),
-                        np.array([fine_min, best_rescue_angle_deg, fine_max]),
-                    )))
-
-                rescued_translation, rescued_error, rescued_angle_deg = None, float("inf"), best_rescue_angle_deg
-                for flex_angle_deg in local_angles_deg:
-                    translation, reprojection_error = evaluateFlexAngle(float(flex_angle_deg), correspondence_indices)
-                    if reprojection_error < rescued_error:
-                        rescued_translation = translation
-                        rescued_error = reprojection_error
-                        rescued_angle_deg = float(flex_angle_deg)
-
-                if rescued_translation is not None and rescued_error < best_reprojection_error:
-                    best_translation = rescued_translation
-                    best_reprojection_error = rescued_error
-                    best_flex_angle_deg = rescued_angle_deg
-
-            pnp_rescue_seconds += time.perf_counter() - rescue_timing_start
-
-        if best_translation is None or not np.all(np.isfinite(best_translation)):
+            result = cv2.solvePnPGeneric(anchor_object_points, anchor_image_points, camera_calibration.camera_matrix,
+                                         camera_calibration.distortion_coefficients, flags=cv2.SOLVEPNP_SQPNP)
+            solution_count, rotation_vectors, translation_vectors = result[:3]
+        if not solution_count:
             continue
 
-        # Ordered criteria avoid arbitrary weighted coefficients:
-        #   1) more matched markers, 2) more fully observed planes, 3) greater marker-set
-        #   completeness, 4) evidence from more planes, then geometric fit quality.
-        candidate_rank = (
-            matched_count,
-            full_plane_count,
-            marker_coverage,
-            represented_plane_count,
-            -best_reprojection_error,
-            -mean_shape_error,
-        )
+        for rotation_vector, translation_vector in zip(rotation_vectors, translation_vectors):
+            rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+            trial_indices, total_squared_error, total_points, valid = [0]*len(pnp_markers), 0.0, 0, True
+            trial_indices[anchor_index] = anchor_ordering_index
+            for i, object_points in enumerate(object_groups):
+                camera_points = (rotation_matrix@object_points.T + translation_vector.reshape(3, 1)).T
+                if np.any(camera_points[:, 2] <= 0.0):
+                    valid = False
+                    break
+                projected, _ = cv2.projectPoints(object_points, rotation_vector, translation_vector, camera_calibration.camera_matrix,
+                                                 camera_calibration.distortion_coefficients)
+                projected = projected.reshape(-1, 2)
+                if i == anchor_index:
+                    ordering_index = anchor_ordering_index
+                    squared_error = float(np.sum((anchor_image_points - projected)**2))
+                else:
+                    ordering_index, squared_error = min(
+                        ((j, float(np.sum((vertices - projected)**2))) for j, (vertices, _) in enumerate(marker_matches[i])),
+                        key=lambda item: item[1],
+                    )
+                trial_indices[i] = ordering_index
+                total_squared_error += squared_error
+                total_points += len(object_points)
+            if valid and total_points:
+                error = float(np.sqrt(total_squared_error/total_points))
+                if error < best_error:
+                    best_indices, best_error = trial_indices, error
+    return best_indices, best_error
 
-        if best_rank is None or candidate_rank > best_rank:
-            best_rank = candidate_rank
-            best_result = (
-                best_translation, best_reprojection_error, best_flex_angle_deg,
-                connection, matched_count, total_group_marker_count,
-                dict(correspondence_indices),
-            )
 
-    if best_result is None:
-        return failed_measurement
+def rescueCorrespondences(best_flex_angle_deg: float, coarse_angles_deg: np.ndarray, current_indices: list[int], pnp_markers: list[tuple],
+                          marker_matches: list[list[tuple[np.ndarray, float]]], connection: tuple[str, str, float] | None,
+                          hinge_point: np.ndarray | None, hinge_direction: np.ndarray | None, camera_calibration: CameraCalibration,
+                          rescue_error_px: float) -> tuple[list[int], float, float, int]:
+    best_indices, best_angle, best_error, tested = current_indices.copy(), best_flex_angle_deg, float('inf'), set()
 
-    (
-        best_translation, best_reprojection_error, best_flex_angle_deg,
-        best_connection, matched_count, total_group_marker_count,
-        best_correspondence_indices,
-    ) = best_result
+    def tryAngles(angles) -> None:
+        nonlocal best_indices, best_angle, best_error
+        for raw_angle in angles:
+            angle = float(raw_angle)
+            if connection is not None:
+                angle = float(np.clip(angle, -connection[2], connection[2]))
+            key = round(angle, 6)
+            if key in tested:
+                continue
+            tested.add(key)
+            indices, error = findBestCorrespondenceAtAngle(angle, pnp_markers, marker_matches, connection, hinge_point, hinge_direction, camera_calibration)
+            if indices is not None and error < best_error:
+                best_indices, best_angle, best_error = indices, angle, error
 
-    # Cache only a geometrically credible solution. Save each physical marker's
-    # successful ordered polygon geometry so it can be matched temporally next frame.
-    if best_connection is not None and best_reprojection_error <= warm_start_severe_error_px:
-        plane_id_1, plane_id_2, _ = best_connection
-        warm_start_key = (id(object_vision_spec), frozenset((plane_id_1, plane_id_2)))
-        _PNP_WARM_START_ANGLES_DEG[warm_start_key] = best_flex_angle_deg
-        ordered_vertices_by_marker = {}
+    tryAngles([best_flex_angle_deg])
+    if best_error > rescue_error_px and connection is not None:
+        tryAngles([best_flex_angle_deg - 2.0, best_flex_angle_deg + 2.0])
+    if best_error > rescue_error_px and connection is not None:
+        tryAngles(coarse_angles_deg)
+    return best_indices, best_angle, best_error, len(tested)
 
-        for (shape_index, marker_index), correspondence_index in best_correspondence_indices.items():
-            ordered_vertices_px = marker_matches[(shape_index, marker_index)][correspondence_index][0]
-            centered_vertices = ordered_vertices_px - np.mean(ordered_vertices_px, axis=0)
-            vertex_scale = float(np.sqrt(np.mean(np.sum(centered_vertices*centered_vertices, axis=1))))
 
-            if vertex_scale > 1e-12:
-                ordered_vertices_by_marker[marker_index] = (centered_vertices/vertex_scale).copy()
-
-        _PNP_WARM_START_ORDERED_VERTICES[warm_start_key] = ordered_vertices_by_marker
-
-    if best_connection is not None and not _timing_warmup:
-        plane_id_1, plane_id_2, _ = best_connection
-        print(
-            f"flex {plane_id_1}<->{plane_id_2}: {best_flex_angle_deg:+.1f} deg | "
-            f"markers={matched_count}/{total_group_marker_count} | reprojection={best_reprojection_error:.2f} px"
-        )
-
-    pnp_total_seconds = time.perf_counter() - measurement_timing_start
+# Convert the already-selected one-plane or one-hinge shape group into a camera-frame measurement.
+def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: ObjectVisionSpec, camera_calibration: CameraCalibration,
+                                     _timing_warmup: bool = False) -> Measurement:
+    failed = Measurement(None, None, None, None, None, None)
+    measurement_debug = None if _timing_warmup else getattr(detection, '_debug', None)
     if measurement_debug is not None:
-        measurement_debug.setTiming("PnP setup + correspondences", pnp_setup_seconds)
-        measurement_debug.setTiming("PnP marker assignment", pnp_assignment_seconds)
-        measurement_debug.setTiming("PnP warm-start search", pnp_warm_start_seconds)
-        measurement_debug.setTiming("PnP full flex search", pnp_full_search_seconds)
-        measurement_debug.setTiming("PnP correspondence rescue", pnp_rescue_seconds)
-        measurement_debug.setTiming("PnP total", pnp_total_seconds)
-        detection_total_ms = measurement_debug.timings_ms.get("2D detection total")
+        createMeasurementUsingShapeGroup(detection, object_vision_spec, camera_calibration, _timing_warmup=True)
+    timing_start = time.perf_counter()
+
+    pnp_markers = buildSelectedPnPMarkers(detection, object_vision_spec)
+    if pnp_markers is None:
+        return failed
+    plane_group = tuple(detection.plane_ids)
+    planes_by_id = {plane.plane_id: plane for plane in object_vision_spec.rigid_planes}
+    connections = {frozenset((p1, p2)): (p1, p2, max_angle) for p1, p2, max_angle in object_vision_spec.rigid_plane_connections}
+    connection = connections.get(frozenset(plane_group)) if len(plane_group) == 2 else None
+    if len(plane_group) == 2 and connection is None:
+        return failed
+
+    marker_matches = [getVertexOrderings(marker_data[0], marker_data[5]) for marker_data in pnp_markers]
+    if any(not orderings for orderings in marker_matches):
+        return failed
+    bbox_diagonal_px = float(np.hypot(detection.px_w or 0.0, detection.px_h or 0.0))
+    severe_error_px = max(12.0, 0.040*bbox_diagonal_px)
+    rescue_error_px = max(8.0, 0.025*bbox_diagonal_px)
+
+    hinge_point = hinge_direction = None
+    max_rotation_deg = 0.0
+    if connection is not None:
+        plane_id_1, plane_id_2, max_rotation_deg = connection
+        hinge_point, hinge_direction = getRigidPlaneIntersection(planes_by_id[plane_id_1], planes_by_id[plane_id_2])
+    coarse_angles_deg = np.linspace(-max_rotation_deg, max_rotation_deg, 7) if max_rotation_deg > 0.0 else np.array([0.0])
+
+    spec_state_key = id(object_vision_spec)
+    warm_key = (spec_state_key, frozenset(plane_group))
+    warm_angle = _PNP_WARM_START_ANGLES_DEG.get(warm_key) if connection is not None else None
+    cached_vertices = _PNP_WARM_START_ORDERED_VERTICES.get(warm_key, {})
+    correspondence_indices = chooseInitialCorrespondences(pnp_markers, marker_matches, cached_vertices)
+    previous_translation = _PNP_PREVIOUS_TRANSLATION_M.get((spec_state_key, plane_group))
+    pnp_setup_seconds = time.perf_counter() - timing_start
+    pnp_warm_seconds = pnp_full_seconds = pnp_rescue_seconds = 0.0
+    rescue_angles_tested = 0
+
+    def solveAngle(angle: float, indices: list[int] | None = None):
+        return solvePnPAtFlexAngle(angle, pnp_markers, marker_matches, correspondence_indices if indices is None else indices,
+                                   connection, hinge_point, hinge_direction, camera_calibration, previous_translation)
+
+    best_translation, best_error, best_angle = None, float('inf'), 0.0
+    accepted_warm = False
+    needs_full_search = True
+    if connection is not None and warm_angle is not None and max_rotation_deg > 0.0:
+        warm_min, warm_max = max(-max_rotation_deg, warm_angle - 2.0), min(max_rotation_deg, warm_angle + 2.0)
+        warm_angles = np.unique(np.append(np.arange(warm_min, warm_max + 0.5, 1.0), np.clip(warm_angle, -max_rotation_deg, max_rotation_deg)))
+        t = time.perf_counter()
+        best_translation, best_error, best_angle = searchFlexAngles(warm_angles, solveAngle)
+        pnp_warm_seconds = time.perf_counter() - t
+        at_lower_edge = abs(best_angle - warm_min) <= 0.51 and warm_min > -max_rotation_deg + 1e-9
+        at_upper_edge = abs(best_angle - warm_max) <= 0.51 and warm_max < max_rotation_deg - 1e-9
+        needs_full_search = best_translation is None or at_lower_edge or at_upper_edge or best_error > severe_error_px
+        accepted_warm = not needs_full_search
+
+    if needs_full_search:
+        t = time.perf_counter()
+        best_translation, best_error, best_angle = searchFullFlex(max_rotation_deg, coarse_angles_deg, solveAngle)
+        pnp_full_seconds = time.perf_counter() - t
+        accepted_warm = False
+
+    if not accepted_warm and best_translation is not None and best_error > rescue_error_px and len(pnp_markers) >= 2:
+        t = time.perf_counter()
+        rescued_indices, rescue_angle, _, rescue_angles_tested = rescueCorrespondences(
+            best_angle, coarse_angles_deg, correspondence_indices, pnp_markers, marker_matches, connection,
+            hinge_point, hinge_direction, camera_calibration, rescue_error_px,
+        )
+        if rescued_indices != correspondence_indices:
+            local_angles = np.array([rescue_angle])
+            if connection is not None and max_rotation_deg > 0.0:
+                coarse_step = 2.0*max_rotation_deg/6.0
+                fine_min, fine_max = max(-max_rotation_deg, rescue_angle - coarse_step), min(max_rotation_deg, rescue_angle + coarse_step)
+                local_angles = np.unique(np.concatenate((np.arange(fine_min, fine_max + 0.5, 1.0), np.array([fine_min, rescue_angle, fine_max]))))
+            rescued_translation, rescued_error, rescued_angle = searchFlexAngles(local_angles, lambda angle: solveAngle(angle, rescued_indices))
+            if rescued_translation is not None and rescued_error < best_error:
+                best_translation, best_error, best_angle = rescued_translation, rescued_error, rescued_angle
+                correspondence_indices = rescued_indices
+        pnp_rescue_seconds = time.perf_counter() - t
+
+    if best_translation is None or not np.all(np.isfinite(best_translation)):
+        return failed
+
+    _PNP_PREVIOUS_PLANE_GROUP[spec_state_key] = plane_group
+    if best_error <= severe_error_px:
+        _PNP_PREVIOUS_TRANSLATION_M[(spec_state_key, plane_group)] = best_translation.copy()
+        ordered_vertices_by_marker = {}
+        for marker_data, orderings, correspondence_index in zip(pnp_markers, marker_matches, correspondence_indices):
+            normalized = normalizeOrderedVertices(orderings[correspondence_index][0])
+            if normalized is not None:
+                ordered_vertices_by_marker[(marker_data[1], marker_data[2])] = normalized.copy()
+        if ordered_vertices_by_marker:
+            _PNP_WARM_START_ORDERED_VERTICES[warm_key] = ordered_vertices_by_marker
+        if connection is not None:
+            _PNP_WARM_START_ANGLES_DEG[warm_key] = best_angle
+
+    total_group_marker_count = sum(marker.num_sides != 0 for plane_id in plane_group for marker in planes_by_id[plane_id].shape_markers)
+    if connection is not None and not _timing_warmup:
+        print(f'flex {connection[0]}<->{connection[1]}: {best_angle:+.1f} deg | markers={len(pnp_markers)}/{total_group_marker_count} | '
+              f'reprojection={best_error:.2f} px | hinges_considered=1')
+
+    pnp_total_seconds = time.perf_counter() - timing_start
+    if measurement_debug is not None:
+        measurement_debug.setTiming('PnP setup + correspondences', pnp_setup_seconds)
+        measurement_debug.setTiming('PnP warm-start search', pnp_warm_seconds)
+        measurement_debug.setTiming('PnP full flex search', pnp_full_seconds)
+        measurement_debug.setTiming(f'PnP correspondence rescue ({rescue_angles_tested} angles)', pnp_rescue_seconds)
+        measurement_debug.setTiming('PnP total', pnp_total_seconds)
+        detection_total_ms = measurement_debug.timings_ms.get('2D detection total')
         if detection_total_ms is not None:
-            measurement_debug.timings_ms["TOTAL vision"] = detection_total_ms + 1000.0*pnp_total_seconds
+            measurement_debug.timings_ms['TOTAL vision'] = detection_total_ms + 1000.0*pnp_total_seconds
         measurement_debug.updateTimingStage()
 
-    return Measurement(float(best_translation[0]), float(best_translation[1]), float(best_translation[2]), None, None, None,)
+    return Measurement(float(best_translation[0]), float(best_translation[1]), float(best_translation[2]), None, None, None)
 

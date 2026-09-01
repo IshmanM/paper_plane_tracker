@@ -416,7 +416,7 @@ OBJECT_VISION_SPECS = {
                 translation_object_from_plane_m=np.array([0.0, 0.001, -0.01], dtype=np.float64),
                 shape_markers=[
                     ShapeMarkerSpec(
-                        color_id=ColorId.TENNIS_GREEN, num_sides=4,
+                        color_id=ColorId.GREEN, num_sides=4,
                         object_vertices_m=np.array([[-0.09, -0.02], [0.032, 0.0], [0.032, 0.02], [-0.09, 0.02]], dtype=np.float64),
                     ),
                 ],
@@ -438,9 +438,9 @@ OBJECT_VISION_SPECS = {
             ),
         ],
         rigid_plane_connections=[
-            ('plane_0', 'plane_1', 15.0),
-            ('plane_0', 'plane_2', 15.0),
-            ('plane_2', 'plane_3', 15.0),
+            ('plane_0', 'plane_1', 10.0),
+            ('plane_0', 'plane_2', 10.0),
+            ('plane_2', 'plane_3', 10.0),
         ],
         width=None, height=None, length=None,
     )
