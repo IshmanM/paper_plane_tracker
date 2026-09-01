@@ -893,69 +893,172 @@ def findSingleObjectUsingLargestColorBlob(frame: np.ndarray, object_vision_spec:
 
 
 # Refine an accepted polygon by fitting its straight edges and intersecting neighboring lines.
+def selectPolygonTopology(
+    hull: np.ndarray, perimeter: float, epsilon_ratio: float, expected_num_sides: set[int],
+) -> tuple[np.ndarray | None, int, list[float]]:
+    """Infer side count from contour corners, constrained only by VisionSpec-allowed counts."""
+    MAX_TOPOLOGY_EPSILON_RATIO = 0.015
+    WEAK_CORNER_STRENGTH = 0.12
+
+    allowed_counts = sorted(set(expected_num_sides))
+    if not allowed_counts:
+        return None, 0, []
+
+    def cornerStrengths(vertices: np.ndarray) -> np.ndarray:
+        strengths = np.zeros(len(vertices), dtype=np.float64)
+
+        for i in range(len(vertices)):
+            previous, vertex, following = vertices[i - 1], vertices[i], vertices[(i + 1)%len(vertices)]
+            chord = following - previous
+            chord_length = float(np.linalg.norm(chord))
+            local_scale = max(
+                float(np.linalg.norm(vertex - previous)),
+                float(np.linalg.norm(following - vertex)),
+            )
+
+            if chord_length <= 1e-6 or local_scale <= 1e-6:
+                continue
+
+            deviation = abs(
+                chord[0]*(vertex - previous)[1] - chord[1]*(vertex - previous)[0]
+            )/chord_length
+            strengths[i] = deviation/local_scale
+
+        return strengths
+
+    def pruneToSupportedTopology(polygon: np.ndarray) -> tuple[np.ndarray | None, list[float]]:
+        vertices = polygon.reshape(-1, 2).astype(np.float64)
+        removed_strengths: list[float] = []
+        minimum_count = allowed_counts[0]
+
+        while len(vertices) > minimum_count:
+            strengths = cornerStrengths(vertices)
+            weakest_index = int(np.argmin(strengths))
+            weakest_strength = float(strengths[weakest_index])
+
+            # Keep a supported count only when every remaining corner has real support.
+            # If one corner is weak and the next-lower count is still compatible with
+            # the VisionSpec, remove it and reconsider the topology.
+            lower_supported_count_exists = any(
+                count <= len(vertices) - 1 for count in allowed_counts
+            )
+
+            if weakest_strength >= WEAK_CORNER_STRENGTH or not lower_supported_count_exists:
+                break
+
+            vertices = np.delete(vertices, weakest_index, axis=0)
+            removed_strengths.append(weakest_strength)
+
+        if len(vertices) not in allowed_counts:
+            return None, removed_strengths
+
+        return vertices.astype(np.float32).reshape(-1, 1, 2), removed_strengths
+
+    # Topology needs a fine corner proposal even if polygon_epsilon_ratio is temporarily
+    # larger for experimentation. Geometry itself will still come from the original contour.
+    proposal_ratio = min(epsilon_ratio, MAX_TOPOLOGY_EPSILON_RATIO)
+    base_polygon = cv2.approxPolyDP(hull, proposal_ratio*perimeter, True)
+    observed_num_sides = len(base_polygon)
+    polygon, removed_strengths = pruneToSupportedTopology(base_polygon)
+
+    if polygon is not None:
+        return polygon, observed_num_sides, removed_strengths
+
+    # Only needed when the proposal was too coarse to reach the minimum allowed count.
+    if observed_num_sides < allowed_counts[0]:
+        retry_ratio = max(0.005, 0.5*proposal_ratio)
+        retry_polygon = cv2.approxPolyDP(hull, retry_ratio*perimeter, True)
+        polygon, retry_removed = pruneToSupportedTopology(retry_polygon)
+
+        if polygon is not None:
+            return polygon, observed_num_sides, removed_strengths + retry_removed
+
+    return None, observed_num_sides, removed_strengths
+
+
+
 def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> np.ndarray:
     rough_vertices = polygon.reshape(-1, 2).astype(np.float64)
     contour_points = contour.reshape(-1, 2).astype(np.float64)
     num_sides = len(rough_vertices)
-    edge_distances, fitted_lines = [], []
 
-    # Assign contour points to the nearest rough polygon edge.
+    if num_sides < 3:
+        return rough_vertices
+
+    bbox_diagonal_px = float(np.linalg.norm(np.ptp(rough_vertices, axis=0)))
+    short_edge_px = max(10.0, 0.18*bbox_diagonal_px)
+    edge_distances = []
+
+    # Assign every original HSV-contour point to its nearest proposed edge.
     for edge_index in range(num_sides):
-        edge_start = rough_vertices[edge_index]
-        edge_end = rough_vertices[(edge_index + 1)%num_sides]
-        edge_vector = edge_end - edge_start
-        edge_length = np.linalg.norm(edge_vector)
+        start = rough_vertices[edge_index]
+        end = rough_vertices[(edge_index + 1)%num_sides]
+        edge = end - start
+        edge_length = float(np.linalg.norm(edge))
 
         if edge_length <= 1e-6:
             return rough_vertices
 
-        relative_points = contour_points - edge_start
-        distances = np.abs(edge_vector[0]*relative_points[:, 1] - edge_vector[1]*relative_points[:, 0])/edge_length
-        edge_distances.append(distances)
+        relative = contour_points - start
+        edge_distances.append(
+            np.abs(edge[0]*relative[:, 1] - edge[1]*relative[:, 0])/edge_length
+        )
 
-    edge_assignments = np.argmin(np.stack(edge_distances, axis=1), axis=1)
+    assignments = np.argmin(np.stack(edge_distances, axis=1), axis=1)
+    fitted_lines = []
 
-    # Fit each edge from its straight middle section and measure how well the contour supports that line.
     for edge_index in range(num_sides):
-        edge_start = rough_vertices[edge_index]
-        edge_end = rough_vertices[(edge_index + 1)%num_sides]
-        edge_vector = edge_end - edge_start
-        edge_length_squared = np.dot(edge_vector, edge_vector)
-        edge_points = contour_points[edge_assignments == edge_index]
+        start = rough_vertices[edge_index]
+        end = rough_vertices[(edge_index + 1)%num_sides]
+        edge = end - start
+        edge_length = float(np.linalg.norm(edge))
+        edge_dir = edge/edge_length
+        edge_points = contour_points[assignments == edge_index]
 
         if len(edge_points) < 3:
             return rough_vertices
 
-        projection = ((edge_points - edge_start)@edge_vector)/edge_length_squared
+        projection = ((edge_points - start)@edge)/(edge_length*edge_length)
         edge_points = edge_points[(projection >= 0.10) & (projection <= 0.90)]
 
         if len(edge_points) < 3:
             return rough_vertices
 
-        vx, vy, x0, y0 = cv2.fitLine(edge_points.astype(np.float32), cv2.DIST_L2, 0, 0.01, 0.01).reshape(4)
-        line_point = np.array([x0, y0], dtype=np.float64)
-        line_direction = np.array([vx, vy], dtype=np.float64)
-        direction_norm = np.linalg.norm(line_direction)
+        if edge_length <= short_edge_px:
+            # A short edge has too little leverage to estimate angle stably frame-to-frame.
+            # Preserve the topology proposal's direction and use contour evidence only to
+            # slide that line in the normal direction.
+            normal = np.array([-edge_dir[1], edge_dir[0]])
+            normal_offsets = (edge_points - start)@normal
+            median_offset = float(np.median(normal_offsets))
+            line_point = 0.5*(start + end) + median_offset*normal
+            line_direction = edge_dir
+            residuals = np.abs(normal_offsets - median_offset)
+        else:
+            vx, vy, x0, y0 = cv2.fitLine(
+                edge_points.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01,
+            ).reshape(4)
+            line_point = np.array([x0, y0], dtype=np.float64)
+            line_direction = np.array([vx, vy], dtype=np.float64)
+            direction_norm = float(np.linalg.norm(line_direction))
 
-        if direction_norm <= 1e-6:
-            return rough_vertices
+            if direction_norm <= 1e-6:
+                return rough_vertices
 
-        line_direction /= direction_norm
-        relative_points = edge_points - line_point
-        residuals = np.abs(line_direction[0]*relative_points[:, 1] - line_direction[1]*relative_points[:, 0])
+            line_direction /= direction_norm
+            relative = edge_points - line_point
+            residuals = np.abs(
+                line_direction[0]*relative[:, 1] - line_direction[1]*relative[:, 0]
+            )
+
         edge_fit_error = float(np.sqrt(np.mean(residuals**2)))
-
-        # Allow modest raster/mask roughness, especially on long marker edges. A fixed 1 px RMS
-        # cutoff was too strict: one slightly jagged edge could cancel refinement for the entire
-        # polygon and prevent acute corners from being recovered by line intersection.
         maximum_edge_fit_error_px = min(3.0, max(1.5, 0.01*edge_length))
+
         if edge_fit_error > maximum_edge_fit_error_px:
             return rough_vertices
 
         fitted_lines.append((line_point, line_direction))
 
-    # Intersect neighboring fitted edges to recover refined corners. Acute corners may move substantially
-    # beyond approxPolyDP when both neighboring edge fits are clean.
     refined_vertices = []
 
     for vertex_index in range(num_sides):
@@ -971,8 +1074,6 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
         refined_vertices.append(point_1 + t*direction_1)
 
     refined_vertices = np.asarray(refined_vertices, dtype=np.float64)
-
-    # Keep only an emergency displacement limit; fit residuals above are the main refinement confidence test.
     maximum_edge_length = max(
         np.linalg.norm(rough_vertices[i] - rough_vertices[(i + 1)%num_sides])
         for i in range(num_sides)
@@ -981,21 +1082,19 @@ def refineShapeVerticesUsingEdges(contour: np.ndarray, polygon: np.ndarray) -> n
     if np.any(np.linalg.norm(refined_vertices - rough_vertices, axis=1) > 0.50*maximum_edge_length):
         return rough_vertices
 
-    # Reject geometry that changes the polygon topology or area implausibly.
     refined_polygon = refined_vertices.astype(np.float32).reshape(-1, 1, 2)
-
-    # Refinement currently supports convex polygons only. A future concave-shape path
-    # would need different edge assignment/topology validation.
-    if not cv2.isContourConvex(refined_polygon):
-        return rough_vertices
-
     rough_area = cv2.contourArea(rough_vertices.astype(np.float32))
     refined_area = cv2.contourArea(refined_polygon)
 
-    if rough_area <= 0.0 or not 0.65 <= refined_area/rough_area <= 1.35:
+    if (
+        rough_area <= 0.0
+        or not cv2.isContourConvex(refined_polygon)
+        or not 0.65 <= refined_area/rough_area <= 1.35
+    ):
         return rough_vertices
 
     return refined_vertices
+
 
 
 # Refine straight marker edges using the same idea as the tennis-ball LAB rays:
@@ -1252,7 +1351,7 @@ def refineShapeVerticesUsingLabRays(
         cv2.polylines(debug_frame, [np.round(refined).astype(np.int32).reshape(-1, 1, 2)], True, draw_bgr, 2)
     return refined
 
-# Shape path: find color-based convex polygon candidates, group nearby markers, then select the best group.
+# Shape path: detect HSV contours, infer polygon topology, then fit geometry from the original contours.
 def findSingleObjectUsingBestShapeGroup(
     frame: np.ndarray, object_vision_spec: ObjectVisionSpec, debug: DetectionDebug | None = None,
     _timing_profile: dict[str, float] | None = None,
@@ -1885,61 +1984,36 @@ def findSingleObjectUsingBestShapeGroup(
                         timing_polygon_refine_s += time.perf_counter() - polygon_start
                     continue
 
-                base_epsilon_ratio = object_vision_spec.polygon_epsilon_ratio
-                base_polygon = cv2.approxPolyDP(hull, base_epsilon_ratio*perimeter, True)
+                epsilon_ratio = object_vision_spec.polygon_epsilon_ratio
                 expected_num_sides = expected_num_sides_by_color[color_id]
-                initial_num_sides = len(base_polygon)
-
-                # Keep the same computational ceiling as before: one normal approxPolyDP call,
-                # plus at most ONE retry when the initial count misses a configured polygon by
-                # exactly one vertex. The retry moves epsilon in the useful direction:
-                #   too few vertices -> smaller epsilon, recover a shallow/missing corner
-                #   too many vertices -> larger epsilon, suppress one extra/noisy corner
-                if initial_num_sides in expected_num_sides:
-                    candidate_polygons = [(initial_num_sides, base_polygon)]
-                    retry_polygon = None
-                    retry_epsilon_ratio = None
-                else:
-                    candidate_polygons = []
-                    retry_polygon = None
-                    retry_epsilon_ratio = None
-
-                    nearest_expected_num_sides = min(
-                        expected_num_sides,
-                        key=lambda num_sides: abs(num_sides - initial_num_sides),
-                    )
-
-                    if abs(nearest_expected_num_sides - initial_num_sides) == 1:
-                        epsilon_direction = -1.0 if initial_num_sides < nearest_expected_num_sides else +1.0
-                        retry_epsilon_ratio = max(0.005, base_epsilon_ratio + epsilon_direction*0.02)
-                        retry_polygon = cv2.approxPolyDP(hull, retry_epsilon_ratio*perimeter, True)
-
-                        if len(retry_polygon) in expected_num_sides:
-                            candidate_polygons.append((len(retry_polygon), retry_polygon))
+                polygon, observed_num_sides, removed_corner_strengths = selectPolygonTopology(
+                    hull, perimeter, epsilon_ratio, expected_num_sides,
+                )
 
                 if polygon_debug_frame is not None:
-                    cv2.polylines(polygon_debug_frame, [base_polygon], True, draw_bgr, 1)
-                    polygon_center = np.mean(base_polygon.reshape(-1, 2), axis=0).astype(np.int32)
-
-                    if retry_polygon is not None and candidate_polygons:
-                        recovered_num_sides = len(candidate_polygons[0][1])
-                        debug_text = (
-                            f"{color_name}: observed={initial_num_sides}, expected={expected_num_sides}, "
-                            f"recovered={recovered_num_sides}"
-                        )
-                        cv2.polylines(polygon_debug_frame, [candidate_polygons[0][1]], True, draw_bgr, 2)
+                    polygon_center = np.mean(hull.reshape(-1, 2), axis=0).astype(np.int32)
+                    if polygon is None:
+                        debug_text = f"{color_name}: observed={observed_num_sides}, expected={expected_num_sides}, REJECT"
                     else:
-                        debug_text = f"{color_name}: observed={initial_num_sides}, expected={expected_num_sides}"
-
+                        cv2.polylines(polygon_debug_frame, [np.round(polygon).astype(np.int32)], True, draw_bgr, 1)
+                        pruned_text = (
+                            f", pruned={len(removed_corner_strengths)}"
+                            if removed_corner_strengths else ""
+                        )
+                        debug_text = (
+                            f"{color_name}: observed={observed_num_sides} -> N={len(polygon)}"
+                            f"{pruned_text}, allowed={expected_num_sides}"
+                        )
                     cv2.putText(
                         polygon_debug_frame, debug_text, tuple(polygon_center),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.40, draw_bgr, 1, cv2.LINE_AA,
                     )
 
-                for num_sides, polygon in candidate_polygons:
-                    if not cv2.isContourConvex(polygon):
-                        continue
+                if polygon is not None and cv2.isContourConvex(polygon):
+                    num_sides = len(polygon)
 
+                    # The selected polygon supplies topology/rough edge ownership only.
+                    # Actual edge geometry is fitted from the ORIGINAL selected HSV contour.
                     vertices_px = refineShapeVerticesUsingEdges(contour, polygon)
                     vertices_px = refineShapeVerticesUsingLabRays(
                         frame, vertices_px, color_spec, lab_ray_debug_frame, draw_bgr,
@@ -1961,17 +2035,15 @@ def findSingleObjectUsingBestShapeGroup(
                         )
 
                     if debug is not None:
-                        rough_debug = frame.copy()
-                        cv2.polylines(rough_debug, [polygon], True, draw_bgr, 2)
-                        debug.addStage(f"{color_name} candidate {candidate_index} rough polygon", rough_debug)
+                        topology_debug = frame.copy()
+                        cv2.polylines(topology_debug, [np.round(polygon).astype(np.int32)], True, draw_bgr, 2)
+                        debug.addStage(f"{color_name} candidate {candidate_index} selected topology", topology_debug)
 
                         refined_debug = frame.copy()
                         refined_points = np.round(vertices_px).astype(np.int32).reshape(-1, 1, 2)
                         cv2.polylines(refined_debug, [refined_points], True, draw_bgr, 2)
-
                         for vertex_u, vertex_v in np.round(vertices_px).astype(np.int32):
                             cv2.circle(refined_debug, (int(vertex_u), int(vertex_v)), 4, draw_bgr, -1)
-
                         debug.addStage(f"{color_name} candidate {candidate_index} refined polygon", refined_debug)
 
                 if profile_shape_detection:
@@ -1984,7 +2056,7 @@ def findSingleObjectUsingBestShapeGroup(
         debug.addStage("Combined raw mask", combined_raw_mask)
         debug.addStage("Combined cleaned mask", combined_cleaned_mask)
         debug.addStage("All selected HSV contours", contour_debug_frame)
-        debug.addStage("Polygon approximations", polygon_debug_frame)
+        debug.addStage("Polygon topology proposals", polygon_debug_frame)
         debug.addStage(
             "LAB edge rays (magenta=edge, cyan=acute-tip ray, orange=direct tip)",
             lab_ray_debug_frame,
