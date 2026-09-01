@@ -49,7 +49,7 @@ CAMERA_INDEX = 0
 # Best for moving ArUco:
 CAMERA_AUTO_EXPOSURE = False
 CAMERA_EXPOSURE = -7.5       # start here; try -10 if blur remains
-CAMERA_GAIN = 40.0           # instead of 0; tune upward if image is dark
+CAMERA_GAIN = 45.0           # instead of 0; tune upward if image is dark
 CAMERA_AUTO_WHITE_BALANCE = False
 CAMERA_WHITE_BALANCE_TEMPERATURE = 4600.0
 CAMERA_AUTOFOCUS = False

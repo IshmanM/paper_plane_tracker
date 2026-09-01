@@ -8,7 +8,10 @@ import numpy as np
 
 import src.primary.config as config
 from src.primary.camera.camera_calibration import CameraCalibration
-from src.primary.detection import detectArucoMarkerV2, detectSingleObject, drawDetection
+from src.primary.detection import (
+    detectArucoMarkerV2, detectSingleObject, drawDetection,
+    resetArucoOpticalFlowTracker,
+)
 from src.primary.object_vision_spec import OBJECT_VISION_SPECS, ObjectType, ObjectVisionSpecId
 
 
@@ -40,6 +43,13 @@ def main() -> None:
 
     object_vision_spec_id = ObjectVisionSpecId[args.spec]
     object_vision_spec = OBJECT_VISION_SPECS[object_vision_spec_id]
+
+    switchable_spec_ids = list(OBJECT_VISION_SPECS.keys())[:9]
+    spec_hotkeys = {
+        ord(str(index + 1)): spec_id
+        for index, spec_id in enumerate(switchable_spec_ids)
+    }
+
     camera_calibration = CameraCalibration(
         config.CAMERA_CALIBRATION_PATH, config.FRAME_W, config.FRAME_H,
     )
@@ -138,13 +148,17 @@ def main() -> None:
 
     print(f"ObjectVisionSpecId: {object_vision_spec_id.name}")
     if object_vision_spec.object_type == ObjectType.ARUCO_MARKER:
-        print("ArUco path: detectArucoMarkerV2")
+        print("ArUco path: standard ArUco + four-corner pyramidal LK")
     print(
         f"Position average: last "
         f"{POSITION_AVERAGING_WINDOW_FRAMES} valid measurements"
     )
+    print("Object switching:")
+    for index, spec_id in enumerate(switchable_spec_ids, start=1):
+        print(f"  {index}: {spec_id.name}")
+
     print(
-        "Tab: display size | P: pause/resume | "
+        "1-9: switch object | Tab: display size | P: pause/resume | "
         "S: save raw frame | Q/Esc: quit"
     )
 
@@ -287,6 +301,42 @@ def main() -> None:
 
             if key in (ord("q"), 27):
                 break
+
+            elif key in spec_hotkeys:
+                new_object_vision_spec_id = spec_hotkeys[key]
+
+                if new_object_vision_spec_id != object_vision_spec_id:
+                    object_vision_spec_id = new_object_vision_spec_id
+                    object_vision_spec = OBJECT_VISION_SPECS[
+                        object_vision_spec_id
+                    ]
+
+                    # Do not allow image-space state from the previous selected
+                    # object/spec to leak into the newly selected one.
+                    resetArucoOpticalFlowTracker()
+
+                    detection_times_s.clear()
+                    loop_periods_s.clear()
+                    measurement_buffer.clear()
+                    previous_loop_start_s = None
+
+                    timing_text = ""
+                    current_text = ""
+                    average_text = ""
+                    last_display_frame = None
+
+                    print(
+                        f"ObjectVisionSpecId: "
+                        f"{object_vision_spec_id.name}"
+                    )
+                    if (
+                        object_vision_spec.object_type
+                        == ObjectType.ARUCO_MARKER
+                    ):
+                        print(
+                            "ArUco path: standard ArUco + "
+                            "four-corner pyramidal LK"
+                        )
 
             elif key == 9:
                 display_scale_index = (
