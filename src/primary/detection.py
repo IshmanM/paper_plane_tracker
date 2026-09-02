@@ -201,11 +201,11 @@ def findSingleObjectTriangleColorBlob(
     """
     Fast pure-color paper-plane detector.
 
-    LAB hotspot -> full-frame HSV+LAB mask -> hotspot-anchored color component
-    -> small close/open geometry cleanup -> convex hull -> triangle -> edge refit.
+    Half-resolution LAB hotspot/trust acquisition -> full-resolution HSV component
+    -> convex hull -> triangle -> edge refit.
 
-    The geometry cleanup is deliberately done BEFORE the hull so narrow skin/clutter
-    appendages do not warp the triangle.
+    LAB is only the identity/trust gate. The selected raw HSV component still supplies
+    the complete full-resolution boundary, including the paper-plane tip.
     """
     if not object_vision_spec.color_ids:
         raise ValueError("Pure-color triangle detection requires at least one color_id")
@@ -214,11 +214,15 @@ def findSingleObjectTriangleColorBlob(
 
     MAX_CANDIDATES = 1
 
-    GLOBAL_BLUR_KERNEL = (5, 5)
+    # LAB only proposes/selects a candidate; it never supplies final geometry. Running
+    # this stage at half resolution removes most of the full-frame float/LAB work while
+    # preserving full-resolution HSV contours, triangle vertices, and depth estimation.
+    LAB_ACQUISITION_SCALE = 0.5
+    GLOBAL_BLUR_KERNEL = (3, 3)
     HOTSPOT_PERCENTILE = 98.5
     MIN_HOTSPOT_RESPONSE_FACTOR = 0.30
     MIN_HOTSPOT_DIRECTION_COSINE = 0.82
-    MIN_HOTSPOT_AREA_PX = 6
+    MIN_HOTSPOT_AREA_PX_FULL_RES = 6
 
     LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 10, 20], dtype=np.int16)
     MIN_SEED_LAB_DIRECTION_COSINE = 0.88
@@ -246,12 +250,16 @@ def findSingleObjectTriangleColorBlob(
     lab_a_direction, lab_b_direction = float(lab_direction[0]), float(lab_direction[1])
     reference_chroma_strength = float(np.mean(reference_chroma_strengths))
 
-    # Same broad LAB acquisition idea as the sphere detector.
-    blurred = cv2.GaussianBlur(frame, GLOBAL_BLUR_KERNEL, 0)
+    # Same broad LAB acquisition idea as the sphere detector, at half resolution.
+    acquisition_frame = cv2.resize(
+        frame, None, fx=LAB_ACQUISITION_SCALE, fy=LAB_ACQUISITION_SCALE,
+        interpolation=cv2.INTER_AREA,
+    )
+    blurred = cv2.GaussianBlur(acquisition_frame, GLOBAL_BLUR_KERNEL, 0)
     lab = cv2.cvtColor(blurred, cv2.COLOR_BGR2LAB)
-    _, a_u8, b_u8 = cv2.split(lab)
-    a = a_u8.astype(np.float32) - 128.0
-    b = b_u8.astype(np.float32) - 128.0
+    # Avoid cv2.split(): the L channel is unused, and splitting would copy all three.
+    a = lab[:, :, 1].astype(np.float32) - 128.0
+    b = lab[:, :, 2].astype(np.float32) - 128.0
     response = a*lab_a_direction + b*lab_b_direction
     chroma = np.sqrt(a*a + b*b)
 
@@ -267,19 +275,28 @@ def findSingleObjectTriangleColorBlob(
     )
     hotspot_mask = (aligned_response >= hotspot_threshold).astype(np.uint8)*255
 
-    hotspot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # 3x3 here has roughly the same image-space footprint as the old 5x5 full-res kernel.
+    hotspot_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     hotspot_mask = cv2.morphologyEx(hotspot_mask, cv2.MORPH_CLOSE, hotspot_kernel)
-    hotspot_mask = cv2.erode(hotspot_mask, hotspot_kernel, iterations=1)
-    hotspot_mask = cv2.dilate(hotspot_mask, hotspot_kernel, iterations=1)
+    hotspot_mask = cv2.morphologyEx(hotspot_mask, cv2.MORPH_OPEN, hotspot_kernel)
 
     if debug is not None:
         debug.reset(frame)
         debug.addStage("Original", frame)
         debug.addStage(
             "LAB color response from ColorSpec LAB",
-            np.clip(128.0 + 4.0*response, 0, 255).astype(np.uint8),
+            cv2.resize(
+                np.clip(128.0 + 4.0*response, 0, 255).astype(np.uint8),
+                (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR,
+            ),
         )
-        debug.addStage("LAB hotspot mask", hotspot_mask)
+        debug.addStage(
+            "LAB hotspot mask",
+            cv2.resize(
+                hotspot_mask, (frame.shape[1], frame.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            ),
+        )
 
     num_hotspot_labels, hotspot_labels, hotspot_stats, _ = cv2.connectedComponentsWithStats(
         hotspot_mask, connectivity=8
@@ -288,11 +305,17 @@ def findSingleObjectTriangleColorBlob(
         hotspot_labels.ravel(), weights=aligned_response.ravel(),
         minlength=num_hotspot_labels,
     )
+    acquisition_to_full_x = frame.shape[1]/acquisition_frame.shape[1]
+    acquisition_to_full_y = frame.shape[0]/acquisition_frame.shape[0]
+    min_hotspot_area_px = max(1, int(np.ceil(
+        MIN_HOTSPOT_AREA_PX_FULL_RES
+        * LAB_ACQUISITION_SCALE*LAB_ACQUISITION_SCALE
+    )))
     candidates = []
 
     for hotspot_label in range(1, num_hotspot_labels):
         area = int(hotspot_stats[hotspot_label, cv2.CC_STAT_AREA])
-        if area < MIN_HOTSPOT_AREA_PX:
+        if area < min_hotspot_area_px:
             continue
 
         x = int(hotspot_stats[hotspot_label, cv2.CC_STAT_LEFT])
@@ -300,8 +323,15 @@ def findSingleObjectTriangleColorBlob(
         w = int(hotspot_stats[hotspot_label, cv2.CC_STAT_WIDTH])
         h = int(hotspot_stats[hotspot_label, cv2.CC_STAT_HEIGHT])
         mean_response = float(response_sums[hotspot_label]/area)
+        full_x1 = max(0, int(np.floor(x*acquisition_to_full_x)))
+        full_y1 = max(0, int(np.floor(y*acquisition_to_full_y)))
+        full_x2 = min(frame.shape[1], int(np.ceil((x + w)*acquisition_to_full_x)))
+        full_y2 = min(frame.shape[0], int(np.ceil((y + h)*acquisition_to_full_y)))
+        full_area = int(round(area*acquisition_to_full_x*acquisition_to_full_y))
         candidates.append((
-            mean_response*(area**0.10), area, x, y, w, h, mean_response, hotspot_label
+            mean_response*(full_area**0.10), full_area,
+            full_x1, full_y1, max(1, full_x2 - full_x1), max(1, full_y2 - full_y1),
+            mean_response, hotspot_label,
         ))
 
     if not candidates:
@@ -335,11 +365,15 @@ def findSingleObjectTriangleColorBlob(
                 raw_hsv_mask, cv2.inRange(hsv, loose_lower, upper_hsv)
             )
 
-    seed_gate = (
+    seed_gate_small = (
         (response > 0.0)
         & (response >= MIN_SEED_LAB_DIRECTION_COSINE*chroma)
         & (chroma >= MIN_SEED_LAB_CHROMA_FACTOR*reference_chroma_strength)
     )
+    seed_gate = cv2.resize(
+        seed_gate_small.astype(np.uint8),
+        (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST,
+    ).astype(bool)
 
     # LAB is only a TRUST signal now. Do not let it erase valid HSV geometry.
     # This is the same separation used successfully in the shape detector:
@@ -371,10 +405,14 @@ def findSingleObjectTriangleColorBlob(
 
     for candidate_index, (hotspot_score, _, hx, hy, hw, hh, _, hotspot_label) in enumerate(candidates, 1):
         hotspot_component = (hotspot_labels == hotspot_label).astype(np.uint8)*255
-        hotspot_anchor = cv2.dilate(
+        hotspot_anchor_small = cv2.dilate(
             hotspot_component,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
             iterations=1,
+        )
+        hotspot_anchor = cv2.resize(
+            hotspot_anchor_small, (frame.shape[1], frame.shape[0]),
+            interpolation=cv2.INTER_NEAREST,
         ).astype(bool)
 
         # First choose the TRUSTED seed component tied to this LAB hotspot.
@@ -396,12 +434,18 @@ def findSingleObjectTriangleColorBlob(
             continue
 
         _, primary_seed_label = best_seed
-        primary_seed_mask = (seed_labels == primary_seed_label)
+        seed_x = int(seed_stats[primary_seed_label, cv2.CC_STAT_LEFT])
+        seed_y = int(seed_stats[primary_seed_label, cv2.CC_STAT_TOP])
+        seed_w = int(seed_stats[primary_seed_label, cv2.CC_STAT_WIDTH])
+        seed_h = int(seed_stats[primary_seed_label, cv2.CC_STAT_HEIGHT])
+        seed_labels_roi = seed_labels[seed_y:seed_y + seed_h, seed_x:seed_x + seed_w]
+        raw_labels_at_seed_roi = raw_labels[seed_y:seed_y + seed_h, seed_x:seed_x + seed_w]
+        primary_seed_mask_roi = seed_labels_roi == primary_seed_label
 
         # Recover the COMPLETE RAW HSV component(s) overlapping that trusted seed.
         # This restores valid nose/tip pixels that LAB rejected, without admitting
         # arbitrary HSV blobs elsewhere in the frame.
-        overlapping_raw_labels = np.unique(raw_labels[primary_seed_mask])
+        overlapping_raw_labels = np.unique(raw_labels_at_seed_roi[primary_seed_mask_roi])
         overlapping_raw_labels = overlapping_raw_labels[overlapping_raw_labels != 0]
         if len(overlapping_raw_labels) == 0:
             continue
@@ -410,7 +454,7 @@ def findSingleObjectTriangleColorBlob(
         best_raw_label = max(
             overlapping_raw_labels,
             key=lambda raw_label: int(np.count_nonzero(
-                (raw_labels == raw_label) & primary_seed_mask
+                (raw_labels_at_seed_roi == raw_label) & primary_seed_mask_roi
             )),
         )
         best_raw_label = int(best_raw_label)
@@ -419,16 +463,28 @@ def findSingleObjectTriangleColorBlob(
         if primary_area < object_vision_spec.minimum_contour_area_px:
             continue
 
-        primary_mask = (raw_labels == best_raw_label).astype(np.uint8)*255
-        primary_points = cv2.findNonZero(primary_mask)
-        if primary_points is None:
+        # Everything after component selection is local to this blob's tight bounding box.
+        # Points/contours are offset back into full-frame coordinates, so geometry is unchanged.
+        primary_x = int(raw_stats[best_raw_label, cv2.CC_STAT_LEFT])
+        primary_y = int(raw_stats[best_raw_label, cv2.CC_STAT_TOP])
+        primary_w = int(raw_stats[best_raw_label, cv2.CC_STAT_WIDTH])
+        primary_h = int(raw_stats[best_raw_label, cv2.CC_STAT_HEIGHT])
+        primary_mask_roi = (
+            raw_labels[
+                primary_y:primary_y + primary_h,
+                primary_x:primary_x + primary_w,
+            ] == best_raw_label
+        ).astype(np.uint8)*255
+        primary_points_local = cv2.findNonZero(primary_mask_roi)
+        if primary_points_local is None:
             continue
+        primary_points = primary_points_local + np.array([[[primary_x, primary_y]]], dtype=np.int32)
 
         # The recovered raw HSV component is already the correct object identity.
         # Do NOT morphologically open/close it: opening erodes the paper-plane tip,
         # while the convex hull below already ignores internal holes/creases and
         # small boundary concavities.
-        geometry_mask = primary_mask
+        geometry_mask_roi = primary_mask_roi
         geometry_points = primary_points
 
         if debug is not None:
@@ -440,7 +496,15 @@ def findSingleObjectTriangleColorBlob(
                 0.46, (0, 255, 255), 2, cv2.LINE_AA,
             )
             debug.addStage(f"Candidate {candidate_index} hotspot anchor", anchor_stage)
-            debug.addStage(f"Candidate {candidate_index} recovered raw HSV geometry", primary_mask)
+            primary_mask_debug = np.zeros(frame.shape[:2], dtype=np.uint8)
+            primary_mask_debug[
+                primary_y:primary_y + primary_h,
+                primary_x:primary_x + primary_w,
+            ] = primary_mask_roi
+            debug.addStage(
+                f"Candidate {candidate_index} recovered raw HSV geometry",
+                primary_mask_debug,
+            )
 
         hull = cv2.convexHull(geometry_points)
         perimeter = float(cv2.arcLength(hull, True))
@@ -480,11 +544,11 @@ def findSingleObjectTriangleColorBlob(
                 )
             continue
 
-        # Fit the final three edges from the CLEANED outer contour. Internal paper
-        # creases are not part of this binary contour, and skin appendages were removed
-        # before this stage.
+        # Fit the final three edges from the selected RAW HSV component's outer contour.
+        # Internal paper creases are not part of this binary contour.
         contours, _ = cv2.findContours(
-            geometry_mask.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
+            geometry_mask_roi.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE,
+            offset=(primary_x, primary_y),
         )
         if not contours:
             continue
@@ -500,12 +564,14 @@ def findSingleObjectTriangleColorBlob(
         if triangle_area < object_vision_spec.minimum_contour_area_px:
             continue
 
-        triangle_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        triangle_mask_roi = np.zeros(primary_mask_roi.shape, dtype=np.uint8)
         cv2.fillConvexPoly(
-            triangle_mask, np.round(triangle).astype(np.int32), 255
+            triangle_mask_roi,
+            np.round(triangle - np.array([primary_x, primary_y])).astype(np.int32),
+            255,
         )
         supported_area = int(cv2.countNonZero(
-            cv2.bitwise_and(geometry_mask, triangle_mask)
+            cv2.bitwise_and(geometry_mask_roi, triangle_mask_roi)
         ))
         occupancy = supported_area/max(triangle_area, 1.0)
 
@@ -3727,4 +3793,3 @@ def createMeasurementUsingShapeGroup(detection: Detection, object_vision_spec: O
         measurement_debug.updateTimingStage()
 
     return Measurement(float(best_translation[0]), float(best_translation[1]), float(best_translation[2]), None, None, None)
-
