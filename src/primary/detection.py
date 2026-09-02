@@ -199,36 +199,39 @@ def findSingleObjectTriangleColorBlob(
     debug: DetectionDebug | None = None,
 ) -> Detection | None:
     """
-    Pure-color triangle detector using the tennis-ball detector's color pipeline:
-        LAB hotspot -> loose HSV seed -> nearby-component retention
-        -> loose LAB color support -> HSV-associated support components
-        -> convex hull -> triangle fit.
+    Pure-color paper-plane detector.
 
-    HSV only seeds/associates the object. Internal crease gradients are ignored.
+    LAB finds strong target-color hotspots, but there is NO hotspot ROI. A single
+    full-frame HSV+LAB color mask is built, each hotspot anchors one component in
+    that mask, and crease-separated components are joined only across small pixel
+    gaps. Geometry is the convex hull of the joined color blob -> triangle.
     """
     if not object_vision_spec.color_ids:
         raise ValueError("Pure-color triangle detection requires at least one color_id")
     if object_vision_spec.minimum_contour_area_px is None:
         raise ValueError("Pure-color triangle detection requires minimum_contour_area_px")
 
-    MAX_CANDIDATES = 2
-    MIN_LAB_SUPPORT_RESPONSE_FACTOR = 0.12
+    MAX_CANDIDATES = 3
 
     GLOBAL_BLUR_KERNEL = (5, 5)
     HOTSPOT_PERCENTILE = 98.5
     MIN_HOTSPOT_RESPONSE_FACTOR = 0.30
+    MIN_HOTSPOT_DIRECTION_COSINE = 0.82
     MIN_HOTSPOT_AREA_PX = 6
-    # Pure-color paper planes are much larger/asymmetric than a tennis ball, and a
-    # LAB hotspot may land on only one bright wing patch. Give HSV enough room to see
-    # the rest of the plane before the tennis-ball-style component joining runs.
-    HOTSPOT_PADDING_FACTOR = 1.25
-    MIN_HOTSPOT_PADDING_PX = 24
 
-    LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 40, 15], dtype=np.int16)
-    MIN_SECONDARY_SEED_AREA_FACTOR = 0.15
-    MAX_SECONDARY_SEED_DISTANCE_FACTOR = 1.25
+    # The full-frame seed is already LAB-gated, so do not make HSV dramatically
+    # looser in saturation. Large S subtraction was admitting skin/gray clutter.
+    LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 10, 20], dtype=np.int16)
+    MIN_SEED_LAB_DIRECTION_COSINE = 0.88
+    MIN_SEED_LAB_CHROMA_FACTOR = 0.45
 
-    # Same LAB target-color construction as findSingleObjectSphere().
+    # Crease fragments should be separated by only a few image pixels. Join by
+    # boundary gap, not by centroid distance scaled by the plane's huge major axis.
+    MIN_JOINED_COMPONENT_AREA_FACTOR = 0.03
+    MAX_JOIN_GAP_PX = 8
+    MAX_JOIN_ITERATIONS = 3
+
+    # Build one target LAB chroma direction exactly as in the sphere path.
     lab_direction = np.zeros(2, dtype=np.float32)
     reference_chroma_strengths = []
 
@@ -238,14 +241,13 @@ def findSingleObjectTriangleColorBlob(
             raise ValueError(f"Pure-color triangle detection requires ColorSpec.lab_value for {color_id}")
 
         direction = color_spec.lab_value[1:3].astype(np.float32) - 128.0
-        direction_norm = np.linalg.norm(direction)
-
+        direction_norm = float(np.linalg.norm(direction))
         if direction_norm > 0.0:
             lab_direction += direction/direction_norm
             reference_chroma_strengths.append(direction_norm)
 
-    lab_direction_norm = np.linalg.norm(lab_direction)
-    if lab_direction_norm == 0.0 or not reference_chroma_strengths:
+    lab_direction_norm = float(np.linalg.norm(lab_direction))
+    if lab_direction_norm <= 0.0 or not reference_chroma_strengths:
         raise ValueError("Configured ColorSpec LAB values do not define a valid chroma direction")
 
     lab_direction /= lab_direction_norm
@@ -255,10 +257,18 @@ def findSingleObjectTriangleColorBlob(
     blurred_frame = cv2.GaussianBlur(frame, GLOBAL_BLUR_KERNEL, 0)
     lab_frame = cv2.cvtColor(blurred_frame, cv2.COLOR_BGR2LAB)
     _, a_u8, b_u8 = cv2.split(lab_frame)
-    a, b = a_u8.astype(np.float32) - 128.0, b_u8.astype(np.float32) - 128.0
+    a = a_u8.astype(np.float32) - 128.0
+    b = b_u8.astype(np.float32) - 128.0
 
     lab_color_response = a*lab_a_direction + b*lab_b_direction
-    positive_response = np.maximum(lab_color_response, 0.0)
+    pixel_chroma_strength = np.sqrt(a*a + b*b)
+
+    hotspot_direction_matches = (
+        (lab_color_response > 0.0)
+        & (lab_color_response >= MIN_HOTSPOT_DIRECTION_COSINE*pixel_chroma_strength)
+    )
+    aligned_response = np.where(hotspot_direction_matches, lab_color_response, 0.0)
+    positive_response = np.maximum(aligned_response, 0.0)
 
     minimum_hotspot_response = MIN_HOTSPOT_RESPONSE_FACTOR*reference_chroma_strength
     percentile_hotspot_response = float(np.percentile(positive_response, HOTSPOT_PERCENTILE))
@@ -273,267 +283,250 @@ def findSingleObjectTriangleColorBlob(
     if debug is not None:
         debug.reset(frame)
         debug.addStage("Original", frame)
-        response_debug = np.clip(128.0 + 4.0*lab_color_response, 0, 255).astype(np.uint8)
-        debug.addStage("LAB color response from ColorSpec LAB", response_debug)
+        debug.addStage(
+            "LAB color response from ColorSpec LAB",
+            np.clip(128.0 + 4.0*lab_color_response, 0, 255).astype(np.uint8),
+        )
         debug.addStage("LAB hotspot mask", hotspot_mask)
 
-    # Same LAB hotspot ranking / spatial de-duplication as the tennis-ball path.
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(hotspot_mask, connectivity=8)
-    response_sums = np.bincount(labels.ravel(), weights=positive_response.ravel(), minlength=num_labels)
-    candidates = []
+    # Rank spatially distinct LAB hotspot components.
+    num_hotspot_labels, hotspot_labels, hotspot_stats, _ = cv2.connectedComponentsWithStats(
+        hotspot_mask, connectivity=8
+    )
+    response_sums = np.bincount(
+        hotspot_labels.ravel(), weights=positive_response.ravel(),
+        minlength=num_hotspot_labels,
+    )
+    hotspot_candidates = []
 
-    for label in range(1, num_labels):
-        area = int(stats[label, cv2.CC_STAT_AREA])
+    for hotspot_label in range(1, num_hotspot_labels):
+        area = int(hotspot_stats[hotspot_label, cv2.CC_STAT_AREA])
         if area < MIN_HOTSPOT_AREA_PX:
             continue
 
-        x, y = int(stats[label, cv2.CC_STAT_LEFT]), int(stats[label, cv2.CC_STAT_TOP])
-        w, h = int(stats[label, cv2.CC_STAT_WIDTH]), int(stats[label, cv2.CC_STAT_HEIGHT])
-        mean_response = float(response_sums[label]/max(area, 1))
-        candidates.append((mean_response*(area**0.10), area, x, y, w, h, mean_response))
+        x = int(hotspot_stats[hotspot_label, cv2.CC_STAT_LEFT])
+        y = int(hotspot_stats[hotspot_label, cv2.CC_STAT_TOP])
+        w = int(hotspot_stats[hotspot_label, cv2.CC_STAT_WIDTH])
+        h = int(hotspot_stats[hotspot_label, cv2.CC_STAT_HEIGHT])
+        mean_response = float(response_sums[hotspot_label]/area)
+        hotspot_candidates.append(
+            (mean_response*(area**0.10), area, x, y, w, h, mean_response, hotspot_label)
+        )
+
+    hotspot_candidates.sort(reverse=True)
+    candidates = []
+
+    for candidate in hotspot_candidates:
+        _, _, x, y, w, h, _, _ = candidate
+        cx, cy = x + 0.5*w, y + 0.5*h
+
+        if any(
+            (cx - (sx + 0.5*sw))**2 + (cy - (sy + 0.5*sh))**2
+            < (0.75*max(w, h, sw, sh))**2
+            for _, _, sx, sy, sw, sh, _, _ in candidates
+        ):
+            continue
+
+        candidates.append(candidate)
+        if len(candidates) >= MAX_CANDIDATES:
+            break
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda candidate: candidate[0], reverse=True)
-    selected_candidates = []
-
-    for candidate in candidates:
-        _, _, x, y, w, h, _ = candidate
-        center_x, center_y = x + 0.5*w, y + 0.5*h
-        duplicate = False
-
-        for selected_candidate in selected_candidates:
-            _, _, sx, sy, sw, sh, _ = selected_candidate
-            selected_center_x, selected_center_y = sx + 0.5*sw, sy + 0.5*sh
-            dx, dy = center_x - selected_center_x, center_y - selected_center_y
-            duplicate_distance = 0.75*max(w, h, sw, sh)
-
-            if dx*dx + dy*dy < duplicate_distance*duplicate_distance:
-                duplicate = True
-                break
-
-        if not duplicate:
-            selected_candidates.append(candidate)
-        if len(selected_candidates) >= MAX_CANDIDATES:
-            break
-
-    candidates = selected_candidates
-
     if debug is not None:
-        candidate_frame = frame.copy()
-        for candidate_index, (score, area, x, y, w, h, mean_response) in enumerate(candidates, start=1):
-            cv2.rectangle(candidate_frame, (x, y), (x + w, y + h), (0, 255, 255), 1)
+        candidate_debug = frame.copy()
+        for i, (score, area, x, y, w, h, mean_response, _) in enumerate(candidates, 1):
+            cv2.rectangle(candidate_debug, (x, y), (x + w, y + h), (0, 255, 255), 1)
             cv2.putText(
-                candidate_frame,
-                f"{candidate_index}: area={area} resp={mean_response:.1f} score={score:.1f}",
+                candidate_debug,
+                f"{i}: area={area} resp={mean_response:.1f} score={score:.1f}",
                 (x, max(15, y - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.40,
                 (0, 255, 255), 1, cv2.LINE_AA,
             )
-        debug.addStage("LAB hotspot candidates", candidate_frame)
+        debug.addStage("LAB hotspot candidates", candidate_debug)
+
+    # Build ONE full-frame loose HSV mask.
+    hsv_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    raw_hsv_mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+
+    for color_id in object_vision_spec.color_ids:
+        color_spec = COLOR_SPECS[color_id]
+        for lower_hsv, upper_hsv in color_spec.hsv_ranges:
+            loose_lower_hsv = np.clip(
+                lower_hsv.astype(np.int16) - LOOSE_HSV_LOWER_SUBTRACTION,
+                0, 255,
+            ).astype(np.uint8)
+            raw_hsv_mask = cv2.bitwise_or(
+                raw_hsv_mask, cv2.inRange(hsv_frame, loose_lower_hsv, upper_hsv)
+            )
+
+    # LAB gate suppresses low-chroma skin/gray pixels even if their HSV hue wanders
+    # into the target range.
+    minimum_seed_chroma = MIN_SEED_LAB_CHROMA_FACTOR*reference_chroma_strength
+    seed_lab_matches = (
+        (lab_color_response > 0.0)
+        & (lab_color_response >= MIN_SEED_LAB_DIRECTION_COSINE*pixel_chroma_strength)
+        & (pixel_chroma_strength >= minimum_seed_chroma)
+    )
+    seed_mask = cv2.bitwise_and(
+        raw_hsv_mask, seed_lab_matches.astype(np.uint8)*255
+    )
+
+    # Tiny close only. We still explicitly join components below, so do not use a
+    # large morphology kernel that could connect the plane to nearby skin.
+    seed_mask = cv2.morphologyEx(
+        seed_mask, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+
+    if debug is not None:
+        debug.addStage("Full-frame loose HSV mask", raw_hsv_mask)
+        debug.addStage("Full-frame HSV + LAB gated mask", seed_mask)
+
+    num_seed_labels, seed_labels, seed_stats, _ = cv2.connectedComponentsWithStats(
+        seed_mask, connectivity=8
+    )
 
     best_result, best_score = None, -np.inf
 
-    for candidate_index, (_, _, hot_x, hot_y, hot_w, hot_h, _) in enumerate(candidates, start=1):
-        hotspot_size = max(hot_w, hot_h)
-        padding = max(MIN_HOTSPOT_PADDING_PX, int(HOTSPOT_PADDING_FACTOR*hotspot_size))
-        x1, y1 = max(0, hot_x - padding), max(0, hot_y - padding)
-        x2 = min(frame.shape[1], hot_x + hot_w + padding)
-        y2 = min(frame.shape[0], hot_y + hot_h + padding)
+    for candidate_index, (hotspot_score, _, hot_x, hot_y, hot_w, hot_h, _, hotspot_label) in enumerate(candidates, 1):
+        hotspot_component = (hotspot_labels == hotspot_label).astype(np.uint8)*255
+        hotspot_anchor = cv2.dilate(
+            hotspot_component,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
+            iterations=1,
+        ).astype(bool)
 
-        roi_frame = np.ascontiguousarray(frame[y1:y2, x1:x2])
-        if roi_frame.size == 0 or roi_frame.shape[0] < 2 or roi_frame.shape[1] < 2:
+        # Primary color component MUST overlap this exact LAB hotspot.
+        best_primary = None
+        for seed_label in np.unique(seed_labels[hotspot_anchor]):
+            seed_label = int(seed_label)
+            if seed_label == 0:
+                continue
+
+            area = int(seed_stats[seed_label, cv2.CC_STAT_AREA])
+            if area < object_vision_spec.minimum_contour_area_px:
+                continue
+
+            overlap = int(np.count_nonzero(
+                (seed_labels == seed_label) & hotspot_anchor
+            ))
+            rank = (overlap, area)
+            if best_primary is None or rank > best_primary[0]:
+                best_primary = (rank, seed_label, area)
+
+        if best_primary is None:
             continue
 
-        # Same loose-HSV acquisition as the tennis-ball detector.
-        roi_hsv = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)
-        seed_mask = np.zeros(roi_hsv.shape[:2], dtype=np.uint8)
+        _, primary_label, primary_area = best_primary
+        px = int(seed_stats[primary_label, cv2.CC_STAT_LEFT])
+        py = int(seed_stats[primary_label, cv2.CC_STAT_TOP])
+        pw = int(seed_stats[primary_label, cv2.CC_STAT_WIDTH])
+        ph = int(seed_stats[primary_label, cv2.CC_STAT_HEIGHT])
 
-        for color_id in object_vision_spec.color_ids:
-            color_spec = COLOR_SPECS[color_id]
-            for lower_hsv, upper_hsv in color_spec.hsv_ranges:
-                loose_lower_hsv = np.clip(
-                    lower_hsv.astype(np.int16) - LOOSE_HSV_LOWER_SUBTRACTION, 0, 255,
-                ).astype(np.uint8)
-                seed_mask = cv2.bitwise_or(
-                    seed_mask, cv2.inRange(roi_hsv, loose_lower_hsv, upper_hsv)
-                )
-
-        num_seed_labels, seed_labels, seed_stats, _ = cv2.connectedComponentsWithStats(
-            seed_mask, connectivity=8
+        # Scale from the MINOR dimension. The major dimension of an airplane is huge
+        # and was the reason the old centroid-distance joining swallowed clutter.
+        join_radius = int(np.clip(round(0.10*min(pw, ph)), 3, MAX_JOIN_GAP_PX))
+        join_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2*join_radius + 1, 2*join_radius + 1)
         )
-        best_seed = None
+        minimum_joined_area = max(
+            4, int(round(MIN_JOINED_COMPONENT_AREA_FACTOR*primary_area))
+        )
 
-        for seed_label in range(1, num_seed_labels):
-            seed_area = int(seed_stats[seed_label, cv2.CC_STAT_AREA])
-            if seed_area < object_vision_spec.minimum_contour_area_px:
-                continue
+        selected_labels = {primary_label}
 
-            sx = int(seed_stats[seed_label, cv2.CC_STAT_LEFT])
-            sy = int(seed_stats[seed_label, cv2.CC_STAT_TOP])
-            sw = int(seed_stats[seed_label, cv2.CC_STAT_WIDTH])
-            sh = int(seed_stats[seed_label, cv2.CC_STAT_HEIGHT])
+        # Iteratively add only components whose PIXELS lie within a small gap of the
+        # currently selected plane fragments.
+        for _ in range(MAX_JOIN_ITERATIONS):
+            selected_mask = np.isin(
+                seed_labels, list(selected_labels)
+            ).astype(np.uint8)*255
+            nearby = cv2.dilate(selected_mask, join_kernel, iterations=1) != 0
 
-            if best_seed is None or seed_area > best_seed[0]:
-                best_seed = (seed_area, seed_label, sx, sy, sw, sh)
+            added = False
+            for other_label in np.unique(seed_labels[nearby]):
+                other_label = int(other_label)
+                if other_label == 0 or other_label in selected_labels:
+                    continue
+                if int(seed_stats[other_label, cv2.CC_STAT_AREA]) < minimum_joined_area:
+                    continue
 
-        if debug is not None:
-            raw_seed_debug = np.zeros(frame.shape[:2], dtype=np.uint8)
-            raw_seed_debug[y1:y2, x1:x2] = seed_mask
-            debug.addStage(f"Candidate {candidate_index} loose HSV seed mask - raw", raw_seed_debug)
+                selected_labels.add(other_label)
+                added = True
 
-        if best_seed is None:
-            continue
+            if not added:
+                break
 
-        seed_area, seed_label, sx, sy, sw, sh = best_seed
+        joined_mask = np.isin(
+            seed_labels, list(selected_labels)
+        ).astype(np.uint8)*255
 
-        if debug is not None:
-            component_mask = (seed_labels == seed_label).astype(np.uint8)*255
-            local_contours, _ = cv2.findContours(
-                component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-            )
-            if local_contours:
-                selected_debug = frame.copy()
-                selected_contour = max(local_contours, key=cv2.contourArea)
-                selected_contour += np.array([[[x1, y1]]], dtype=np.int32)
-                cv2.rectangle(selected_debug, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
-                cv2.drawContours(selected_debug, [selected_contour], -1, (0, 255, 255), 1)
-                debug.addStage(f"Candidate {candidate_index} selected HSV seed", selected_debug)
-
-        # Same nearby-component retention as the tennis-ball path.
-        seed_center_x, seed_center_y = sx + 0.5*sw, sy + 0.5*sh
-        min_secondary_area = MIN_SECONDARY_SEED_AREA_FACTOR*seed_area
-        max_secondary_distance_sq = (MAX_SECONDARY_SEED_DISTANCE_FACTOR*max(sw, sh))**2
-
-        keep_seed_label = np.zeros(num_seed_labels, dtype=np.uint8)
-        keep_seed_label[seed_label] = 255
-
-        for other_label in range(1, num_seed_labels):
-            if other_label == seed_label:
-                continue
-
-            other_area = int(seed_stats[other_label, cv2.CC_STAT_AREA])
-            if other_area < min_secondary_area:
-                continue
-
-            ox = int(seed_stats[other_label, cv2.CC_STAT_LEFT])
-            oy = int(seed_stats[other_label, cv2.CC_STAT_TOP])
-            ow = int(seed_stats[other_label, cv2.CC_STAT_WIDTH])
-            oh = int(seed_stats[other_label, cv2.CC_STAT_HEIGHT])
-            dx = ox + 0.5*ow - seed_center_x
-            dy = oy + 0.5*oh - seed_center_y
-
-            if dx*dx + dy*dy <= max_secondary_distance_sq:
-                keep_seed_label[other_label] = 255
-
-        seed_mask = keep_seed_label[seed_labels]
-
-        if debug is not None:
-            filtered_seed_debug = np.zeros(frame.shape[:2], dtype=np.uint8)
-            filtered_seed_debug[y1:y2, x1:x2] = seed_mask
-            debug.addStage(
-                f"Candidate {candidate_index} joined HSV blobs - filtered",
-                filtered_seed_debug,
-            )
-
-        # Important for creased planes: after joining the separate HSV blobs, use the
-        # FULL joined mask for both center and radial-search extent. Previously the ray
-        # length still mostly came from the primary blob, which could stop before
-        # reaching another wing fragment even though that fragment had been retained.
-        joined_points = cv2.findNonZero(seed_mask)
-        if joined_points is None:
-            continue
-
-        _, _, joined_w, joined_h = cv2.boundingRect(joined_points)
-        seed_moments = cv2.moments(seed_mask, binaryImage=True)
-        if seed_moments["m00"] == 0:
-            continue
-
-        center_u = x1 + seed_moments["m10"]/seed_moments["m00"]
-        center_v = y1 + seed_moments["m01"]/seed_moments["m00"]
-        seed_size = max(joined_w, joined_h, hot_w, hot_h)
-
-        # Do NOT use generic edge strength here. A folded paper plane has strong
-        # internal crease edges that can be stronger than the outer silhouette.
-        #
-        # Instead, use LAB as a loose target-COLOR support mask. HSV only tells us
-        # which support regions belong to this candidate.
-        lab_response_roi = lab_color_response[y1:y2, x1:x2]
-        minimum_lab_support = MIN_LAB_SUPPORT_RESPONSE_FACTOR*reference_chroma_strength
-        lab_support_mask = (lab_response_roi >= minimum_lab_support).astype(np.uint8)*255
-
-        # Close small dark gaps caused by folds/shadows. Do not OPEN/erode: preserving
-        # the outer triangle tips matters more than removing a few isolated support pixels.
-        lab_support_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
-        lab_support_mask = cv2.morphologyEx(
-            lab_support_mask, cv2.MORPH_CLOSE, lab_support_kernel,
+        # Close only crease-sized holes/gaps inside the selected plane fragments.
+        joined_mask = cv2.morphologyEx(
+            joined_mask, cv2.MORPH_CLOSE, join_kernel
         )
 
         if debug is not None:
-            roi_debug = frame.copy()
-            cv2.rectangle(roi_debug, (x1, y1), (x2 - 1, y2 - 1), (255, 255, 255), 1)
-            debug.addStage(f"Candidate {candidate_index} ROI", roi_debug)
-
-            support_debug = np.zeros(frame.shape[:2], dtype=np.uint8)
-            support_debug[y1:y2, x1:x2] = lab_support_mask
+            anchor_debug = frame.copy()
+            cv2.rectangle(
+                anchor_debug, (hot_x, hot_y),
+                (hot_x + hot_w, hot_y + hot_h), (0, 255, 255), 2,
+            )
+            cv2.putText(
+                anchor_debug,
+                f"candidate {candidate_index}: anchor hotspot | join radius={join_radius}px",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.48,
+                (0, 255, 255), 2, cv2.LINE_AA,
+            )
             debug.addStage(
-                f"Candidate {candidate_index} loose LAB color support",
-                support_debug,
+                f"Candidate {candidate_index} hotspot anchor",
+                anchor_debug,
             )
 
-        # Associate LAB support components with the already-joined HSV blobs. Slightly
-        # dilate HSV only for association so a 1-2 px color-space boundary mismatch
-        # does not prevent a legitimate LAB region from being retained.
-        association_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        hsv_association_mask = cv2.dilate(seed_mask, association_kernel, iterations=1)
-
-        num_lab_labels, lab_labels, lab_stats, _ = cv2.connectedComponentsWithStats(
-            lab_support_mask, connectivity=8,
-        )
-        overlapping_lab_labels = np.unique(lab_labels[hsv_association_mask != 0])
-        overlapping_lab_labels = overlapping_lab_labels[overlapping_lab_labels != 0]
-
-        if len(overlapping_lab_labels) == 0:
-            continue
-
-        # Keep every LAB color component supported by one of the separate HSV blobs.
-        # This is what lets crease-separated parts of the same pink plane contribute
-        # jointly to the final geometry.
-        selected_lab_mask = np.isin(lab_labels, overlapping_lab_labels).astype(np.uint8)*255
-        selected_lab_points = cv2.findNonZero(selected_lab_mask)
-        if selected_lab_points is None:
-            continue
-
-        if debug is not None:
-            selected_support_debug = np.zeros(frame.shape[:2], dtype=np.uint8)
-            selected_support_debug[y1:y2, x1:x2] = selected_lab_mask
+            primary_debug = np.zeros(frame.shape[:2], dtype=np.uint8)
+            primary_debug[seed_labels == primary_label] = 255
             debug.addStage(
-                f"Candidate {candidate_index} HSV-associated LAB support",
-                selected_support_debug,
+                f"Candidate {candidate_index} primary anchored color blob",
+                primary_debug,
+            )
+            debug.addStage(
+                f"Candidate {candidate_index} small-gap joined blobs",
+                joined_mask,
             )
 
-        # Geometry comes from the convex envelope of all retained target-color pixels.
-        # Internal crease gaps/lines therefore do not create candidate edges.
-        support_points = selected_lab_points.reshape(-1, 2).astype(np.float32)
-        support_points += np.array([x1, y1], dtype=np.float32)
-        hull = cv2.convexHull(support_points)
+        points = cv2.findNonZero(joined_mask)
+        if points is None:
+            continue
+
+        hull = cv2.convexHull(points)
         perimeter = float(cv2.arcLength(hull, True))
-        if perimeter <= 0.0:
+        hull_area = abs(float(cv2.contourArea(hull)))
+        if perimeter <= 0.0 or hull_area < object_vision_spec.minimum_contour_area_px:
             continue
 
-        triangle = cv2.approxPolyDP(
-            hull, object_vision_spec.polygon_epsilon_ratio*perimeter, True
-        )
-        if len(triangle) != 3 or not cv2.isContourConvex(triangle):
+        # Try the configured epsilon first, then only slightly larger values. The
+        # convex hull should already have removed crease geometry.
+        triangle = None
+        observed_sides = None
+        for epsilon_ratio in sorted(set((
+            object_vision_spec.polygon_epsilon_ratio, 0.035, 0.040, 0.050,
+        ))):
+            proposal = cv2.approxPolyDP(hull, epsilon_ratio*perimeter, True)
+            observed_sides = len(proposal)
+            if len(proposal) == 3 and cv2.isContourConvex(proposal):
+                triangle = proposal.reshape(3, 2).astype(np.float64)
+                break
+
+        if triangle is None:
             if debug is not None:
                 rejected = frame.copy()
-                cv2.polylines(
-                    rejected, [np.round(hull).astype(np.int32)],
-                    True, (0, 0, 255), 1,
-                )
+                cv2.polylines(rejected, [hull], True, (0, 0, 255), 1)
                 cv2.putText(
-                    rejected, f"REJECT: color hull approximated to {len(triangle)} sides",
-                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+                    rejected,
+                    f"REJECT: color hull -> {observed_sides} sides, not 3",
+                    (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
                     (0, 0, 255), 2, cv2.LINE_AA,
                 )
                 debug.addStage(
@@ -542,86 +535,68 @@ def findSingleObjectTriangleColorBlob(
                 )
             continue
 
-        triangle = triangle.reshape(3, 2).astype(np.float64)
         triangle_area = abs(float(cv2.contourArea(triangle.astype(np.float32))))
-        hull_area = abs(float(cv2.contourArea(hull)))
-        if triangle_area < object_vision_spec.minimum_contour_area_px or hull_area <= 0.0:
+        fill_ratio = min(triangle_area, hull_area)/max(triangle_area, hull_area)
+        if fill_ratio < 0.72:
             continue
 
-        fill_ratio = min(hull_area, triangle_area)/max(hull_area, triangle_area)
-        if fill_ratio < 0.70:
-            continue
+        moments = cv2.moments(triangle.astype(np.float32))
+        center = (
+            np.mean(triangle, axis=0)
+            if abs(moments["m00"]) <= 1e-9
+            else np.array([
+                moments["m10"]/moments["m00"],
+                moments["m01"]/moments["m00"],
+            ])
+        )
+
+        bx, by, bw, bh = cv2.boundingRect(triangle.astype(np.float32))
+        color_id = object_vision_spec.color_ids[0]
+        detection = Detection(
+            float(center[0]), float(center[1]), float(bw), float(bh),
+            shapes=[ShapeDetection(
+                vertices_px=triangle, color_id=color_id, num_sides=3,
+            )],
+        )
+
+        # Prefer large, triangle-like blobs associated with strong target-color hotspots.
+        score = hotspot_score*triangle_area*fill_ratio
+        if score > best_score:
+            best_score = score
+            best_result = detection, hull, fill_ratio, join_radius
 
         if debug is not None:
             geometry_debug = frame.copy()
-            cv2.polylines(
-                geometry_debug, [np.round(hull).astype(np.int32)],
-                True, (255, 0, 255), 1,
-            )
+            cv2.polylines(geometry_debug, [hull], True, (255, 0, 255), 1)
             cv2.polylines(
                 geometry_debug,
                 [np.round(triangle).astype(np.int32).reshape(-1, 1, 2)],
-                True, COLOR_SPECS[object_vision_spec.color_ids[0]].draw_bgr,
-                2, cv2.LINE_AA,
+                True, COLOR_SPECS[color_id].draw_bgr, 2, cv2.LINE_AA,
             )
             cv2.putText(
                 geometry_debug,
-                f"COLOR HULL -> TRIANGLE | fill={fill_ratio:.2f}",
-                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-                COLOR_SPECS[object_vision_spec.color_ids[0]].draw_bgr,
-                2, cv2.LINE_AA,
+                f"PASS | fill={fill_ratio:.2f} | joined={len(selected_labels)} blobs",
+                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
+                COLOR_SPECS[color_id].draw_bgr, 2, cv2.LINE_AA,
             )
             debug.addStage(
                 f"Candidate {candidate_index} color hull + triangle",
                 geometry_debug,
             )
 
-        moments = cv2.moments(triangle.astype(np.float32))
-        if abs(moments["m00"]) <= 1e-9:
-            center_u, center_v = np.mean(triangle, axis=0)
-        else:
-            center_u = moments["m10"]/moments["m00"]
-            center_v = moments["m01"]/moments["m00"]
-
-        bx, by, bw, bh = cv2.boundingRect(triangle.astype(np.float32))
-        color_id = object_vision_spec.color_ids[0]
-        shape = ShapeDetection(vertices_px=triangle, color_id=color_id, num_sides=3)
-        detection = Detection(
-            float(center_u), float(center_v), float(bw), float(bh), shapes=[shape]
-        )
-
-        score = triangle_area*fill_ratio
-        if score > best_score:
-            best_score = score
-            best_result = detection, hull, fill_ratio
-
-        if debug is not None:
-            triangle_debug = frame.copy()
-            cv2.polylines(
-                triangle_debug,
-                [np.round(triangle).astype(np.int32).reshape(-1, 1, 2)],
-                True, COLOR_SPECS[color_id].draw_bgr, 2, cv2.LINE_AA,
-            )
-            cv2.putText(
-                triangle_debug,
-                f"PASS triangle | area={triangle_area:.0f}px | fill={fill_ratio:.2f}",
-                (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
-                COLOR_SPECS[color_id].draw_bgr, 2, cv2.LINE_AA,
-            )
-            debug.addStage(f"Candidate {candidate_index} triangle fit", triangle_debug)
-
     if best_result is None:
         return None
 
-    detection, hull, fill_ratio = best_result
+    detection, hull, fill_ratio, join_radius = best_result
 
     if debug is not None:
         final = frame.copy()
-        cv2.polylines(final, [np.round(hull).astype(np.int32)], True, (255, 0, 255), 1)
+        cv2.polylines(final, [hull], True, (255, 0, 255), 1)
         drawDetection(final, detection)
         cv2.putText(
-            final, f"BEST PURE-COLOR TRIANGLE | fill={fill_ratio:.2f}",
-            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.52,
+            final,
+            f"BEST PURE-COLOR TRIANGLE | fill={fill_ratio:.2f} | join={join_radius}px",
+            (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.50,
             (0, 255, 0), 2, cv2.LINE_AA,
         )
         debug.addStage("Final pure-color triangle", final)
