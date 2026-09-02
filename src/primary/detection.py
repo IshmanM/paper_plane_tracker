@@ -224,9 +224,33 @@ def findSingleObjectTriangleColorBlob(
     MIN_HOTSPOT_DIRECTION_COSINE = 0.82
     MIN_HOTSPOT_AREA_PX_FULL_RES = 6
 
-    LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 10, 20], dtype=np.int16)
+    # The paper-plane nose is often the darkest part of the colored face. LAB only
+    # selects the trusted component, so the RAW HSV mask must retain those dark pixels
+    # for the full-resolution hull/edge fit. Keep hue unchanged to avoid broadening the
+    # mask toward skin/background; relax saturation slightly and value more strongly.
+    LOOSE_HSV_LOWER_SUBTRACTION = np.array([0, 10, 50], dtype=np.int16)
     MIN_SEED_LAB_DIRECTION_COSINE = 0.88
     MIN_SEED_LAB_CHROMA_FACTOR = 0.45
+
+    # Recover small RAW-HSV islands separated from the selected component by a few
+    # dark pixels. Dilation is used ONLY to discover nearby component labels; its
+    # artificial bridge pixels never enter the contour/hull geometry.
+    RAW_FRAGMENT_GAP_FACTOR = 0.025
+    MIN_RAW_FRAGMENT_GAP_PX = 2
+    MAX_RAW_FRAGMENT_GAP_PX = 5
+    MIN_RAW_FRAGMENT_AREA_PX = 2
+    MAX_RAW_FRAGMENT_AREA_FACTOR = 0.20
+    MAX_RAW_FRAGMENT_DIAGONAL_FACTOR = 0.30
+
+    # The dark nose can appear as a longer chain of tiny HSV islands. Permit longer
+    # recovery only inside a narrow band continuing forward from the rough triangle
+    # apex, and require that the islands form a gap-bounded chain from the main blob.
+    TIP_RECOVERY_EXTENSION_FACTOR = 0.35
+    TIP_RECOVERY_HALF_WIDTH_FACTOR = 0.04
+    TIP_RECOVERY_CHAIN_GAP_FACTOR = 0.06
+    MIN_TIP_RECOVERY_CHAIN_GAP_PX = 4
+    MAX_TIP_RECOVERY_CHAIN_GAP_PX = 12
+    MIN_TIP_FRAGMENT_INSIDE_FRACTION = 0.75
 
     lab_direction = np.zeros(2, dtype=np.float32)
     reference_chroma_strengths = []
@@ -463,17 +487,237 @@ def findSingleObjectTriangleColorBlob(
         if primary_area < object_vision_spec.minimum_contour_area_px:
             continue
 
-        # Everything after component selection is local to this blob's tight bounding box.
-        # Points/contours are offset back into full-frame coordinates, so geometry is unchanged.
-        primary_x = int(raw_stats[best_raw_label, cv2.CC_STAT_LEFT])
-        primary_y = int(raw_stats[best_raw_label, cv2.CC_STAT_TOP])
-        primary_w = int(raw_stats[best_raw_label, cv2.CC_STAT_WIDTH])
-        primary_h = int(raw_stats[best_raw_label, cv2.CC_STAT_HEIGHT])
+        # Attach only small, immediately adjacent RAW-HSV fragments. This recovers
+        # disconnected dark nose pixels without closing/blurring the whole mask and
+        # without ever supplying synthetic pixels to the final geometry.
+        base_x = int(raw_stats[best_raw_label, cv2.CC_STAT_LEFT])
+        base_y = int(raw_stats[best_raw_label, cv2.CC_STAT_TOP])
+        base_w = int(raw_stats[best_raw_label, cv2.CC_STAT_WIDTH])
+        base_h = int(raw_stats[best_raw_label, cv2.CC_STAT_HEIGHT])
+        base_diagonal = float(np.hypot(base_w, base_h))
+        fragment_gap_px = int(np.clip(
+            round(RAW_FRAGMENT_GAP_FACTOR*base_diagonal),
+            MIN_RAW_FRAGMENT_GAP_PX, MAX_RAW_FRAGMENT_GAP_PX,
+        ))
+
+        recovery_x1 = max(0, base_x - fragment_gap_px)
+        recovery_y1 = max(0, base_y - fragment_gap_px)
+        recovery_x2 = min(frame.shape[1], base_x + base_w + fragment_gap_px)
+        recovery_y2 = min(frame.shape[0], base_y + base_h + fragment_gap_px)
+        recovery_labels_roi = raw_labels[recovery_y1:recovery_y2, recovery_x1:recovery_x2]
+        base_component_roi = (recovery_labels_roi == best_raw_label).astype(np.uint8)*255
+        nearby_support = cv2.dilate(
+            base_component_roi,
+            cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (2*fragment_gap_px + 1, 2*fragment_gap_px + 1),
+            ),
+            iterations=1,
+        ).astype(bool)
+
+        geometry_raw_labels = [best_raw_label]
+        for raw_label in np.unique(recovery_labels_roi[nearby_support]):
+            raw_label = int(raw_label)
+            if raw_label == 0 or raw_label == best_raw_label:
+                continue
+
+            fragment_area = int(raw_stats[raw_label, cv2.CC_STAT_AREA])
+            fragment_w = int(raw_stats[raw_label, cv2.CC_STAT_WIDTH])
+            fragment_h = int(raw_stats[raw_label, cv2.CC_STAT_HEIGHT])
+            fragment_diagonal = float(np.hypot(fragment_w, fragment_h))
+
+            if not (
+                MIN_RAW_FRAGMENT_AREA_PX <= fragment_area
+                <= MAX_RAW_FRAGMENT_AREA_FACTOR*primary_area
+                and fragment_diagonal
+                <= MAX_RAW_FRAGMENT_DIAGONAL_FACTOR*base_diagonal
+            ):
+                continue
+
+            geometry_raw_labels.append(raw_label)
+
+        # Longer, direction-aware recovery for a sparsely segmented dark nose.
+        # First infer an apex from the main component alone; the longest median of
+        # an elongated triangle points to its nose much more reliably than globally
+        # dilating/closing the raw mask.
+        base_mask_tight = (
+            raw_labels[base_y:base_y + base_h, base_x:base_x + base_w]
+            == best_raw_label
+        ).astype(np.uint8)*255
+        base_points_local = cv2.findNonZero(base_mask_tight)
+        rough_base_triangle = None
+
+        if base_points_local is not None:
+            base_points = (
+                base_points_local
+                + np.array([[[base_x, base_y]]], dtype=np.int32)
+            )
+            base_hull = cv2.convexHull(base_points)
+            base_perimeter = float(cv2.arcLength(base_hull, True))
+
+            if base_perimeter > 0.0:
+                for epsilon_ratio in (
+                    object_vision_spec.polygon_epsilon_ratio, 0.05, 0.07,
+                ):
+                    proposal = cv2.approxPolyDP(
+                        base_hull, epsilon_ratio*base_perimeter, True,
+                    )
+                    if len(proposal) == 3 and cv2.isContourConvex(proposal):
+                        rough_base_triangle = proposal.reshape(3, 2).astype(np.float64)
+                        break
+
+        if rough_base_triangle is not None:
+            median_lengths = []
+            for vertex_index in range(3):
+                other_vertices = np.delete(
+                    rough_base_triangle, vertex_index, axis=0,
+                )
+                opposite_midpoint = np.mean(other_vertices, axis=0)
+                median_lengths.append(float(np.linalg.norm(
+                    rough_base_triangle[vertex_index] - opposite_midpoint
+                )))
+
+            tip_index = int(np.argmax(median_lengths))
+            tip = rough_base_triangle[tip_index]
+            opposite_midpoint = np.mean(
+                np.delete(rough_base_triangle, tip_index, axis=0), axis=0,
+            )
+            tip_direction = tip - opposite_midpoint
+            tip_direction_norm = float(np.linalg.norm(tip_direction))
+
+            if tip_direction_norm > 1e-6:
+                tip_direction /= tip_direction_norm
+                tip_perpendicular = np.array(
+                    [-tip_direction[1], tip_direction[0]], dtype=np.float64,
+                )
+                tip_extension_px = max(
+                    4.0, TIP_RECOVERY_EXTENSION_FACTOR*base_diagonal,
+                )
+                tip_half_width_px = max(
+                    3.0, TIP_RECOVERY_HALF_WIDTH_FACTOR*base_diagonal,
+                )
+                tip_chain_gap_px = float(np.clip(
+                    TIP_RECOVERY_CHAIN_GAP_FACTOR*base_diagonal,
+                    MIN_TIP_RECOVERY_CHAIN_GAP_PX,
+                    MAX_TIP_RECOVERY_CHAIN_GAP_PX,
+                ))
+                tip_backtrack_px = float(fragment_gap_px)
+
+                band_start = tip - tip_backtrack_px*tip_direction
+                band_end = tip + tip_extension_px*tip_direction
+                band_polygon = np.asarray([
+                    band_start + tip_half_width_px*tip_perpendicular,
+                    band_end + tip_half_width_px*tip_perpendicular,
+                    band_end - tip_half_width_px*tip_perpendicular,
+                    band_start - tip_half_width_px*tip_perpendicular,
+                ], dtype=np.float64)
+                band_x1 = max(0, int(np.floor(np.min(band_polygon[:, 0]))))
+                band_y1 = max(0, int(np.floor(np.min(band_polygon[:, 1]))))
+                band_x2 = min(frame.shape[1], int(np.ceil(np.max(band_polygon[:, 0]))) + 1)
+                band_y2 = min(frame.shape[0], int(np.ceil(np.max(band_polygon[:, 1]))) + 1)
+
+                if band_x2 > band_x1 and band_y2 > band_y1:
+                    band_mask_roi = np.zeros(
+                        (band_y2 - band_y1, band_x2 - band_x1), dtype=np.uint8,
+                    )
+                    cv2.fillConvexPoly(
+                        band_mask_roi,
+                        np.round(
+                            band_polygon - np.array([band_x1, band_y1])
+                        ).astype(np.int32),
+                        255,
+                    )
+                    band_labels_roi = raw_labels[band_y1:band_y2, band_x1:band_x2]
+                    possible_tip_labels = np.unique(
+                        band_labels_roi[band_mask_roi != 0]
+                    )
+                    tip_fragment_candidates = []
+
+                    for raw_label in possible_tip_labels:
+                        raw_label = int(raw_label)
+                        if (
+                            raw_label == 0
+                            or raw_label == best_raw_label
+                        ):
+                            continue
+
+                        fragment_area = int(raw_stats[raw_label, cv2.CC_STAT_AREA])
+                        fragment_x = int(raw_stats[raw_label, cv2.CC_STAT_LEFT])
+                        fragment_y = int(raw_stats[raw_label, cv2.CC_STAT_TOP])
+                        fragment_w = int(raw_stats[raw_label, cv2.CC_STAT_WIDTH])
+                        fragment_h = int(raw_stats[raw_label, cv2.CC_STAT_HEIGHT])
+                        fragment_diagonal = float(np.hypot(fragment_w, fragment_h))
+
+                        if not (
+                            MIN_RAW_FRAGMENT_AREA_PX <= fragment_area
+                            <= MAX_RAW_FRAGMENT_AREA_FACTOR*primary_area
+                            and fragment_diagonal
+                            <= MAX_RAW_FRAGMENT_DIAGONAL_FACTOR*base_diagonal
+                        ):
+                            continue
+
+                        fragment_mask = (
+                            raw_labels[
+                                fragment_y:fragment_y + fragment_h,
+                                fragment_x:fragment_x + fragment_w,
+                            ] == raw_label
+                        )
+                        fragment_v, fragment_u = np.nonzero(fragment_mask)
+                        fragment_points = np.column_stack((
+                            fragment_u + fragment_x,
+                            fragment_v + fragment_y,
+                        )).astype(np.float64)
+                        relative = fragment_points - tip
+                        axial = relative@tip_direction
+                        lateral = np.abs(relative@tip_perpendicular)
+                        inside = (
+                            (axial >= -tip_backtrack_px)
+                            & (axial <= tip_extension_px)
+                            & (lateral <= tip_half_width_px)
+                        )
+
+                        if float(np.mean(inside)) < MIN_TIP_FRAGMENT_INSIDE_FRACTION:
+                            continue
+
+                        inside_axial = axial[inside]
+                        tip_fragment_candidates.append((
+                            float(np.min(inside_axial)),
+                            float(np.max(inside_axial)),
+                            raw_label,
+                        ))
+
+                    # A far isolated speck is not enough. Each accepted component must
+                    # continue a chain whose previous reach starts at the rough apex.
+                    current_tip_reach = 0.0
+                    for min_axial, max_axial, raw_label in sorted(tip_fragment_candidates):
+                        if min_axial > current_tip_reach + tip_chain_gap_px:
+                            continue
+                        if raw_label not in geometry_raw_labels:
+                            geometry_raw_labels.append(raw_label)
+                        current_tip_reach = max(current_tip_reach, max_axial)
+
+        # Everything after component selection is local to the union's tight bounding
+        # box. Points/contours are offset back to full-frame coordinates.
+        primary_x = min(
+            int(raw_stats[label, cv2.CC_STAT_LEFT]) for label in geometry_raw_labels
+        )
+        primary_y = min(
+            int(raw_stats[label, cv2.CC_STAT_TOP]) for label in geometry_raw_labels
+        )
+        primary_x2 = max(
+            int(raw_stats[label, cv2.CC_STAT_LEFT] + raw_stats[label, cv2.CC_STAT_WIDTH])
+            for label in geometry_raw_labels
+        )
+        primary_y2 = max(
+            int(raw_stats[label, cv2.CC_STAT_TOP] + raw_stats[label, cv2.CC_STAT_HEIGHT])
+            for label in geometry_raw_labels
+        )
+        primary_w, primary_h = primary_x2 - primary_x, primary_y2 - primary_y
         primary_mask_roi = (
-            raw_labels[
+            np.isin(raw_labels[
                 primary_y:primary_y + primary_h,
                 primary_x:primary_x + primary_w,
-            ] == best_raw_label
+            ], geometry_raw_labels)
         ).astype(np.uint8)*255
         primary_points_local = cv2.findNonZero(primary_mask_roi)
         if primary_points_local is None:
@@ -491,7 +735,8 @@ def findSingleObjectTriangleColorBlob(
             anchor_stage = frame.copy()
             cv2.rectangle(anchor_stage, (hx, hy), (hx + hw, hy + hh), (0, 255, 255), 2)
             cv2.putText(
-                anchor_stage, "raw HSV component -> hull (no geometry morphology)",
+                anchor_stage,
+                f"raw HSV component + {len(geometry_raw_labels) - 1} nearby fragments -> hull",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
                 0.46, (0, 255, 255), 2, cv2.LINE_AA,
             )
