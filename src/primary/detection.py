@@ -340,23 +340,31 @@ def findSingleObjectTriangleColorBlob(
         & (response >= MIN_SEED_LAB_DIRECTION_COSINE*chroma)
         & (chroma >= MIN_SEED_LAB_CHROMA_FACTOR*reference_chroma_strength)
     )
-    color_mask = cv2.bitwise_and(
+
+    # LAB is only a TRUST signal now. Do not let it erase valid HSV geometry.
+    # This is the same separation used successfully in the shape detector:
+    # trusted/cleaned pixels select the object; the complete raw component supplies
+    # its boundary geometry.
+    trusted_seed_mask = cv2.bitwise_and(
         raw_hsv_mask, seed_gate.astype(np.uint8)*255
     )
-
-    # Only tiny cleanup here. Larger cleanup is done on the selected object component.
-    color_mask = cv2.morphologyEx(
-        color_mask, cv2.MORPH_CLOSE,
+    trusted_seed_mask = cv2.morphologyEx(
+        trusted_seed_mask, cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+    )
+
+    # RAW HSV components are deliberately kept separate from the LAB-gated mask.
+    # A nose/tip pixel may be valid HSV but weak LAB because of lighting or shading.
+    num_raw_labels, raw_labels, raw_stats, _ = cv2.connectedComponentsWithStats(
+        raw_hsv_mask, connectivity=8
+    )
+    num_seed_labels, seed_labels, seed_stats, _ = cv2.connectedComponentsWithStats(
+        trusted_seed_mask, connectivity=8
     )
 
     if debug is not None:
         debug.addStage("Full-frame loose HSV mask", raw_hsv_mask)
-        debug.addStage("Full-frame HSV + LAB gated mask", color_mask)
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        color_mask, connectivity=8
-    )
+        debug.addStage("Full-frame HSV + LAB trusted seed", trusted_seed_mask)
 
     best_result = None
     best_score = -np.inf
@@ -369,90 +377,70 @@ def findSingleObjectTriangleColorBlob(
             iterations=1,
         ).astype(bool)
 
+        # First choose the TRUSTED seed component tied to this LAB hotspot.
         best_seed = None
-        for label in np.unique(labels[hotspot_anchor]):
-            label = int(label)
-            if label == 0:
+        for seed_label in np.unique(seed_labels[hotspot_anchor]):
+            seed_label = int(seed_label)
+            if seed_label == 0:
                 continue
 
-            area = int(stats[label, cv2.CC_STAT_AREA])
-            if area < object_vision_spec.minimum_contour_area_px:
-                continue
-
+            seed_area = int(seed_stats[seed_label, cv2.CC_STAT_AREA])
             overlap = int(np.count_nonzero(
-                (labels == label) & hotspot_anchor
+                (seed_labels == seed_label) & hotspot_anchor
             ))
-            rank = (overlap, area)
+            rank = (overlap, seed_area)
             if best_seed is None or rank > best_seed[0]:
-                best_seed = (rank, label, area)
+                best_seed = (rank, seed_label)
 
         if best_seed is None:
             continue
 
-        _, primary_label, primary_area = best_seed
-        primary_mask = (labels == primary_label).astype(np.uint8)*255
+        _, primary_seed_label = best_seed
+        primary_seed_mask = (seed_labels == primary_seed_label)
+
+        # Recover the COMPLETE RAW HSV component(s) overlapping that trusted seed.
+        # This restores valid nose/tip pixels that LAB rejected, without admitting
+        # arbitrary HSV blobs elsewhere in the frame.
+        overlapping_raw_labels = np.unique(raw_labels[primary_seed_mask])
+        overlapping_raw_labels = overlapping_raw_labels[overlapping_raw_labels != 0]
+        if len(overlapping_raw_labels) == 0:
+            continue
+
+        # Prefer the raw component with the strongest overlap with the trusted seed.
+        best_raw_label = max(
+            overlapping_raw_labels,
+            key=lambda raw_label: int(np.count_nonzero(
+                (raw_labels == raw_label) & primary_seed_mask
+            )),
+        )
+        best_raw_label = int(best_raw_label)
+        primary_area = int(raw_stats[best_raw_label, cv2.CC_STAT_AREA])
+
+        if primary_area < object_vision_spec.minimum_contour_area_px:
+            continue
+
+        primary_mask = (raw_labels == best_raw_label).astype(np.uint8)*255
         primary_points = cv2.findNonZero(primary_mask)
         if primary_points is None:
             continue
 
-        bx, by, bw, bh = cv2.boundingRect(primary_points)
-
-        # Geometry-only cleanup:
-        # close bridges narrow crease holes; open removes narrow skin/clutter appendages.
-        # Scale from the MINOR dimension so the kernel does not explode for a long plane.
-        minor_dim = max(1, min(bw, bh))
-        cleanup_radius = int(np.clip(round(0.035*minor_dim), 1, 3))
-        cleanup_kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE,
-            (2*cleanup_radius + 1, 2*cleanup_radius + 1),
-        )
-
-        geometry_mask = cv2.morphologyEx(
-            primary_mask, cv2.MORPH_CLOSE, cleanup_kernel
-        )
-        geometry_mask = cv2.morphologyEx(
-            geometry_mask, cv2.MORPH_OPEN, cleanup_kernel
-        )
-
-        # Opening may disconnect a narrow appendage. Keep the cleaned component that
-        # still overlaps the original hotspot anchor.
-        clean_count, clean_labels, clean_stats, _ = cv2.connectedComponentsWithStats(
-            geometry_mask, connectivity=8
-        )
-        clean_best = None
-
-        for clean_label in np.unique(clean_labels[hotspot_anchor]):
-            clean_label = int(clean_label)
-            if clean_label == 0:
-                continue
-
-            area = int(clean_stats[clean_label, cv2.CC_STAT_AREA])
-            overlap = int(np.count_nonzero(
-                (clean_labels == clean_label) & hotspot_anchor
-            ))
-            rank = (overlap, area)
-            if clean_best is None or rank > clean_best[0]:
-                clean_best = (rank, clean_label)
-
-        if clean_best is None:
-            continue
-
-        geometry_mask = (clean_labels == clean_best[1]).astype(np.uint8)*255
-        geometry_points = cv2.findNonZero(geometry_mask)
-        if geometry_points is None:
-            continue
+        # The recovered raw HSV component is already the correct object identity.
+        # Do NOT morphologically open/close it: opening erodes the paper-plane tip,
+        # while the convex hull below already ignores internal holes/creases and
+        # small boundary concavities.
+        geometry_mask = primary_mask
+        geometry_points = primary_points
 
         if debug is not None:
             anchor_stage = frame.copy()
             cv2.rectangle(anchor_stage, (hx, hy), (hx + hw, hy + hh), (0, 255, 255), 2)
             cv2.putText(
-                anchor_stage, f"cleanup radius={cleanup_radius}px",
+                anchor_stage, "raw HSV component -> hull (no geometry morphology)",
                 (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
-                0.48, (0, 255, 255), 2, cv2.LINE_AA,
+                0.46, (0, 255, 255), 2, cv2.LINE_AA,
             )
             debug.addStage(f"Candidate {candidate_index} hotspot anchor", anchor_stage)
-            debug.addStage(f"Candidate {candidate_index} primary anchored blob", primary_mask)
-            debug.addStage(f"Candidate {candidate_index} cleaned geometry blob", geometry_mask)
+            debug.addStage(f"Candidate {candidate_index} recovered raw HSV geometry", primary_mask)
 
         hull = cv2.convexHull(geometry_points)
         perimeter = float(cv2.arcLength(hull, True))
@@ -548,7 +536,7 @@ def findSingleObjectTriangleColorBlob(
 
         if score > best_score:
             best_score = score
-            best_result = detection, hull, occupancy, cleanup_radius, used_epsilon
+            best_result = detection, hull, occupancy, used_epsilon
 
         if debug is not None:
             final_geometry = frame.copy()
@@ -572,7 +560,7 @@ def findSingleObjectTriangleColorBlob(
     if best_result is None:
         return None
 
-    detection, hull, occupancy, cleanup_radius, used_epsilon = best_result
+    detection, hull, occupancy, used_epsilon = best_result
 
     if debug is not None:
         final = frame.copy()
@@ -580,7 +568,7 @@ def findSingleObjectTriangleColorBlob(
         drawDetection(final, detection)
         cv2.putText(
             final,
-            f"BEST PURE-COLOR TRIANGLE | occ={occupancy:.2f} clean={cleanup_radius}px eps={used_epsilon:.3f}",
+            f"BEST PURE-COLOR TRIANGLE | occ={occupancy:.2f} eps={used_epsilon:.3f}",
             (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
             0.46, (0, 255, 0), 2, cv2.LINE_AA,
         )
