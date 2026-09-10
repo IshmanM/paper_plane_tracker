@@ -1,9 +1,229 @@
+import errno
 import math
+from pathlib import Path
 import threading
 import time
 
 from gpiozero import DigitalOutputDevice
-from rpi_hardware_pwm import HardwarePWM
+
+
+class _LinuxSysfsPWM:
+    """
+    Minimal userspace wrapper for the Linux kernel PWM sysfs interface.
+
+    The interface is documented by the Linux kernel at:
+    https://docs.kernel.org/driver-api/pwm.html
+
+    This class is intentionally small and project-local so the motor driver
+    does not depend on a separate Raspberry Pi PWM package.
+    """
+
+    _SYSFS_ROOT = Path("/sys/class/pwm")
+    _EXPORT_TIMEOUT_S = 0.25
+    _POLL_INTERVAL_S = 0.005
+
+    def __init__(
+        self,
+        pwm_channel: int,
+        hz: int,
+        chip: int = 0,
+    ):
+        if isinstance(pwm_channel, bool) or not isinstance(pwm_channel, int):
+            raise ValueError("pwm_channel must be an integer")
+        if pwm_channel < 0:
+            raise ValueError("pwm_channel must be non-negative")
+
+        if isinstance(chip, bool) or not isinstance(chip, int):
+            raise ValueError("chip must be an integer")
+        if chip < 0:
+            raise ValueError("chip must be non-negative")
+
+        if isinstance(hz, bool) or not isinstance(hz, int) or hz <= 0:
+            raise ValueError("hz must be a positive integer")
+
+        self._channel = pwm_channel
+        self._chip = chip
+        self._frequency_hz = hz
+        self._period_ns = round(1_000_000_000 / hz)
+
+        if self._period_ns <= 0:
+            raise ValueError("PWM frequency is too high")
+
+        self._chip_path = self._SYSFS_ROOT / f"pwmchip{chip}"
+        self._pwm_path = self._chip_path / f"pwm{pwm_channel}"
+        self._exported_by_this_instance = False
+        self._started = False
+        self._closed = False
+
+        self._validate_pwm_chip()
+
+    def start(self, duty_cycle_percent: float = 0.0) -> None:
+        """Export, configure, and enable the PWM channel."""
+        self._ensure_not_closed()
+        duty_cycle_percent = self._validate_duty_cycle(duty_cycle_percent)
+
+        self._export_if_needed()
+
+        # Reconfigure from a known inactive state. Setting duty to zero before
+        # changing the period avoids an invalid duty > period intermediate state.
+        self._write_pwm_value("enable", 0)
+        self._write_pwm_value("duty_cycle", 0)
+        self._write_pwm_value("period", self._period_ns)
+        self._write_pwm_value(
+            "duty_cycle",
+            self._duty_cycle_ns(duty_cycle_percent),
+        )
+        self._write_pwm_value("enable", 1)
+        self._started = True
+
+    def change_duty_cycle(self, duty_cycle_percent: float) -> None:
+        """Change duty cycle while preserving the configured frequency."""
+        self._ensure_not_closed()
+        if not self._started:
+            raise RuntimeError("PWM must be started before changing duty cycle")
+
+        duty_cycle_percent = self._validate_duty_cycle(duty_cycle_percent)
+        self._write_pwm_value(
+            "duty_cycle",
+            self._duty_cycle_ns(duty_cycle_percent),
+        )
+
+    def stop(self) -> None:
+        """Drive the PWM inactive, disable it, and release it when appropriate."""
+        if self._closed:
+            return
+
+        first_error: Exception | None = None
+
+        if self._pwm_path.exists():
+            try:
+                # The kernel documentation notes that a disabled PWM is not
+                # guaranteed to hold a particular output state. Set zero duty
+                # first so the signal is inactive before disabling it.
+                self._write_pwm_value("duty_cycle", 0)
+            except Exception as exc:
+                first_error = exc
+
+            try:
+                self._write_pwm_value("enable", 0)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+
+        if self._exported_by_this_instance:
+            try:
+                self._write_chip_value("unexport", self._channel)
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+
+        self._started = False
+        self._closed = True
+
+        if first_error is not None:
+            raise first_error
+
+    def _validate_pwm_chip(self) -> None:
+        if not self._chip_path.is_dir():
+            raise RuntimeError(
+                f"Linux PWM chip not found at {self._chip_path}. "
+                "Ensure the Raspberry Pi PWM device-tree overlay is enabled "
+                "and that the expected pwmchip number is correct."
+            )
+
+        npwm_path = self._chip_path / "npwm"
+        try:
+            num_channels = int(npwm_path.read_text().strip())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(
+                f"Could not read PWM channel count from {npwm_path}"
+            ) from exc
+
+        if self._channel >= num_channels:
+            raise ValueError(
+                f"PWM channel {self._channel} is unavailable on pwmchip{self._chip}; "
+                f"the chip exposes {num_channels} channel(s)"
+            )
+
+    def _export_if_needed(self) -> None:
+        if self._pwm_path.is_dir():
+            return
+
+        try:
+            self._write_chip_value("export", self._channel)
+            self._exported_by_this_instance = True
+        except OSError as exc:
+            # Another process may have exported the channel between our path
+            # check and our write. Treat EBUSY as success if the channel appears.
+            if exc.errno != errno.EBUSY:
+                raise
+
+        deadline = time.monotonic() + self._EXPORT_TIMEOUT_S
+        required_files = ("period", "duty_cycle", "enable")
+
+        while time.monotonic() < deadline:
+            if self._pwm_path.is_dir() and all(
+                (self._pwm_path / name).exists()
+                for name in required_files
+            ):
+                return
+            time.sleep(self._POLL_INTERVAL_S)
+
+        raise RuntimeError(
+            f"PWM channel {self._channel} was exported, but {self._pwm_path} "
+            "did not become ready in time"
+        )
+
+    def _write_chip_value(self, filename: str, value: int) -> None:
+        path = self._chip_path / filename
+        self._write_sysfs_value(path, value)
+
+    def _write_pwm_value(self, filename: str, value: int) -> None:
+        path = self._pwm_path / filename
+        self._write_sysfs_value(path, value)
+
+    @staticmethod
+    def _write_sysfs_value(path: Path, value: int) -> None:
+        try:
+            path.write_text(str(value), encoding="ascii")
+        except PermissionError as exc:
+            raise PermissionError(
+                f"Permission denied writing {path}. Configure permissions for "
+                "the Linux PWM sysfs interface before running the endpoint."
+            ) from exc
+        except OSError as exc:
+            raise OSError(
+                exc.errno,
+                f"Could not write {value} to Linux PWM control {path}: {exc}",
+            ) from exc
+
+    def _duty_cycle_ns(self, duty_cycle_percent: float) -> int:
+        duty_ns = round(
+            self._period_ns * duty_cycle_percent / 100.0
+        )
+        return min(max(duty_ns, 0), self._period_ns)
+
+    @staticmethod
+    def _validate_duty_cycle(duty_cycle_percent: float) -> float:
+        if (
+            isinstance(duty_cycle_percent, bool)
+            or not isinstance(duty_cycle_percent, (int, float))
+        ):
+            raise ValueError("duty cycle must be numeric")
+
+        duty_cycle_percent = float(duty_cycle_percent)
+
+        if not math.isfinite(duty_cycle_percent):
+            raise ValueError("duty cycle must be finite")
+
+        if not 0.0 <= duty_cycle_percent <= 100.0:
+            raise ValueError("duty cycle must be between 0 and 100 percent")
+
+        return duty_cycle_percent
+
+    def _ensure_not_closed(self) -> None:
+        if self._closed:
+            raise RuntimeError("Cannot use PWM after it has been stopped")
 
 
 class DCMotorDriver:
@@ -123,7 +343,7 @@ class DCMotorDriver:
 
         self._sleep: DigitalOutputDevice | None = None
         self._directions: list[DigitalOutputDevice] = []
-        self._pwms: list[HardwarePWM] = []
+        self._pwms: list[_LinuxSysfsPWM] = []
 
         try:
             if sleep_gpio is not None:
@@ -146,7 +366,7 @@ class DCMotorDriver:
 
             for pwm_gpio, _ in self._motor_gpio_pairs:
                 self._pwms.append(
-                    HardwarePWM(
+                    _LinuxSysfsPWM(
                         pwm_channel=self._get_pwm_channel(
                             pwm_gpio
                         ),
@@ -303,7 +523,7 @@ class DCMotorDriver:
 
     @staticmethod
     def _set_motor_speed(
-        pwm: HardwarePWM,
+        pwm: _LinuxSysfsPWM,
         direction: DigitalOutputDevice,
         speed: float,
     ) -> None:
@@ -475,285 +695,3 @@ class DCMotorDriver:
             )
 
         return speed
-
-# import math
-# import threading
-
-# import pwmio
-
-
-# class DCMotorDriver:
-#     """
-#     Controls two DC motors through a dual H-bridge such as the DRV8833.
-
-#     Each motor GPIO pair is:
-#         (input_1_pin, input_2_pin)
-
-#     Speeds range from -1.0 to 1.0:
-#         positive: input 1 receives PWM
-#         negative: input 2 receives PWM
-#         zero:     both inputs are low
-#     """
-
-#     _MAX_DUTY_CYCLE = 65535
-
-#     def __init__(
-#         self,
-#         motor_1_gpio_pins: tuple[object, object],
-#         motor_2_gpio_pins: tuple[object, object],
-#         pwm_frequency_hz: int = 20000,
-#     ):
-#         self._validate_gpio_pair(
-#             gpio_pins=motor_1_gpio_pins,
-#             name="motor_1_gpio_pins",
-#         )
-#         self._validate_gpio_pair(
-#             gpio_pins=motor_2_gpio_pins,
-#             name="motor_2_gpio_pins",
-#         )
-
-#         if isinstance(pwm_frequency_hz, bool) or not isinstance(
-#             pwm_frequency_hz,
-#             int,
-#         ):
-#             raise ValueError("pwm_frequency_hz must be an integer")
-
-#         if pwm_frequency_hz <= 0:
-#             raise ValueError("pwm_frequency_hz must be greater than zero")
-
-#         all_pins = motor_1_gpio_pins + motor_2_gpio_pins
-
-#         if self._contains_duplicate_pins(all_pins):
-#             raise ValueError(
-#                 "Each motor-driver input must use a different GPIO pin"
-#             )
-
-#         motor_1_in1_pin, motor_1_in2_pin = motor_1_gpio_pins
-#         motor_2_in1_pin, motor_2_in2_pin = motor_2_gpio_pins
-
-#         self._lock = threading.Lock()
-#         self._closed = False
-
-#         self._motor_1_in1 = None
-#         self._motor_1_in2 = None
-#         self._motor_2_in1 = None
-#         self._motor_2_in2 = None
-
-#         try:
-#             self._motor_1_in1 = pwmio.PWMOut(
-#                 motor_1_in1_pin,
-#                 frequency=pwm_frequency_hz,
-#                 duty_cycle=0,
-#             )
-#             self._motor_1_in2 = pwmio.PWMOut(
-#                 motor_1_in2_pin,
-#                 frequency=pwm_frequency_hz,
-#                 duty_cycle=0,
-#             )
-#             self._motor_2_in1 = pwmio.PWMOut(
-#                 motor_2_in1_pin,
-#                 frequency=pwm_frequency_hz,
-#                 duty_cycle=0,
-#             )
-#             self._motor_2_in2 = pwmio.PWMOut(
-#                 motor_2_in2_pin,
-#                 frequency=pwm_frequency_hz,
-#                 duty_cycle=0,
-#             )
-#         except Exception:
-#             # Do not let cleanup failures hide the original setup error.
-#             self._deinit_outputs(suppress_errors=True)
-#             raise
-
-#     def set_speeds(
-#         self,
-#         motor_1_speed: float,
-#         motor_2_speed: float,
-#     ) -> None:
-#         """
-#         Set both motor speeds from -1.0 to 1.0.
-#         """
-#         motor_1_speed = self._validate_speed(
-#             speed=motor_1_speed,
-#             name="motor_1_speed",
-#         )
-#         motor_2_speed = self._validate_speed(
-#             speed=motor_2_speed,
-#             name="motor_2_speed",
-#         )
-
-#         with self._lock:
-#             self._ensure_open()
-
-#             try:
-#                 self._set_motor_speed(
-#                     in1=self._motor_1_in1,
-#                     in2=self._motor_1_in2,
-#                     speed=motor_1_speed,
-#                 )
-#                 self._set_motor_speed(
-#                     in1=self._motor_2_in1,
-#                     in2=self._motor_2_in2,
-#                     speed=motor_2_speed,
-#                 )
-#             except Exception:
-#                 # Do not leave one motor running if the other update fails.
-#                 try:
-#                     self._stop_all_unlocked()
-#                 except Exception:
-#                     pass
-#                 raise
-
-#     def stop_all(self) -> None:
-#         """
-#         Coast both motors to a stop.
-#         """
-#         with self._lock:
-#             self._ensure_open()
-#             self._stop_all_unlocked()
-
-#     def close(self) -> None:
-#         """
-#         Stop both motors and release the GPIO resources.
-#         """
-#         with self._lock:
-#             if self._closed:
-#                 return
-
-#             first_error = None
-
-#             try:
-#                 self._stop_all_unlocked()
-#             except Exception as exc:
-#                 first_error = exc
-
-#             try:
-#                 self._deinit_outputs()
-#             except Exception as exc:
-#                 if first_error is None:
-#                     first_error = exc
-#             finally:
-#                 self._closed = True
-
-#             if first_error is not None:
-#                 raise first_error
-
-#     def _stop_all_unlocked(self) -> None:
-#         first_error = None
-
-#         for output in self._outputs():
-#             if output is None:
-#                 continue
-
-#             try:
-#                 output.duty_cycle = 0
-#             except Exception as exc:
-#                 if first_error is None:
-#                     first_error = exc
-
-#         if first_error is not None:
-#             raise first_error
-
-#     @classmethod
-#     def _set_motor_speed(
-#         cls,
-#         in1: pwmio.PWMOut,
-#         in2: pwmio.PWMOut,
-#         speed: float,
-#     ) -> None:
-#         # Remove drive before changing direction.
-#         in1.duty_cycle = 0
-#         in2.duty_cycle = 0
-
-#         duty_cycle = round(abs(speed) * cls._MAX_DUTY_CYCLE)
-
-#         if speed > 0.0:
-#             in1.duty_cycle = duty_cycle
-#         elif speed < 0.0:
-#             in2.duty_cycle = duty_cycle
-
-#     def _deinit_outputs(self, suppress_errors: bool = False) -> None:
-#         first_error = None
-
-#         output_attributes = (
-#             "_motor_1_in1",
-#             "_motor_1_in2",
-#             "_motor_2_in1",
-#             "_motor_2_in2",
-#         )
-
-#         for attribute_name in output_attributes:
-#             output = getattr(self, attribute_name)
-
-#             try:
-#                 if output is not None:
-#                     output.deinit()
-#             except Exception as exc:
-#                 if first_error is None:
-#                     first_error = exc
-#             finally:
-#                 setattr(self, attribute_name, None)
-
-#         if first_error is not None and not suppress_errors:
-#             raise first_error
-
-#     def _outputs(self) -> tuple[object, object, object, object]:
-#         return (
-#             self._motor_1_in1,
-#             self._motor_1_in2,
-#             self._motor_2_in1,
-#             self._motor_2_in2,
-#         )
-
-#     def _ensure_open(self) -> None:
-#         if self._closed:
-#             raise RuntimeError(
-#                 "Cannot use DC motor driver after it has been closed"
-#             )
-
-#     @staticmethod
-#     def _contains_duplicate_pins(pins: tuple[object, ...]) -> bool:
-#         return any(
-#             pin == other_pin
-#             for index, pin in enumerate(pins)
-#             for other_pin in pins[index + 1:]
-#         )
-
-#     @staticmethod
-#     def _validate_gpio_pair(
-#         gpio_pins: tuple[object, object],
-#         name: str,
-#     ) -> None:
-#         if not isinstance(gpio_pins, tuple) or len(gpio_pins) != 2:
-#             raise ValueError(
-#                 f"{name} must be a tuple containing two board GPIO pins"
-#             )
-
-#         if gpio_pins[0] == gpio_pins[1]:
-#             raise ValueError(
-#                 f"{name} must contain two different GPIO pins"
-#             )
-
-#     @staticmethod
-#     def _validate_speed(speed: float, name: str) -> float:
-#         if isinstance(speed, bool):
-#             raise ValueError(f"{name} must be numeric, not bool")
-
-#         if not isinstance(speed, int | float):
-#             raise ValueError(
-#                 f"{name} must be numeric, "
-#                 f"got {type(speed).__name__}"
-#             )
-
-#         speed = float(speed)
-
-#         if not math.isfinite(speed):
-#             raise ValueError(f"{name} must be finite")
-
-#         if not -1.0 <= speed <= 1.0:
-#             raise ValueError(
-#                 f"{name} must be between -1.0 and 1.0, got {speed}"
-#             )
-
-#         return speed
-
