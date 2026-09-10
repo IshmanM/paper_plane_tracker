@@ -4,6 +4,12 @@ Paper Plane Tracker is a desk-scale DIY robotics sandbox for experimenting with 
 
 The project combines a webcam, laptop-based perception and tracking, a Raspberry Pi endpoint, and a hobby pan/tilt platform. Soft foam darts can also be used in supervised indoor tests as a simple physical timing demonstration.
 
+## License
+
+Except where otherwise noted, this project is licensed under the MIT License. See [LICENSE](LICENSE).
+
+Third-party software and dependencies remain subject to their respective licenses. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## AI-Assisted Development
 
 Generative AI tools were used as development aids during portions of this project's implementation and documentation.

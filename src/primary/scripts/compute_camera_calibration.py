@@ -1,3 +1,7 @@
+# Checkerboard calibration workflow follows the standard OpenCV camera-calibration tutorial:
+# https://docs.opencv.org/4.x/dc/dbb/tutorial_py_calibration.html
+
+
 import argparse
 from pathlib import Path
 

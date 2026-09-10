@@ -13,7 +13,7 @@ from src.primary.camera_to_platform_calibration import CameraToPlatformCalibrati
 
 
 
-MAX_SERVO_SETTLING_TIME = 0.080 # seconds
+MAX_SERVO_SETTLING_TIME = 0.100 # seconds
 SERVO_ANGLE_CHANGE_FOR_MAX_SETTLING = 30.0 # degrees
 
 SERVO_ROTATION_TIME_MARGIN = 0.00 # seconds. an extra margin.
@@ -40,7 +40,7 @@ SUBSEQUENT_INTERCEPT_MAX_NUM_CANDIDATES = 5
 SUBSEQUENT_INTERCEPT_MAX_LOOKAHEAD = 0.5 # seconds
 
 # TODO: make sure this is > FOAM_TRIGGER_HOLD_DELAY + FOAM_RESET_HOLD_DELAY from the endpoint 
-TRIGGER_DELAY = 0.050 # seconds
+TRIGGER_DELAY = 0.065 # seconds
 
 GRAVITY = 9.81  # m/s^2
 
@@ -50,7 +50,7 @@ MAX_TRAJECTORY_SOLVE_ITERATIONS = 8
 
 # Tune experimentally.
 # DART_PROTRUSION_SPEED = 21.67 # m/s, actual protrusion speed v0
-DART_PROTRUSION_SPEED = 18.0 # m/s, actual protrusion speed v0
+DART_PROTRUSION_SPEED = 18.5 # m/s, actual protrusion speed v0
 
 DART_DRAG_K = 0.040 # 1/m; k=rho*Cd*A/(2m) ~= 1.2*0.6*pi*(0.0065)^2/(2*0.001) ~= 0.048
 DART_SIMULATION_DT = 0.001 # seconds, Euler used to precompute the trajectory table.
