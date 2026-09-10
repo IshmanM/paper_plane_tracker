@@ -20,7 +20,7 @@ The exact versions used by a particular installation should be recorded in the p
 
 ## OpenCV Calibration Acknowledgement
 
-The checkerboard camera-calibration workflow in `src/primary/scripts/compute_camera_calibration.py` follows the standard OpenCV camera-calibration tutorial. An acknowledgement is included directly in that source file.
+The checkerboard camera-calibration workflow used by this project, including earlier historical calibration scripts, follows the standard OpenCV camera-calibration tutorial. An acknowledgement is included directly in the current calibration source file.
 
 OpenCV documentation: https://docs.opencv.org/4.x/dc/dbb/tutorial_py_calibration.html
 
