@@ -1,6 +1,6 @@
 # Paper Plane Tracker
 
-Paper Plane Tracker is a desk-scale DIY robotics sandbox for experimenting with real-time computer vision, 3D motion estimation, and vision-guided mechatronics using lightweight moving objects such as paper planes and tennis balls.
+Paper Plane Tracker (or Real-Time Paper Airplane Tracking Platform) is a desk-scale DIY robotics sandbox for experimenting with real-time computer vision, 3D motion estimation, and vision-guided mechatronics using lightweight moving objects such as paper planes and tennis balls.
 
 The project combines a webcam, laptop-based perception and tracking, a Raspberry Pi endpoint, and a hobby pan/tilt platform. Soft foam darts can also be used in supervised indoor tests as a simple physical timing demonstration.
 
